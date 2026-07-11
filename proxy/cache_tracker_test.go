@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"kiro-go/config"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -46,6 +47,284 @@ func TestPromptCacheTrackerComputeAndUpdate(t *testing.T) {
 	if second.CacheCreationInputTokens != 0 {
 		t.Fatalf("expected repeated request to avoid cache creation, got %+v", second)
 	}
+}
+
+func TestPromptCacheDefaultTTLHotReloadAffectsOnlyNewProfiles(t *testing.T) {
+	tracker := newPromptCacheTracker(time.Hour)
+	longSystem := strings.Repeat("stable prompt cache prefix ", 700)
+	request := func(explicitTTL string) *ClaudeRequest {
+		cacheControl := map[string]interface{}{"type": "ephemeral"}
+		if explicitTTL != "" {
+			cacheControl["ttl"] = explicitTTL
+		}
+		return &ClaudeRequest{
+			Model: "claude-sonnet-4.5",
+			System: []interface{}{map[string]interface{}{
+				"type":          "text",
+				"text":          longSystem,
+				"cache_control": cacheControl,
+			}},
+			Messages: []ClaudeMessage{{Role: "user", Content: "hello"}},
+		}
+	}
+
+	profile5m := tracker.BuildClaudeProfile(request(""), 4096, "ttl-session")
+	if profile5m == nil || len(profile5m.Breakpoints) == 0 {
+		t.Fatal("expected a cache profile using the default TTL")
+	}
+	for _, breakpoint := range profile5m.Breakpoints {
+		if breakpoint.TTL != 5*time.Minute {
+			t.Fatalf("initial breakpoint TTL=%v, want 5m", breakpoint.TTL)
+		}
+	}
+	tracker.Update("account", profile5m)
+	firstFingerprint := profile5m.Breakpoints[0].Fingerprint
+	tracker.mu.Lock()
+	storedTTL := tracker.entries[firstFingerprint].TTL
+	storedExpiry := tracker.entries[firstFingerprint].ExpiresAt
+	tracker.mu.Unlock()
+
+	tracker.SetDefaultTTL(time.Hour)
+	if got := tracker.DefaultTTL(); got != time.Hour {
+		t.Fatalf("runtime default TTL=%v, want 1h", got)
+	}
+	tracker.mu.Lock()
+	entry := tracker.entries[firstFingerprint]
+	if entry.TTL != storedTTL || !entry.ExpiresAt.Equal(storedExpiry) {
+		tracker.mu.Unlock()
+		t.Fatalf("hot reload changed existing entry: ttl=%v expiry=%v", entry.TTL, entry.ExpiresAt)
+	}
+	tracker.mu.Unlock()
+
+	profile1h := tracker.BuildClaudeProfile(request(""), 4096, "ttl-session")
+	for _, breakpoint := range profile1h.Breakpoints {
+		if breakpoint.TTL != time.Hour {
+			t.Fatalf("reloaded default breakpoint TTL=%v, want 1h", breakpoint.TTL)
+		}
+	}
+	if profile1h.Breakpoints[0].Fingerprint == profile5m.Breakpoints[0].Fingerprint {
+		t.Fatal("5m and 1h cache policies must not share a fingerprint")
+	}
+	if cold := tracker.Compute("account", profile1h); cold.CacheReadInputTokens != 0 || cold.CacheCreationInputTokens == 0 {
+		t.Fatalf("1h profile reused the existing 5m entry: %+v", cold)
+	}
+	tracker.Update("account", profile1h)
+	if hot := tracker.Compute("account", profile1h); hot.CacheReadInputTokens == 0 {
+		t.Fatalf("1h profile did not hit its own entry: %+v", hot)
+	}
+	oneHourFingerprint := profile1h.Breakpoints[0].Fingerprint
+	tracker.mu.Lock()
+	oneHourEntry := tracker.entries[oneHourFingerprint]
+	oneHourTTL := oneHourEntry.TTL
+	oneHourExpiry := oneHourEntry.ExpiresAt
+	tracker.mu.Unlock()
+
+	// A request that started before the hot reload may finish afterward. Its
+	// 5m profile must not overwrite the newer 1h cache entry.
+	tracker.Update("account", profile5m)
+	tracker.mu.Lock()
+	oneHourEntry = tracker.entries[oneHourFingerprint]
+	if oneHourEntry.TTL != oneHourTTL || !oneHourEntry.ExpiresAt.Equal(oneHourExpiry) {
+		tracker.mu.Unlock()
+		t.Fatalf("stale 5m profile overwrote 1h entry: ttl=%v expiry=%v", oneHourEntry.TTL, oneHourEntry.ExpiresAt)
+	}
+	tracker.mu.Unlock()
+
+	// Explicit request TTLs remain authoritative over the Admin default.
+	explicit5m := tracker.BuildClaudeProfile(request("5m"), 4096, "ttl-session")
+	if got := explicit5m.Breakpoints[0].TTL; got != 5*time.Minute {
+		t.Fatalf("explicit 5m TTL=%v, want 5m", got)
+	}
+	if explicit5m.Breakpoints[0].Fingerprint != profile5m.Breakpoints[0].Fingerprint {
+		t.Fatal("explicit and default 5m policies produced different fingerprints")
+	}
+	tracker.SetDefaultTTL(5 * time.Minute)
+	explicit1h := tracker.BuildClaudeProfile(request("1h"), 4096, "ttl-session")
+	if got := explicit1h.Breakpoints[0].TTL; got != time.Hour {
+		t.Fatalf("explicit 1h TTL=%v, want 1h", got)
+	}
+	if explicit1h.Breakpoints[0].Fingerprint != profile1h.Breakpoints[0].Fingerprint {
+		t.Fatal("explicit and default 1h policies produced different fingerprints")
+	}
+}
+
+func TestPromptCacheExplicitInvalidTTLDoesNotUseAdminDefault(t *testing.T) {
+	tracker := newPromptCacheTracker(time.Hour)
+	tracker.SetDefaultTTL(time.Hour)
+	request := func(ttl interface{}, includeTTL bool) *ClaudeRequest {
+		cacheControl := map[string]interface{}{"type": "ephemeral"}
+		if includeTTL {
+			cacheControl["ttl"] = ttl
+		}
+		return &ClaudeRequest{
+			Model: "claude-sonnet-4.5",
+			System: []interface{}{map[string]interface{}{
+				"type":          "text",
+				"text":          strings.Repeat("stable invalid ttl prefix ", 700),
+				"cache_control": cacheControl,
+			}},
+			Messages: []ClaudeMessage{{Role: "user", Content: "hello"}},
+		}
+	}
+
+	if profile := tracker.BuildClaudeProfile(request(nil, false), 4096, "ttl-session"); profile == nil || profile.Breakpoints[0].TTL != time.Hour {
+		t.Fatalf("omitted TTL did not use the 1h Admin default: %#v", profile)
+	}
+	for name, tc := range map[string]struct {
+		value interface{}
+		want  time.Duration
+	}{
+		"numeric-5m": {value: 300, want: 5 * time.Minute},
+		"seconds-1h": {value: "3600s", want: time.Hour},
+	} {
+		t.Run(name, func(t *testing.T) {
+			profile := tracker.BuildClaudeProfile(request(tc.value, true), 4096, "ttl-session")
+			if profile == nil || profile.Breakpoints[0].TTL != tc.want {
+				t.Fatalf("compatible explicit TTL=%v, want %v", profile, tc.want)
+			}
+		})
+	}
+	for name, value := range map[string]interface{}{
+		"null": nil, "zero": 0, "unsupported-seconds": 600,
+		"fractional-seconds": 300.9, "unsupported-duration": "10m", "garbage": "garbage",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if profile := tracker.BuildClaudeProfile(request(value, true), 4096, "ttl-session"); profile != nil {
+				t.Fatalf("invalid explicit TTL used the Admin default: %+v", profile.Breakpoints)
+			}
+		})
+	}
+}
+
+func TestPromptCacheTTLIdentitySurvivesExplicitToImplicitMarkerDrift(t *testing.T) {
+	tracker := newPromptCacheTracker(time.Hour)
+	build := func(explicitMessageMarker bool) *ClaudeRequest {
+		messageBlock := map[string]interface{}{
+			"type": "text",
+			"text": strings.Repeat("stable multi-turn history ", 500),
+		}
+		if explicitMessageMarker {
+			messageBlock["cache_control"] = map[string]interface{}{"type": "ephemeral", "ttl": "5m"}
+		}
+		return &ClaudeRequest{
+			Model: "claude-sonnet-4.5",
+			System: []interface{}{map[string]interface{}{
+				"type":          "text",
+				"text":          strings.Repeat("stable system prefix ", 500),
+				"cache_control": map[string]interface{}{"type": "ephemeral", "ttl": "5m"},
+			}},
+			Messages: []ClaudeMessage{{Role: "user", Content: []interface{}{messageBlock}}},
+		}
+	}
+
+	explicit := tracker.BuildClaudeProfile(build(true), 4096, "ttl-session")
+	implicit := tracker.BuildClaudeProfile(build(false), 4096, "ttl-session")
+	if explicit == nil || implicit == nil || len(explicit.Breakpoints) < 2 || len(implicit.Breakpoints) < 2 {
+		t.Fatalf("expected explicit and implicit history breakpoints: explicit=%#v implicit=%#v", explicit, implicit)
+	}
+	explicitLast := explicit.Breakpoints[len(explicit.Breakpoints)-1]
+	implicitLast := implicit.Breakpoints[len(implicit.Breakpoints)-1]
+	if explicitLast.Fingerprint != implicitLast.Fingerprint {
+		t.Fatal("moving a 5m marker from explicit to inherited changed cache identity")
+	}
+	tracker.Update("account", explicit)
+	if usage := tracker.Compute("account", implicit); usage.CacheReadInputTokens == 0 || usage.CacheCreationInputTokens != 0 {
+		t.Fatalf("implicit history failed to hit explicit history entry: %+v", usage)
+	}
+}
+
+func TestPromptCacheTTLIdentityIncludesPolicyHistory(t *testing.T) {
+	tracker := newPromptCacheTracker(time.Hour)
+	request := &ClaudeRequest{
+		Model: "claude-sonnet-4.5",
+		System: []interface{}{map[string]interface{}{
+			"type":          "text",
+			"text":          strings.Repeat("default ttl system prefix ", 500),
+			"cache_control": map[string]interface{}{"type": "ephemeral"},
+		}},
+		Messages: []ClaudeMessage{{Role: "user", Content: []interface{}{map[string]interface{}{
+			"type":          "text",
+			"text":          strings.Repeat("explicit five minute tail ", 500),
+			"cache_control": map[string]interface{}{"type": "ephemeral", "ttl": "5m"},
+		}}}},
+	}
+
+	oldPolicy := tracker.BuildClaudeProfile(request, 4096, "ttl-session")
+	if oldPolicy == nil || len(oldPolicy.Breakpoints) != 2 {
+		t.Fatalf("expected [5m,5m] policy, got %#v", oldPolicy)
+	}
+	tracker.Update("account", oldPolicy)
+
+	tracker.SetDefaultTTL(time.Hour)
+	newPolicy := tracker.BuildClaudeProfile(request, 4096, "ttl-session")
+	if newPolicy == nil || len(newPolicy.Breakpoints) != 2 {
+		t.Fatalf("expected [1h,5m] policy, got %#v", newPolicy)
+	}
+	if oldPolicy.Breakpoints[1].Fingerprint == newPolicy.Breakpoints[1].Fingerprint {
+		t.Fatal("mixed TTL history shared the full-prefix fingerprint")
+	}
+	if usage := tracker.Compute("account", newPolicy); usage.CacheReadInputTokens != 0 || usage.CacheCreationInputTokens == 0 {
+		t.Fatalf("[1h,5m] policy reused the cached [5m,5m] prefix: %+v", usage)
+	}
+	tracker.Update("account", newPolicy)
+	if usage := tracker.Compute("account", newPolicy); usage.CacheReadInputTokens == 0 {
+		t.Fatalf("[1h,5m] policy did not hit its own entry: %+v", usage)
+	}
+}
+
+func TestPromptCacheInvalidExplicitTTLStopsImplicitInheritance(t *testing.T) {
+	tracker := newPromptCacheTracker(time.Hour)
+	request := &ClaudeRequest{
+		Model: "claude-sonnet-4.5",
+		System: []interface{}{map[string]interface{}{
+			"type":          "text",
+			"text":          strings.Repeat("stable valid system marker ", 500),
+			"cache_control": map[string]interface{}{"type": "ephemeral", "ttl": "5m"},
+		}},
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: []interface{}{map[string]interface{}{
+				"type":          "text",
+				"text":          strings.Repeat("invalid marker history ", 300),
+				"cache_control": map[string]interface{}{"type": "ephemeral", "ttl": "garbage"},
+			}}},
+			{Role: "assistant", Content: "plain content after invalid marker"},
+		},
+	}
+
+	profile := tracker.BuildClaudeProfile(request, 4096, "ttl-session")
+	if profile == nil {
+		t.Fatal("the valid system breakpoint should remain usable")
+	}
+	if len(profile.Breakpoints) != 1 {
+		t.Fatalf("invalid marker inherited the earlier TTL; breakpoints=%+v", profile.Breakpoints)
+	}
+	if profile.Breakpoints[0].TTL != 5*time.Minute {
+		t.Fatalf("valid system breakpoint TTL=%v, want 5m", profile.Breakpoints[0].TTL)
+	}
+}
+
+func TestPromptCacheDefaultTTLConcurrentHotReload(t *testing.T) {
+	tracker := newPromptCacheTracker(time.Hour)
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(2)
+		go func(i int) {
+			defer wg.Done()
+			if i%2 == 0 {
+				tracker.SetDefaultTTL(5 * time.Minute)
+			} else {
+				tracker.SetDefaultTTL(time.Hour)
+			}
+		}(i)
+		go func() {
+			defer wg.Done()
+			got := tracker.DefaultTTL()
+			if got != 5*time.Minute && got != time.Hour {
+				t.Errorf("unexpected runtime TTL %v", got)
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 func TestBuildClaudeUsageMapIncludesCacheFields(t *testing.T) {

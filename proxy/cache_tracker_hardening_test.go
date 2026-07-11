@@ -142,6 +142,9 @@ func TestWriteFileAtomicPersistsAndLeavesNoTemp(t *testing.T) {
 	if json.Unmarshal(raw, &disk) != nil {
 		t.Fatalf("flushed file is not valid JSON: %s", string(raw))
 	}
+	if disk.Version != promptCachePersistenceVersion {
+		t.Fatalf("persistence version=%d, want %d", disk.Version, promptCachePersistenceVersion)
+	}
 	if len(disk.Entries) != 1 {
 		t.Fatalf("expected 1 persisted entry, got %d", len(disk.Entries))
 	}
@@ -162,6 +165,30 @@ func TestWriteFileAtomicPersistsAndLeavesNoTemp(t *testing.T) {
 	t2.mu.Unlock()
 	if !ok {
 		t.Fatal("entry not reloaded after atomic flush")
+	}
+}
+
+func TestPromptCacheLoadRejectsIncompatibleFingerprintVersion(t *testing.T) {
+	path := t.TempDir() + "/prompt_cache.json"
+	data, err := json.Marshal(map[string]interface{}{
+		"version": promptCachePersistenceVersion - 1,
+		"entries": []promptCacheEntryOnDisk{{
+			Fingerprint: [32]byte{1},
+			ExpiresAt:   time.Now().Add(time.Hour).Unix(),
+			TTLSeconds:  int64(time.Hour / time.Second),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshal old cache state: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatalf("write old cache state: %v", err)
+	}
+
+	tracker := newPromptCacheTracker(time.Hour)
+	tracker.Load(path)
+	if got := tracker.Stats().Entries; got != 0 {
+		t.Fatalf("loaded %d entries from incompatible fingerprint schema", got)
 	}
 }
 

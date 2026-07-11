@@ -48,6 +48,11 @@
     { key: 'cacheCreationTokens', labelKey: 'traffic.cacheCreationTokens', color: '#d97706' },
     { key: 'cacheReadTokens', labelKey: 'traffic.cacheReadTokens', color: '#7c3aed' }
   ];
+  const TRAFFIC_CACHE_READ_RATE = {
+    key: 'cacheReadRate',
+    labelKey: 'traffic.cacheReadRate',
+    color: '#db2777'
+  };
 
   // DOM helpers
   const $ = (id) => document.getElementById(id);
@@ -717,6 +722,11 @@
     return [];
   }
 
+  function trafficCacheReadRate(inputTokens, cacheCreationTokens, cacheReadTokens) {
+    const denominator = inputTokens + cacheCreationTokens + cacheReadTokens;
+    return denominator > 0 ? Math.min(100, cacheReadTokens / denominator * 100) : null;
+  }
+
   function normalizeTrafficTimestamp(value, index, total, range) {
     let timestamp = NaN;
     if (typeof value === 'number') {
@@ -772,15 +782,19 @@
         const direct = trafficNumberFrom(bucket, names);
         return direct === null ? (trafficNumberFrom(usage, names) || 0) : direct;
       };
+      const inputTokens = value(['inputTokens', 'input_tokens', 'input']);
+      const cacheCreationTokens = value(['cacheCreationTokens', 'cacheCreationInputTokens', 'cache_creation_input_tokens', 'cacheCreation']);
+      const cacheReadTokens = value(['cacheReadTokens', 'cacheReadInputTokens', 'cache_read_input_tokens', 'cacheRead']);
       return {
         timestamp: normalizeTrafficTimestamp(
           bucket && (bucket.timestamp ?? bucket.time ?? bucket.bucketStart ?? bucket.bucket_start ?? bucket.ts),
           index, rawBuckets.length, range
         ),
-        inputTokens: value(['inputTokens', 'input_tokens', 'input']),
+        inputTokens,
         outputTokens: value(['outputTokens', 'output_tokens', 'output']),
-        cacheCreationTokens: value(['cacheCreationTokens', 'cacheCreationInputTokens', 'cache_creation_input_tokens', 'cacheCreation']),
-        cacheReadTokens: value(['cacheReadTokens', 'cacheReadInputTokens', 'cache_read_input_tokens', 'cacheRead']),
+        cacheCreationTokens,
+        cacheReadTokens,
+        cacheReadRate: trafficCacheReadRate(inputTokens, cacheCreationTokens, cacheReadTokens),
         requests: value(['requests', 'requestCount', 'request_count'])
       };
     }).sort((a, b) => a.timestamp - b.timestamp);
@@ -815,6 +829,10 @@
   function formatTrafficAxis(value) {
     const locale = currentLang === 'zh' ? 'zh-CN' : 'en-US';
     return new Intl.NumberFormat(locale, { notation: 'compact', maximumFractionDigits: 1 }).format(Math.round(value));
+  }
+
+  function formatTrafficPercent(value) {
+    return value === null || !Number.isFinite(Number(value)) ? '--' : Number(value).toFixed(1) + '%';
   }
 
   function formatTrafficTime(timestamp, withDate) {
@@ -922,19 +940,20 @@
     const points = trafficData.points;
     const rawMax = Math.max(0, ...points.flatMap(point => TRAFFIC_SERIES.map(series => point[series.key] || 0)));
     const yMax = rawMax > 0 ? rawMax * 1.08 : 1;
-    const yTicks = 4;
+    const yTicks = 5;
     ctx.font = '11px ' + font;
     const widestLabel = Math.max(...Array.from({ length: yTicks + 1 }, (_, i) =>
       ctx.measureText(formatTrafficAxis(yMax * i / yTicks)).width
     ));
     const left = Math.max(44, Math.ceil(widestLabel) + 13);
-    const right = 12;
+    const right = 48;
     const top = 12;
     const bottom = 34;
     const plotWidth = Math.max(1, width - left - right);
     const plotHeight = Math.max(1, height - top - bottom);
     const xFor = index => points.length === 1 ? left + plotWidth / 2 : left + (index / (points.length - 1)) * plotWidth;
     const yFor = value => top + plotHeight - (Math.max(0, value) / yMax) * plotHeight;
+    const yForRate = value => top + plotHeight - (Math.max(0, Math.min(100, value)) / 100) * plotHeight;
 
     ctx.strokeStyle = border;
     ctx.fillStyle = muted;
@@ -949,6 +968,10 @@
       ctx.stroke();
       ctx.textAlign = 'right';
       ctx.fillText(formatTrafficAxis(value), left - 8, y);
+      ctx.fillStyle = TRAFFIC_CACHE_READ_RATE.color;
+      ctx.textAlign = 'left';
+      ctx.fillText(Math.round(100 * (yTicks - i) / yTicks) + '%', width - right + 8, y);
+      ctx.fillStyle = muted;
     }
 
     const labelFractions = width < 560 ? [0, 0.5, 1] : [0, 0.25, 0.5, 0.75, 1];
@@ -981,6 +1004,39 @@
       }
     });
 
+    ctx.beginPath();
+    let rateSegmentOpen = false;
+    points.forEach((point, index) => {
+      const rate = point[TRAFFIC_CACHE_READ_RATE.key];
+      if (!Number.isFinite(rate)) {
+        rateSegmentOpen = false;
+        return;
+      }
+      const x = xFor(index);
+      const y = yForRate(rate);
+      if (!rateSegmentOpen) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+      rateSegmentOpen = true;
+    });
+    ctx.strokeStyle = TRAFFIC_CACHE_READ_RATE.color;
+    ctx.lineWidth = 1.8;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.setLineDash([5, 4]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    points.forEach((point, index) => {
+      const rate = point[TRAFFIC_CACHE_READ_RATE.key];
+      if (!Number.isFinite(rate)) return;
+      const previousValid = index > 0 && Number.isFinite(points[index - 1][TRAFFIC_CACHE_READ_RATE.key]);
+      const nextValid = index + 1 < points.length && Number.isFinite(points[index + 1][TRAFFIC_CACHE_READ_RATE.key]);
+      if (previousValid || nextValid) return;
+      ctx.fillStyle = TRAFFIC_CACHE_READ_RATE.color;
+      ctx.beginPath();
+      ctx.arc(xFor(index), yForRate(rate), 3, 0, Math.PI * 2);
+      ctx.fill();
+    });
+
     ctx.strokeStyle = foreground;
     ctx.globalAlpha = 0.12;
     ctx.beginPath();
@@ -1006,6 +1062,8 @@
       html += '<div class="traffic-tooltip-row"><span class="traffic-tooltip-label"><span class="traffic-tooltip-dot" style="--series-color:' + series.color + '"></span>' +
         escapeHtml(t(series.labelKey)) + '</span><strong>' + escapeHtml(formatTrafficNumber(point[series.key])) + '</strong></div>';
     });
+    html += '<div class="traffic-tooltip-row"><span class="traffic-tooltip-label"><span class="traffic-tooltip-dot" style="--series-color:' + TRAFFIC_CACHE_READ_RATE.color + '"></span>' +
+      escapeHtml(t(TRAFFIC_CACHE_READ_RATE.labelKey)) + '</span><strong>' + escapeHtml(formatTrafficPercent(point[TRAFFIC_CACHE_READ_RATE.key])) + '</strong></div>';
     tooltip.innerHTML = html;
     tooltip.classList.remove('hidden');
     const left = Math.max(8, Math.min(rect.width - tooltip.offsetWidth - 8, event.clientX - rect.left + 12));
@@ -1883,6 +1941,8 @@
     $('promptCacheMaxEntries').value = Number.isInteger(promptCacheMaxEntries) && promptCacheMaxEntries >= 256 && promptCacheMaxEntries <= 1048576
       ? String(promptCacheMaxEntries)
       : '131072';
+    const promptCacheTTLSeconds = Number(d.promptCacheTTLSeconds);
+    $('promptCacheTTLSeconds').value = promptCacheTTLSeconds === 3600 ? '3600' : '300';
     await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys()]);
     refreshCustomSelects();
   }
@@ -1994,6 +2054,7 @@
   async function savePromptCacheConfig() {
     const ratioInput = $('promptCacheMaxRatio');
     const entriesInput = $('promptCacheMaxEntries');
+    const ttlInput = $('promptCacheTTLSeconds');
     const promptCacheMaxRatio = Number(ratioInput.value);
     if (!Number.isFinite(promptCacheMaxRatio) || promptCacheMaxRatio < 0.01 || promptCacheMaxRatio > 1) {
       toast(t('settings.promptCacheMaxRatioInvalid'), 'warning');
@@ -2006,14 +2067,21 @@
       entriesInput.focus();
       return;
     }
+    const promptCacheTTLSeconds = Number(ttlInput.value);
+    if (promptCacheTTLSeconds !== 300 && promptCacheTTLSeconds !== 3600) {
+      toast(t('settings.promptCacheTTLInvalid'), 'warning');
+      ttlInput.focus();
+      return;
+    }
     try {
       const res = await api('/settings', {
-        method: 'POST', body: JSON.stringify({ promptCacheMaxRatio, promptCacheMaxEntries })
+        method: 'POST', body: JSON.stringify({ promptCacheMaxRatio, promptCacheMaxEntries, promptCacheTTLSeconds })
       });
       const d = await res.json().catch(() => ({}));
       if (!res.ok || d.success === false) throw new Error(d.error || t('common.saveFailed'));
       ratioInput.value = String(promptCacheMaxRatio);
       entriesInput.value = String(promptCacheMaxEntries);
+      ttlInput.value = String(promptCacheTTLSeconds);
       toast(t('settings.promptCacheSaved'), 'success');
     } catch (e) {
       toast((e && e.message) || t('common.saveFailed'), 'error');

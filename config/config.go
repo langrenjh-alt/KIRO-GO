@@ -224,6 +224,11 @@ type Config struct {
 	// tracker clamps explicit small values up to 256.
 	PromptCacheMaxEntries int `json:"promptCacheMaxEntries,omitempty"`
 
+	// PromptCacheTTLSeconds is the default lifetime used when an Anthropic
+	// cache_control marker omits ttl. Anthropic supports 5-minute and 1-hour
+	// ephemeral cache lifetimes, represented here as 300 or 3600 seconds.
+	PromptCacheTTLSeconds int `json:"promptCacheTTLSeconds,omitempty"`
+
 	// Global statistics (persisted across restarts)
 	TotalRequests   int     `json:"totalRequests,omitempty"`   // Total API requests received
 	SuccessRequests int     `json:"successRequests,omitempty"` // Successful requests count
@@ -1154,7 +1159,7 @@ func GetPromptCacheMaxRatio() float64 {
 
 // UpdatePromptCacheMaxRatio sets the cache-read cap ratio and persists the change.
 func UpdatePromptCacheMaxRatio(ratio float64) error {
-	return UpdatePromptCacheSettings(&ratio, nil)
+	return UpdatePromptCacheSettings(&ratio, nil, nil)
 }
 
 const defaultPromptCacheMaxEntries = 131072
@@ -1199,16 +1204,48 @@ func UpdatePromptCacheMaxEntries(n int) error {
 	return nil
 }
 
-// UpdatePromptCacheSettings validates and persists both cache controls as one
+const (
+	// DefaultPromptCacheTTLSeconds is Anthropic's default ephemeral cache TTL.
+	DefaultPromptCacheTTLSeconds = 5 * 60
+	// ExtendedPromptCacheTTLSeconds is Anthropic's optional one-hour cache TTL.
+	ExtendedPromptCacheTTLSeconds = 60 * 60
+)
+
+// IsValidPromptCacheTTLSeconds reports whether seconds is one of Anthropic's
+// supported ephemeral cache TTLs.
+func IsValidPromptCacheTTLSeconds(seconds int) bool {
+	return seconds == DefaultPromptCacheTTLSeconds || seconds == ExtendedPromptCacheTTLSeconds
+}
+
+// GetPromptCacheTTLSeconds returns the default TTL used for cache_control
+// markers that omit ttl. Unset or legacy invalid values fall back to 5 minutes.
+func GetPromptCacheTTLSeconds() int {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || !IsValidPromptCacheTTLSeconds(cfg.PromptCacheTTLSeconds) {
+		return DefaultPromptCacheTTLSeconds
+	}
+	return cfg.PromptCacheTTLSeconds
+}
+
+// UpdatePromptCacheTTLSeconds persists the default prompt-cache TTL.
+func UpdatePromptCacheTTLSeconds(seconds int) error {
+	return UpdatePromptCacheSettings(nil, nil, &seconds)
+}
+
+// UpdatePromptCacheSettings validates and persists all cache controls as one
 // update. In-memory values are rolled back when persistence fails.
-func UpdatePromptCacheSettings(ratio *float64, maxEntries *int) error {
+func UpdatePromptCacheSettings(ratio *float64, maxEntries *int, ttlSeconds *int) error {
 	if ratio != nil && (*ratio < MinPromptCacheRatio || *ratio > MaxPromptCacheRatio) {
 		return fmt.Errorf("promptCacheMaxRatio must be between %.2f and %.2f", MinPromptCacheRatio, MaxPromptCacheRatio)
 	}
 	if maxEntries != nil && (*maxEntries < MinPromptCacheEntries || *maxEntries > MaxPromptCacheEntries) {
 		return fmt.Errorf("promptCacheMaxEntries must be between %d and %d", MinPromptCacheEntries, MaxPromptCacheEntries)
 	}
-	if ratio == nil && maxEntries == nil {
+	if ttlSeconds != nil && !IsValidPromptCacheTTLSeconds(*ttlSeconds) {
+		return fmt.Errorf("promptCacheTTLSeconds must be either %d or %d", DefaultPromptCacheTTLSeconds, ExtendedPromptCacheTTLSeconds)
+	}
+	if ratio == nil && maxEntries == nil && ttlSeconds == nil {
 		return nil
 	}
 
@@ -1216,15 +1253,20 @@ func UpdatePromptCacheSettings(ratio *float64, maxEntries *int) error {
 	defer cfgLock.Unlock()
 	previousRatio := cfg.PromptCacheMaxRatio
 	previousMaxEntries := cfg.PromptCacheMaxEntries
+	previousTTLSeconds := cfg.PromptCacheTTLSeconds
 	if ratio != nil {
 		cfg.PromptCacheMaxRatio = *ratio
 	}
 	if maxEntries != nil {
 		cfg.PromptCacheMaxEntries = *maxEntries
 	}
+	if ttlSeconds != nil {
+		cfg.PromptCacheTTLSeconds = *ttlSeconds
+	}
 	if err := Save(); err != nil {
 		cfg.PromptCacheMaxRatio = previousRatio
 		cfg.PromptCacheMaxEntries = previousMaxEntries
+		cfg.PromptCacheTTLSeconds = previousTTLSeconds
 		return err
 	}
 	return nil

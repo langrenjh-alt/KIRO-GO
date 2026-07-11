@@ -254,6 +254,7 @@ func NewHandler() *Handler {
 		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
 		traffic:         NewTrafficTracker(DefaultTrafficRetention),
 	}
+	h.promptCache.SetDefaultTTL(time.Duration(config.GetPromptCacheTTLSeconds()) * time.Second)
 	cachePath := filepath.Join(config.GetConfigDir(), "prompt_cache.json")
 	h.promptCache.Load(cachePath)
 	h.promptCache.startSaveLoop(cachePath, 30*time.Second)
@@ -3451,6 +3452,7 @@ func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 		"allowOverUsage":        config.GetAllowOverUsage(),
 		"promptCacheMaxRatio":   config.GetPromptCacheMaxRatio(),
 		"promptCacheMaxEntries": config.GetPromptCacheMaxEntries(),
+		"promptCacheTTLSeconds": config.GetPromptCacheTTLSeconds(),
 	})
 }
 
@@ -3505,6 +3507,7 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		AllowOverUsage        *bool    `json:"allowOverUsage,omitempty"`
 		PromptCacheMaxRatio   *float64 `json:"promptCacheMaxRatio,omitempty"`
 		PromptCacheMaxEntries *int     `json:"promptCacheMaxEntries,omitempty"`
+		PromptCacheTTLSeconds *int     `json:"promptCacheTTLSeconds,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -3519,6 +3522,11 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	if req.PromptCacheMaxEntries != nil && (*req.PromptCacheMaxEntries < config.MinPromptCacheEntries || *req.PromptCacheMaxEntries > config.MaxPromptCacheEntries) {
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("promptCacheMaxEntries must be between %d and %d", config.MinPromptCacheEntries, config.MaxPromptCacheEntries)})
+		return
+	}
+	if req.PromptCacheTTLSeconds != nil && !config.IsValidPromptCacheTTLSeconds(*req.PromptCacheTTLSeconds) {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("promptCacheTTLSeconds must be either %d or %d", config.DefaultPromptCacheTTLSeconds, config.ExtendedPromptCacheTTLSeconds)})
 		return
 	}
 
@@ -3540,16 +3548,19 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		// Rebuild the pool so over-quota accounts are re-included or dropped immediately.
 		h.pool.Reload()
 	}
-	if req.PromptCacheMaxRatio != nil || req.PromptCacheMaxEntries != nil {
+	if req.PromptCacheMaxRatio != nil || req.PromptCacheMaxEntries != nil || req.PromptCacheTTLSeconds != nil {
 		h.promptCacheConfigMu.Lock()
 		defer h.promptCacheConfigMu.Unlock()
-		if err := config.UpdatePromptCacheSettings(req.PromptCacheMaxRatio, req.PromptCacheMaxEntries); err != nil {
+		if err := config.UpdatePromptCacheSettings(req.PromptCacheMaxRatio, req.PromptCacheMaxEntries, req.PromptCacheTTLSeconds); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
 		}
 		if req.PromptCacheMaxEntries != nil && h.promptCache != nil {
 			h.promptCache.SetMaxEntries(config.GetPromptCacheMaxEntries())
+		}
+		if req.PromptCacheTTLSeconds != nil && h.promptCache != nil {
+			h.promptCache.SetDefaultTTL(time.Duration(config.GetPromptCacheTTLSeconds()) * time.Second)
 		}
 	}
 

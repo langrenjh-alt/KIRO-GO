@@ -57,7 +57,7 @@ func TestUpdateSettingsPatchCanExplicitlyDisableAPIKey(t *testing.T) {
 
 func TestPromptCacheConfigClampsLegacyOutOfRangeValues(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
-	if err := os.WriteFile(path, []byte(`{"promptCacheMaxRatio":0.001,"promptCacheMaxEntries":2097152}`), 0600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"promptCacheMaxRatio":0.001,"promptCacheMaxEntries":2097152,"promptCacheTTLSeconds":600}`), 0600); err != nil {
 		t.Fatalf("write legacy config: %v", err)
 	}
 	if err := Init(path); err != nil {
@@ -69,6 +69,9 @@ func TestPromptCacheConfigClampsLegacyOutOfRangeValues(t *testing.T) {
 	if got := GetPromptCacheMaxEntries(); got != MaxPromptCacheEntries {
 		t.Fatalf("cache capacity=%d, want %d", got, MaxPromptCacheEntries)
 	}
+	if got := GetPromptCacheTTLSeconds(); got != DefaultPromptCacheTTLSeconds {
+		t.Fatalf("cache TTL=%d, want default %d", got, DefaultPromptCacheTTLSeconds)
+	}
 	if err := UpdatePromptCacheMaxRatio(MinPromptCacheRatio / 2); err == nil {
 		t.Fatal("expected direct ratio update below Admin minimum to fail")
 	}
@@ -79,8 +82,8 @@ func TestUpdatePromptCacheSettingsRollsBackOnSaveFailure(t *testing.T) {
 	if err := Init(path); err != nil {
 		t.Fatalf("init config: %v", err)
 	}
-	ratio, entries := 0.85, 4096
-	if err := UpdatePromptCacheSettings(&ratio, &entries); err != nil {
+	ratio, entries, ttlSeconds := 0.85, 4096, ExtendedPromptCacheTTLSeconds
+	if err := UpdatePromptCacheSettings(&ratio, &entries, &ttlSeconds); err != nil {
 		t.Fatalf("seed cache settings: %v", err)
 	}
 
@@ -94,8 +97,8 @@ func TestUpdatePromptCacheSettingsRollsBackOnSaveFailure(t *testing.T) {
 		cfgLock.Unlock()
 	})
 
-	nextRatio, nextEntries := 0.95, 8192
-	if err := UpdatePromptCacheSettings(&nextRatio, &nextEntries); err == nil {
+	nextRatio, nextEntries, nextTTLSeconds := 0.95, 8192, DefaultPromptCacheTTLSeconds
+	if err := UpdatePromptCacheSettings(&nextRatio, &nextEntries, &nextTTLSeconds); err == nil {
 		t.Fatal("expected cache settings persistence failure")
 	}
 	if got := GetPromptCacheMaxRatio(); got != ratio {
@@ -103,6 +106,9 @@ func TestUpdatePromptCacheSettingsRollsBackOnSaveFailure(t *testing.T) {
 	}
 	if got := GetPromptCacheMaxEntries(); got != entries {
 		t.Fatalf("cache capacity changed after failed save: got %d want %d", got, entries)
+	}
+	if got := GetPromptCacheTTLSeconds(); got != ttlSeconds {
+		t.Fatalf("cache TTL changed after failed save: got %d want %d", got, ttlSeconds)
 	}
 }
 

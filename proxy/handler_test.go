@@ -7,6 +7,7 @@ import (
 	accountpool "kiro-go/pool"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -865,6 +866,98 @@ func TestAdminSettingsRejectsInvalidPromptCacheMaxEntries(t *testing.T) {
 		if got := config.GetPromptCacheMaxEntries(); got != 4096 {
 			t.Fatalf("body=%s changed capacity to %d", body, got)
 		}
+	}
+}
+
+func TestAdminSettingsPromptCacheTTLHotReloadAndPersistence(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	tracker := newPromptCacheTracker(time.Hour)
+	h := &Handler{promptCache: tracker}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/settings", strings.NewReader(`{"promptCacheTTLSeconds":3600}`))
+	h.apiUpdateSettings(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := config.GetPromptCacheTTLSeconds(); got != config.ExtendedPromptCacheTTLSeconds {
+		t.Fatalf("configured TTL=%d, want 3600", got)
+	}
+	if got := tracker.DefaultTTL(); got != time.Hour {
+		t.Fatalf("live tracker TTL=%v, want 1h", got)
+	}
+
+	getRec := httptest.NewRecorder()
+	h.apiGetSettings(getRec, httptest.NewRequest(http.MethodGet, "/admin/api/settings", nil))
+	var settings map[string]interface{}
+	if err := json.NewDecoder(getRec.Body).Decode(&settings); err != nil {
+		t.Fatalf("decode settings: %v", err)
+	}
+	if got := settings["promptCacheTTLSeconds"]; got != float64(config.ExtendedPromptCacheTTLSeconds) {
+		t.Fatalf("settings TTL=%#v, want 3600", got)
+	}
+
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("reload persisted config: %v", err)
+	}
+	if got := config.GetPromptCacheTTLSeconds(); got != config.ExtendedPromptCacheTTLSeconds {
+		t.Fatalf("persisted TTL=%d, want 3600", got)
+	}
+}
+
+func TestAdminSettingsRejectsInvalidPromptCacheTTL(t *testing.T) {
+	if err := config.Init(t.TempDir() + "/config.json"); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	tracker := newPromptCacheTracker(time.Hour)
+	h := &Handler{promptCache: tracker}
+	for _, body := range []string{
+		`{"promptCacheTTLSeconds":0}`,
+		`{"promptCacheTTLSeconds":299}`,
+		`{"promptCacheTTLSeconds":301}`,
+		`{"promptCacheTTLSeconds":3599}`,
+		`{"promptCacheTTLSeconds":3601}`,
+		`{"promptCacheTTLSeconds":300.5}`,
+		`{"promptCacheTTLSeconds":"300"}`,
+	} {
+		rec := httptest.NewRecorder()
+		h.apiUpdateSettings(rec, httptest.NewRequest(http.MethodPost, "/admin/api/settings", strings.NewReader(body)))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("body=%s status=%d response=%s", body, rec.Code, rec.Body.String())
+		}
+		if got := config.GetPromptCacheTTLSeconds(); got != config.DefaultPromptCacheTTLSeconds {
+			t.Fatalf("body=%s changed configured TTL to %d", body, got)
+		}
+		if got := tracker.DefaultTTL(); got != defaultPromptCacheTTL {
+			t.Fatalf("body=%s changed live TTL to %v", body, got)
+		}
+	}
+}
+
+func TestAdminSettingsPromptCacheTTLSaveFailureDoesNotHotReload(t *testing.T) {
+	dir := t.TempDir()
+	if err := config.Init(filepath.Join(dir, "config.json")); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	tracker := newPromptCacheTracker(time.Hour)
+	h := &Handler{promptCache: tracker}
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatalf("remove config directory: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	h.apiUpdateSettings(rec, httptest.NewRequest(http.MethodPost, "/admin/api/settings", strings.NewReader(`{"promptCacheTTLSeconds":3600}`)))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s, want 500", rec.Code, rec.Body.String())
+	}
+	if got := config.GetPromptCacheTTLSeconds(); got != config.DefaultPromptCacheTTLSeconds {
+		t.Fatalf("failed save changed configured TTL to %d", got)
+	}
+	if got := tracker.DefaultTTL(); got != defaultPromptCacheTTL {
+		t.Fatalf("failed save changed live tracker TTL to %v", got)
 	}
 }
 

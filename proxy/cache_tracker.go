@@ -19,6 +19,7 @@ import (
 )
 
 const defaultPromptCacheTTL = 5 * time.Minute
+const promptCachePersistenceVersion = 2
 
 // Anthropic requires cached prefixes to reach a minimum token count before
 // caching takes effect. Breakpoints below this threshold are excluded from
@@ -101,6 +102,7 @@ type promptCacheTracker struct {
 	expiryQueue           promptCacheExpiryHeap
 	maxEntries            int
 	maxSupportedTTL       time.Duration
+	defaultTTL            time.Duration
 	hits                  int64 // atomic — Compute calls returning CacheReadInputTokens > 0
 	misses                int64 // atomic — Compute calls returning CacheReadInputTokens == 0
 	evictions             int64 // atomic — LRU pop-backs in evictOverflowLocked
@@ -127,6 +129,7 @@ func newPromptCacheTrackerWithCapacity(maxTTL time.Duration, maxEntries int) *pr
 		order:           list.New(),
 		maxEntries:      maxEntries,
 		maxSupportedTTL: maxTTL,
+		defaultTTL:      defaultPromptCacheTTL,
 	}
 }
 
@@ -151,6 +154,9 @@ func (t *promptCacheTracker) Load(path string) {
 	}
 	if json.Unmarshal(data, &disk) != nil {
 		return // corrupt = fresh start
+	}
+	if disk.Version != promptCachePersistenceVersion {
+		return // fingerprint schema changed; incompatible entries start cold
 	}
 	now := time.Now()
 	t.mu.Lock()
@@ -229,7 +235,7 @@ func (t *promptCacheTracker) flush(path string) {
 	t.mu.Unlock()
 
 	data, err := json.MarshalIndent(map[string]interface{}{
-		"version": 1,
+		"version": promptCachePersistenceVersion,
 		"entries": entries,
 	}, "", "  ")
 	if err == nil {
@@ -353,7 +359,7 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 		atomic.AddInt64(&t.skippedNoCacheControl, 1)
 		return nil
 	}
-	blocks := flattenClaudeCacheBlocks(req)
+	blocks := flattenClaudeCacheBlocks(req, t.DefaultTTL())
 	if len(blocks) == 0 {
 		atomic.AddInt64(&t.skippedNoBreakpoints, 1)
 		return nil
@@ -364,6 +370,8 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 		"kind": "isolation_seed",
 		"seed": isolationSeed,
 	}))
+	policyHasher := sha256.New()
+	writeHashChunk(policyHasher, "prompt_cache_policy_v2")
 	breakpoints := make([]promptCacheBreakpoint, 0)
 	cumulativeTokens := 0
 	excludedPrefixTokens := 0
@@ -385,8 +393,15 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 		//      conversations can hit earlier stored prefixes.
 		breakpointTTL := time.Duration(0)
 		if block.TTL > 0 {
+			if activeTTL != block.TTL {
+				writePromptCachePolicyChange(policyHasher, hasher, block.TTL)
+			}
 			breakpointTTL = block.TTL
 			activeTTL = block.TTL
+		} else if block.HasCacheControl {
+			// A malformed explicit marker must not silently inherit a previous
+			// marker's TTL at this or later message boundaries.
+			activeTTL = 0
 		} else if block.IsMessageEnd && activeTTL > 0 {
 			breakpointTTL = activeTTL
 		}
@@ -395,8 +410,7 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 			continue
 		}
 
-		var fingerprint [32]byte
-		copy(fingerprint[:], hasher.Sum(nil))
+		fingerprint := promptCacheFingerprint(hasher, policyHasher)
 		breakpoints = append(breakpoints, promptCacheBreakpoint{
 			Fingerprint:      fingerprint,
 			CumulativeTokens: cumulativeTokens,
@@ -595,6 +609,31 @@ func (t *promptCacheTracker) SetMaxEntries(maxEntries int) {
 	}
 }
 
+// DefaultTTL returns the runtime default used when a cache_control marker does
+// not specify ttl. The value is snapshotted once per profile build.
+func (t *promptCacheTracker) DefaultTTL() time.Duration {
+	if t == nil {
+		return defaultPromptCacheTTL
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.defaultTTL
+}
+
+// SetDefaultTTL hot-reloads the default for new profiles. Existing entries
+// retain their stored TTL and expiry.
+func (t *promptCacheTracker) SetDefaultTTL(ttl time.Duration) {
+	if t == nil {
+		return
+	}
+	if ttl != time.Hour {
+		ttl = defaultPromptCacheTTL
+	}
+	t.mu.Lock()
+	t.defaultTTL = ttl
+	t.mu.Unlock()
+}
+
 // PromptCacheStats is a point-in-time snapshot of cache counters, surfaced via
 // /v1/stats. All counters are cumulative since tracker construction.
 type PromptCacheStats struct {
@@ -679,13 +718,14 @@ type cacheablePromptBlock struct {
 	Value                     interface{}
 	Tokens                    int
 	TTL                       time.Duration
+	HasCacheControl           bool
 	Kind                      string
 	IsMessageEnd              bool
 	ExcludeFromReusablePrefix bool
 	PreserveInReusablePrefix  bool
 }
 
-func flattenClaudeCacheBlocks(req *ClaudeRequest) []cacheablePromptBlock {
+func flattenClaudeCacheBlocks(req *ClaudeRequest, defaultTTL time.Duration) []cacheablePromptBlock {
 	blocks := make([]cacheablePromptBlock, 0)
 	toolLinks := newToolLinkageNormalizer()
 	blocks = append(blocks, buildCachePreludeBlock(req))
@@ -699,19 +739,21 @@ func flattenClaudeCacheBlocks(req *ClaudeRequest) []cacheablePromptBlock {
 			"input_schema": tool.InputSchema,
 		}
 		fingerprintValue := stripCachePositionKeys(toolValue)
+		markerTTL, hasCacheControl := extractPromptCacheTTL(tool, defaultTTL)
 		blocks = append(blocks, cacheablePromptBlock{
-			Value:  fingerprintValue,
-			Tokens: estimateApproxTokens(canonicalizeCacheValue(fingerprintValue)),
-			TTL:    normalizePromptCacheTTL(extractPromptCacheTTL(tool)),
-			Kind:   "tool",
+			Value:           fingerprintValue,
+			Tokens:          estimateApproxTokens(canonicalizeCacheValue(fingerprintValue)),
+			TTL:             normalizePromptCacheTTL(markerTTL),
+			HasCacheControl: hasCacheControl,
+			Kind:            "tool",
 		})
 	}
 
-	appendSystemCacheBlocks(&blocks, req.System)
+	appendSystemCacheBlocks(&blocks, req.System, defaultTTL)
 	markStaticSystemPrefixBlocks(blocks, req.promptCacheStaticSystemPrefix)
 
 	for messageIndex, msg := range req.Messages {
-		appendMessageCacheBlocks(&blocks, messageIndex, msg, toolLinks)
+		appendMessageCacheBlocks(&blocks, messageIndex, msg, toolLinks, defaultTTL)
 	}
 
 	markDynamicSystemPrefixBlocks(blocks)
@@ -762,7 +804,7 @@ func buildCachePreludeBlock(req *ClaudeRequest) cacheablePromptBlock {
 	}
 }
 
-func appendSystemCacheBlocks(blocks *[]cacheablePromptBlock, system interface{}) {
+func appendSystemCacheBlocks(blocks *[]cacheablePromptBlock, system interface{}, defaultTTL time.Duration) {
 	switch v := system.(type) {
 	case string:
 		appendPromptBlock(blocks, map[string]interface{}{
@@ -772,14 +814,14 @@ func appendSystemCacheBlocks(blocks *[]cacheablePromptBlock, system interface{})
 				"type": "text",
 				"text": v,
 			},
-		}, false, nil)
+		}, false, nil, defaultTTL)
 	case []interface{}:
 		for i, block := range v {
 			appendPromptBlock(blocks, map[string]interface{}{
 				"kind":         "system",
 				"system_index": i,
 				"block":        block,
-			}, false, nil)
+			}, false, nil, defaultTTL)
 		}
 	case []string:
 		for i, block := range v {
@@ -790,12 +832,12 @@ func appendSystemCacheBlocks(blocks *[]cacheablePromptBlock, system interface{})
 					"type": "text",
 					"text": block,
 				},
-			}, false, nil)
+			}, false, nil, defaultTTL)
 		}
 	}
 }
 
-func appendMessageCacheBlocks(blocks *[]cacheablePromptBlock, messageIndex int, msg ClaudeMessage, toolLinks *toolLinkageNormalizer) {
+func appendMessageCacheBlocks(blocks *[]cacheablePromptBlock, messageIndex int, msg ClaudeMessage, toolLinks *toolLinkageNormalizer, defaultTTL time.Duration) {
 	role := msg.Role
 	switch content := msg.Content.(type) {
 	case string:
@@ -808,7 +850,7 @@ func appendMessageCacheBlocks(blocks *[]cacheablePromptBlock, messageIndex int, 
 				"type": "text",
 				"text": content,
 			},
-		}, true, toolLinks)
+		}, true, toolLinks, defaultTTL)
 	case []interface{}:
 		lastIdx := len(content) - 1
 		for blockIndex, block := range content {
@@ -818,7 +860,7 @@ func appendMessageCacheBlocks(blocks *[]cacheablePromptBlock, messageIndex int, 
 				"role":          role,
 				"block_index":   blockIndex,
 				"block":         block,
-			}, blockIndex == lastIdx, toolLinks)
+			}, blockIndex == lastIdx, toolLinks, defaultTTL)
 		}
 	default:
 		if content != nil {
@@ -828,14 +870,15 @@ func appendMessageCacheBlocks(blocks *[]cacheablePromptBlock, messageIndex int, 
 				"role":          role,
 				"block_index":   0,
 				"block":         content,
-			}, true, toolLinks)
+			}, true, toolLinks, defaultTTL)
 		}
 	}
 }
 
-func appendPromptBlock(blocks *[]cacheablePromptBlock, wrapper map[string]interface{}, isMessageEnd bool, toolLinks *toolLinkageNormalizer) {
+func appendPromptBlock(blocks *[]cacheablePromptBlock, wrapper map[string]interface{}, isMessageEnd bool, toolLinks *toolLinkageNormalizer, defaultTTL time.Duration) {
 	blockValue := wrapper["block"]
-	ttl := normalizePromptCacheTTL(extractPromptCacheTTL(blockValue))
+	markerTTL, hasCacheControl := extractPromptCacheTTL(blockValue, defaultTTL)
+	ttl := normalizePromptCacheTTL(markerTTL)
 
 	// Drop volatile billing metadata from the cache fingerprint. Claude Code's
 	// x-anthropic-billing-header can drift, appear, or disappear across
@@ -853,11 +896,12 @@ func appendPromptBlock(blocks *[]cacheablePromptBlock, wrapper map[string]interf
 	tokenValue["block"] = normalizeToolLinkageForCacheFingerprint(wrapper["block"], nil)
 	kind, _ := wrapper["kind"].(string)
 	*blocks = append(*blocks, cacheablePromptBlock{
-		Value:        fingerprintValue,
-		Tokens:       estimateApproxTokens(canonicalizeCacheValue(tokenValue)),
-		TTL:          ttl,
-		Kind:         kind,
-		IsMessageEnd: isMessageEnd,
+		Value:           fingerprintValue,
+		Tokens:          estimateApproxTokens(canonicalizeCacheValue(tokenValue)),
+		TTL:             ttl,
+		HasCacheControl: hasCacheControl,
+		Kind:            kind,
+		IsMessageEnd:    isMessageEnd,
 	})
 }
 
@@ -956,7 +1000,7 @@ func isAnthropicBillingHeaderBlock(value interface{}) bool {
 	return strings.HasPrefix(strings.ToLower(trimmed), "x-anthropic-billing-header:")
 }
 
-func extractPromptCacheTTL(value interface{}) time.Duration {
+func extractPromptCacheTTL(value interface{}, defaultTTL time.Duration) (time.Duration, bool) {
 	block, ok := value.(map[string]interface{})
 	if !ok {
 		if raw, err := json.Marshal(value); err == nil {
@@ -968,29 +1012,36 @@ func extractPromptCacheTTL(value interface{}) time.Duration {
 		}
 	}
 	if !ok {
-		return 0
+		return 0, false
 	}
 
 	rawCache, ok := block["cache_control"]
 	if !ok {
-		return 0
+		return 0, false
 	}
 	cacheControl, ok := rawCache.(map[string]interface{})
 	if !ok {
-		return 0
+		return 0, true
 	}
 	cacheType, _ := cacheControl["type"].(string)
 	if !strings.EqualFold(cacheType, "ephemeral") {
-		return 0
+		return 0, true
 	}
 
-	if ttl, ok := parsePromptCacheTTLValue(cacheControl["ttl"]); ok {
-		return ttl
+	rawTTL, hasTTL := cacheControl["ttl"]
+	if !hasTTL {
+		return normalizePromptCacheTTL(defaultTTL), true
 	}
-	return defaultPromptCacheTTL
+	if ttl, ok := parsePromptCacheTTLValue(rawTTL); ok &&
+		(ttl == defaultPromptCacheTTL || ttl == time.Hour) {
+		return ttl, true
+	}
+	return 0, true
 }
 
 func parsePromptCacheTTLValue(value interface{}) (time.Duration, bool) {
+	// Anthropic uses "5m"/"1h" on the wire. Exact second equivalents remain
+	// accepted for compatibility with clients that serialize durations numerically.
 	switch v := value.(type) {
 	case string:
 		trimmed := strings.TrimSpace(strings.ToLower(v))
@@ -1004,7 +1055,7 @@ func parsePromptCacheTTLValue(value interface{}) (time.Duration, bool) {
 			return time.Duration(seconds) * time.Second, true
 		}
 	case float64:
-		if v > 0 {
+		if v > 0 && v == float64(int64(v)) {
 			return time.Duration(v) * time.Second, true
 		}
 	case int:
@@ -1017,6 +1068,22 @@ func parsePromptCacheTTLValue(value interface{}) (time.Duration, bool) {
 		}
 	}
 	return 0, false
+}
+
+func writePromptCachePolicyChange(policyHasher, prefixHasher hashWriter, ttl time.Duration) {
+	writeHashChunk(policyHasher, "ttl_change")
+	_, _ = policyHasher.Write(prefixHasher.Sum(nil))
+	writeHashChunk(policyHasher, strconv.FormatInt(int64(ttl/time.Second), 10))
+}
+
+func promptCacheFingerprint(prefixHasher, policyHasher hashWriter) [32]byte {
+	hasher := sha256.New()
+	writeHashChunk(hasher, "prompt_cache_fingerprint_v2")
+	_, _ = hasher.Write(prefixHasher.Sum(nil))
+	_, _ = hasher.Write(policyHasher.Sum(nil))
+	var fingerprint [32]byte
+	copy(fingerprint[:], hasher.Sum(nil))
+	return fingerprint
 }
 
 func normalizePromptCacheTTL(ttl time.Duration) time.Duration {

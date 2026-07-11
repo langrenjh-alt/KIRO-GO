@@ -134,6 +134,13 @@
       background: var(--series-color);
       flex: none;
     }
+    .traffic-legend-swatch--rate {
+      width: 0.875rem;
+      height: 0;
+      border-radius: 0;
+      border-top: 2px dashed var(--series-color);
+      background: transparent;
+    }
     .traffic-chart-stage {
       position: relative;
       width: 100%;
@@ -509,6 +516,7 @@
             <span class="traffic-legend-item"><span class="traffic-legend-swatch" style="--series-color:#16a34a"></span><span data-i18n="traffic.outputTokens"></span></span>
             <span class="traffic-legend-item"><span class="traffic-legend-swatch" style="--series-color:#d97706"></span><span data-i18n="traffic.cacheCreationTokens"></span></span>
             <span class="traffic-legend-item"><span class="traffic-legend-swatch" style="--series-color:#7c3aed"></span><span data-i18n="traffic.cacheReadTokens"></span></span>
+            <span class="traffic-legend-item"><span class="traffic-legend-swatch traffic-legend-swatch--rate" style="--series-color:#db2777"></span><span data-i18n="traffic.cacheReadRate"></span></span>
           </div>
           <div class="traffic-chart-stage" id="trafficChartStage">
             <canvas id="trafficChart" role="img" aria-label="" data-i18n-aria-label="traffic.chartAria"></canvas>
@@ -570,6 +578,14 @@
             <label for="promptCacheMaxEntries" data-i18n="settings.promptCacheMaxEntries"></label>
             <input type="number" id="promptCacheMaxEntries" min="256" max="1048576" step="256" value="131072" />
             <small data-i18n="settings.promptCacheMaxEntriesHint"></small>
+          </div>
+          <div class="form-group">
+            <label for="promptCacheTTLSeconds" data-i18n="settings.promptCacheTTL"></label>
+            <select id="promptCacheTTLSeconds">
+              <option value="300" data-i18n="settings.promptCacheTTL5m"></option>
+              <option value="3600" data-i18n="settings.promptCacheTTL1h"></option>
+            </select>
+            <small data-i18n="settings.promptCacheTTLHint"></small>
           </div>
           <button class="btn btn-primary" id="savePromptCacheBtn" data-i18n="settings.savePromptCache"></button>
         </div>
