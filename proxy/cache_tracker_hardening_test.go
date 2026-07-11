@@ -181,7 +181,7 @@ func TestBuildClaudeProfileReturnsNilWithoutCacheControl(t *testing.T) {
 	if claudeRequestHasCacheControl(plain) {
 		t.Fatal("claudeRequestHasCacheControl should be false for a request with no cache_control")
 	}
-	if prof := tr.BuildClaudeProfile(plain, 5000); prof != nil {
+	if prof := tr.BuildClaudeProfile(plain, 5000, "test-session"); prof != nil {
 		t.Fatalf("expected nil profile when no cache_control present, got %+v", prof)
 	}
 
@@ -200,7 +200,7 @@ func TestBuildClaudeProfileReturnsNilWithoutCacheControl(t *testing.T) {
 	if !claudeRequestHasCacheControl(withCache) {
 		t.Fatal("claudeRequestHasCacheControl should be true when cache_control is present")
 	}
-	if prof := tr.BuildClaudeProfile(withCache, 2048); prof == nil {
+	if prof := tr.BuildClaudeProfile(withCache, 2048, "test-session"); prof == nil {
 		t.Fatal("expected a profile when cache_control is present above threshold")
 	}
 }

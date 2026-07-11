@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"time"
@@ -269,14 +270,21 @@ var (
 // Init initializes the configuration system with the specified file path.
 // If the file doesn't exist, a default configuration is created.
 func Init(path string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
 	cfgPath = path
-	return Load()
+	return loadLocked()
 }
 
 func Load() error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
+	return loadLocked()
+}
 
+// loadLocked replaces the in-memory configuration from cfgPath. The caller
+// must hold cfgLock so Init cannot switch paths while another save is running.
+func loadLocked() error {
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -357,14 +365,51 @@ func newUUID() string {
 	return GenerateMachineId()
 }
 
-// Save persists the current configuration to the JSON file.
-// Uses indented formatting for human readability.
+// Save persists the current configuration without exposing a partially written
+// JSON file if the process or filesystem fails during the write.
 func Save() error {
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(cfgPath, data, 0600)
+	return writeConfigAtomic(cfgPath, data)
+}
+
+func writeConfigAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+"-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+	}()
+
+	if _, err := tmp.Write(data); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Chmod(0600); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+
+	// Syncing the directory makes the rename durable on filesystems that
+	// support it. Some platforms reject directory Sync, so this is best-effort.
+	if dirHandle, err := os.Open(dir); err == nil {
+		_ = dirHandle.Sync()
+		_ = dirHandle.Close()
+	}
+	return nil
 }
 
 // SetPassword updates the admin password.
@@ -803,12 +848,25 @@ func UpdateSettingsPatch(apiKey *string, requireApiKey *bool, password string) e
 func UpdateStats(totalReq, successReq, failedReq, totalTokens int, totalCredits float64) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
+	previousTotalReq := cfg.TotalRequests
+	previousSuccessReq := cfg.SuccessRequests
+	previousFailedReq := cfg.FailedRequests
+	previousTotalTokens := cfg.TotalTokens
+	previousTotalCredits := cfg.TotalCredits
 	cfg.TotalRequests = totalReq
 	cfg.SuccessRequests = successReq
 	cfg.FailedRequests = failedReq
 	cfg.TotalTokens = totalTokens
 	cfg.TotalCredits = totalCredits
-	return Save()
+	if err := Save(); err != nil {
+		cfg.TotalRequests = previousTotalReq
+		cfg.SuccessRequests = previousSuccessReq
+		cfg.FailedRequests = previousFailedReq
+		cfg.TotalTokens = previousTotalTokens
+		cfg.TotalCredits = previousTotalCredits
+		return err
+	}
+	return nil
 }
 
 func GetStats() (int, int, int, int, float64) {
@@ -1070,30 +1128,46 @@ func GetLogLevel() string {
 	return cfg.LogLevel
 }
 
-// GetPromptCacheMaxRatio returns the cache-read cap ratio (0.0-1.0). Defaults to 0.85.
+const (
+	// MinPromptCacheRatio is the smallest cache-read ratio accepted by Admin.
+	MinPromptCacheRatio = 0.01
+	// MaxPromptCacheRatio is the largest cache-read ratio accepted by Admin.
+	MaxPromptCacheRatio = 1.0
+)
+
+// GetPromptCacheMaxRatio returns the cache-read cap ratio. Defaults to 0.85 and
+// clamps legacy configuration values to the range supported by Admin.
 func GetPromptCacheMaxRatio() float64 {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
-	if cfg == nil || cfg.PromptCacheMaxRatio <= 0 || cfg.PromptCacheMaxRatio > 1 {
+	if cfg == nil || cfg.PromptCacheMaxRatio <= 0 {
 		return 0.85
+	}
+	if cfg.PromptCacheMaxRatio < MinPromptCacheRatio {
+		return MinPromptCacheRatio
+	}
+	if cfg.PromptCacheMaxRatio > MaxPromptCacheRatio {
+		return MaxPromptCacheRatio
 	}
 	return cfg.PromptCacheMaxRatio
 }
 
 // UpdatePromptCacheMaxRatio sets the cache-read cap ratio and persists the change.
 func UpdatePromptCacheMaxRatio(ratio float64) error {
-	cfgLock.Lock()
-	defer cfgLock.Unlock()
-	cfg.PromptCacheMaxRatio = ratio
-	return Save()
+	return UpdatePromptCacheSettings(&ratio, nil)
 }
 
 const defaultPromptCacheMaxEntries = 131072
-const minPromptCacheEntries = 256
+
+// MinPromptCacheEntries is the safety floor accepted by the Admin API.
+const MinPromptCacheEntries = 256
+
+// MaxPromptCacheEntries limits live Admin resizes to a predictable memory bound.
+const MaxPromptCacheEntries = 1048576
 
 // GetPromptCacheMaxEntries returns the prompt-cache LRU bound. Defaults to
 // 131072 when unset (≤ 0); an explicit small value is clamped up to
-// minPromptCacheEntries (256) so a misconfigured tiny value cannot make the
+// MinPromptCacheEntries (256) so a misconfigured tiny value cannot make the
 // cache useless. This is the production safety floor — the tracker constructor
 // trusts its caller (tests may use any capacity).
 func GetPromptCacheMaxEntries() int {
@@ -1102,20 +1176,58 @@ func GetPromptCacheMaxEntries() int {
 	if cfg == nil || cfg.PromptCacheMaxEntries <= 0 {
 		return defaultPromptCacheMaxEntries
 	}
-	if cfg.PromptCacheMaxEntries < minPromptCacheEntries {
-		return minPromptCacheEntries
+	if cfg.PromptCacheMaxEntries < MinPromptCacheEntries {
+		return MinPromptCacheEntries
+	}
+	if cfg.PromptCacheMaxEntries > MaxPromptCacheEntries {
+		return MaxPromptCacheEntries
 	}
 	return cfg.PromptCacheMaxEntries
 }
 
-// UpdatePromptCacheMaxEntries sets the prompt-cache LRU bound and persists it.
-// Applies on the next tracker construction (restart); it does not resize a
-// live tracker.
+// UpdatePromptCacheMaxEntries persists the prompt-cache LRU bound. Runtime
+// callers apply the returned configuration to the live tracker with SetMaxEntries.
 func UpdatePromptCacheMaxEntries(n int) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
+	previous := cfg.PromptCacheMaxEntries
 	cfg.PromptCacheMaxEntries = n
-	return Save()
+	if err := Save(); err != nil {
+		cfg.PromptCacheMaxEntries = previous
+		return err
+	}
+	return nil
+}
+
+// UpdatePromptCacheSettings validates and persists both cache controls as one
+// update. In-memory values are rolled back when persistence fails.
+func UpdatePromptCacheSettings(ratio *float64, maxEntries *int) error {
+	if ratio != nil && (*ratio < MinPromptCacheRatio || *ratio > MaxPromptCacheRatio) {
+		return fmt.Errorf("promptCacheMaxRatio must be between %.2f and %.2f", MinPromptCacheRatio, MaxPromptCacheRatio)
+	}
+	if maxEntries != nil && (*maxEntries < MinPromptCacheEntries || *maxEntries > MaxPromptCacheEntries) {
+		return fmt.Errorf("promptCacheMaxEntries must be between %d and %d", MinPromptCacheEntries, MaxPromptCacheEntries)
+	}
+	if ratio == nil && maxEntries == nil {
+		return nil
+	}
+
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	previousRatio := cfg.PromptCacheMaxRatio
+	previousMaxEntries := cfg.PromptCacheMaxEntries
+	if ratio != nil {
+		cfg.PromptCacheMaxRatio = *ratio
+	}
+	if maxEntries != nil {
+		cfg.PromptCacheMaxEntries = *maxEntries
+	}
+	if err := Save(); err != nil {
+		cfg.PromptCacheMaxRatio = previousRatio
+		cfg.PromptCacheMaxEntries = previousMaxEntries
+		return err
+	}
+	return nil
 }
 
 // UpdateLogLevel updates the log level setting and persists the change.

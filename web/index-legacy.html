@@ -845,6 +845,164 @@
                 font-size: 14px;
             }
         }
+
+        .traffic-toolbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 12px;
+            flex-wrap: wrap;
+        }
+
+        .traffic-toolbar h2 {
+            font-size: 18px;
+            letter-spacing: 0;
+        }
+
+        .traffic-range {
+            display: inline-grid;
+            grid-template-columns: repeat(3, minmax(52px, 1fr));
+            gap: 2px;
+            padding: 3px;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            background: #f1f5f9;
+        }
+
+        .traffic-range button {
+            height: 32px;
+            padding: 0 12px;
+            border: 0;
+            border-radius: 6px;
+            background: transparent;
+            color: #64748b;
+            font: inherit;
+            font-size: 13px;
+            font-weight: 600;
+            letter-spacing: 0;
+            cursor: pointer;
+        }
+
+        .traffic-range button.active {
+            background: #fff;
+            color: #1e293b;
+            box-shadow: 0 0 0 1px #e2e8f0;
+        }
+
+        .traffic-summary-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 10px;
+            margin-bottom: 16px;
+        }
+
+        .traffic-summary-item {
+            min-width: 0;
+            padding: 12px;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            background: #fff;
+            box-shadow: inset 3px 0 0 var(--series-color, #94a3b8);
+        }
+
+        .traffic-summary-label {
+            display: block;
+            color: #64748b;
+            font-size: 12px;
+            line-height: 1.3;
+        }
+
+        .traffic-summary-value {
+            display: block;
+            margin-top: 5px;
+            color: #1e293b;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 16px;
+            line-height: 1.2;
+            overflow-wrap: anywhere;
+        }
+
+        .traffic-chart-header,
+        .traffic-chart-meta,
+        .traffic-legend,
+        .traffic-legend-item {
+            display: flex;
+            align-items: center;
+        }
+
+        .traffic-chart-header {
+            justify-content: space-between;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        .traffic-chart-meta {
+            gap: 10px;
+            color: #64748b;
+            font-size: 12px;
+        }
+
+        .traffic-legend {
+            gap: 12px;
+            margin-top: 12px;
+            color: #64748b;
+            font-size: 12px;
+            flex-wrap: wrap;
+        }
+
+        .traffic-legend-item {
+            gap: 5px;
+            white-space: nowrap;
+        }
+
+        .traffic-legend-swatch {
+            width: 10px;
+            height: 10px;
+            border-radius: 2px;
+            background: var(--series-color);
+        }
+
+        .traffic-chart-stage {
+            position: relative;
+            width: 100%;
+            height: 340px;
+            margin-top: 10px;
+            overflow: hidden;
+        }
+
+        .traffic-chart-stage canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+        }
+
+        .traffic-chart-state {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 16px;
+            background: rgba(255, 255, 255, 0.9);
+            color: #64748b;
+            font-size: 13px;
+            text-align: center;
+        }
+
+        @media (max-width: 640px) {
+            .traffic-range {
+                width: 100%;
+            }
+
+            .traffic-summary-grid {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+
+            .traffic-chart-stage {
+                height: 270px;
+            }
+        }
     </style>
 </head>
 
@@ -914,6 +1072,7 @@
         </div>
         <div class="tabs">
             <div class="tab active" data-tab="accounts" data-i18n="tabs.accounts"></div>
+            <div class="tab" data-tab="traffic" data-i18n="tabs.traffic"></div>
             <div class="tab" data-tab="settings" data-i18n="tabs.settings"></div>
             <div class="tab" data-tab="api" data-i18n="tabs.api"></div>
         </div>
@@ -958,6 +1117,40 @@
                 <div id="accountsList"></div>
             </div>
         </div>
+        <div id="tabTraffic" class="tab-content hidden">
+            <div class="traffic-toolbar">
+                <h2 data-i18n="traffic.title"></h2>
+                <div class="traffic-range" role="group" aria-label="Time range">
+                    <button type="button" data-traffic-range="1h" aria-pressed="false">1h</button>
+                    <button type="button" data-traffic-range="6h" aria-pressed="false">6h</button>
+                    <button type="button" class="active" data-traffic-range="24h" aria-pressed="true">24h</button>
+                </div>
+            </div>
+            <div class="traffic-summary-grid" aria-live="polite">
+                <div class="traffic-summary-item" style="--series-color:#64748b"><span class="traffic-summary-label" data-i18n="traffic.requests"></span><strong class="traffic-summary-value" id="trafficTotalRequests">0</strong></div>
+                <div class="traffic-summary-item" style="--series-color:#0f766e"><span class="traffic-summary-label" data-i18n="traffic.totalTokens"></span><strong class="traffic-summary-value" id="trafficTotalTokens">0</strong></div>
+                <div class="traffic-summary-item" style="--series-color:#2563eb"><span class="traffic-summary-label" data-i18n="traffic.inputTokens"></span><strong class="traffic-summary-value" id="trafficInputTokens">0</strong></div>
+                <div class="traffic-summary-item" style="--series-color:#16a34a"><span class="traffic-summary-label" data-i18n="traffic.outputTokens"></span><strong class="traffic-summary-value" id="trafficOutputTokens">0</strong></div>
+                <div class="traffic-summary-item" style="--series-color:#d97706"><span class="traffic-summary-label" data-i18n="traffic.cacheCreationTokens"></span><strong class="traffic-summary-value" id="trafficCacheCreationTokens">0</strong></div>
+                <div class="traffic-summary-item" style="--series-color:#7c3aed"><span class="traffic-summary-label" data-i18n="traffic.cacheReadTokens"></span><strong class="traffic-summary-value" id="trafficCacheReadTokens">0</strong></div>
+            </div>
+            <div class="card">
+                <div class="traffic-chart-header">
+                    <span class="card-title" data-i18n="traffic.tokenTrend"></span>
+                    <div class="traffic-chart-meta"><span id="trafficUpdatedAt"></span><button type="button" class="btn btn-secondary btn-sm" id="trafficRefreshBtn" data-i18n="traffic.refresh"></button></div>
+                </div>
+                <div class="traffic-legend" aria-hidden="true">
+                    <span class="traffic-legend-item"><span class="traffic-legend-swatch" style="--series-color:#2563eb"></span><span data-i18n="traffic.inputTokens"></span></span>
+                    <span class="traffic-legend-item"><span class="traffic-legend-swatch" style="--series-color:#16a34a"></span><span data-i18n="traffic.outputTokens"></span></span>
+                    <span class="traffic-legend-item"><span class="traffic-legend-swatch" style="--series-color:#d97706"></span><span data-i18n="traffic.cacheCreationTokens"></span></span>
+                    <span class="traffic-legend-item"><span class="traffic-legend-swatch" style="--series-color:#7c3aed"></span><span data-i18n="traffic.cacheReadTokens"></span></span>
+                </div>
+                <div class="traffic-chart-stage" id="trafficChartStage">
+                    <canvas id="trafficChart" role="img" aria-label="Token usage trend"></canvas>
+                    <div class="traffic-chart-state hidden" id="trafficChartState"></div>
+                </div>
+            </div>
+        </div>
         <div id="tabSettings" class="tab-content hidden">
             <div class="card">
                 <div class="card-header"><span class="card-title" data-i18n="settings.apiSettings"></span></div>
@@ -984,6 +1177,22 @@
                         data-i18n="settings.allowOverUsageHint"></small>
                 </div>
                 <button class="btn btn-primary" onclick="saveOverUsageConfig()" data-i18n="common.save"></button>
+            </div>
+            <div class="card">
+                <div class="card-header"><span class="card-title" data-i18n="settings.promptCacheSettings"></span></div>
+                <div class="form-group">
+                    <label for="promptCacheMaxRatio" data-i18n="settings.promptCacheMaxRatio"></label>
+                    <input type="number" id="promptCacheMaxRatio" min="0.01" max="1" step="0.01" value="0.85">
+                    <small style="color:#64748b;font-size:12px;margin-top:4px;display:block"
+                        data-i18n="settings.promptCacheMaxRatioRange"></small>
+                </div>
+                <div class="form-group">
+                    <label for="promptCacheMaxEntries" data-i18n="settings.promptCacheMaxEntries"></label>
+                    <input type="number" id="promptCacheMaxEntries" min="256" max="1048576" step="256" value="131072">
+                    <small style="color:#64748b;font-size:12px;margin-top:4px;display:block"
+                        data-i18n="settings.promptCacheMaxEntriesHint"></small>
+                </div>
+                <button class="btn btn-primary" onclick="savePromptCacheConfig()" data-i18n="settings.savePromptCache"></button>
             </div>
             <div class="card">
                 <div class="card-header"><span class="card-title" data-i18n="settings.thinkingSettings"></span></div>
@@ -1175,8 +1384,22 @@
                 'stats.success': '成功',
                 'stats.failed': '失败',
                 'tabs.accounts': '账号',
+                'tabs.traffic': '流量',
                 'tabs.settings': '设置',
                 'tabs.api': 'API',
+                'traffic.title': '流量',
+                'traffic.requests': '请求数',
+                'traffic.totalTokens': 'Token 总量',
+                'traffic.inputTokens': '输入 Token',
+                'traffic.outputTokens': '输出 Token',
+                'traffic.cacheCreationTokens': '缓存创建 Token',
+                'traffic.cacheReadTokens': '缓存读取 Token',
+                'traffic.tokenTrend': 'Token 使用趋势',
+                'traffic.refresh': '刷新',
+                'traffic.updated': '更新于 {0}',
+                'traffic.loading': '正在加载流量数据...',
+                'traffic.empty': '此时间范围内暂无流量数据',
+                'traffic.loadError': '流量数据加载失败',
                 'accounts.title': '账号列表',
                 'accounts.add': '添加账号',
                 'accounts.empty': '暂无账号',
@@ -1219,6 +1442,15 @@
                 'settings.allowOverUsage': '允许超额使用',
                 'settings.allowOverUsageHint': '开启后，即使账号额度用尽也会继续使用该账号处理请求，不再因余额不足而报错',
                 'settings.overUsageSaved': '超额使用设置已保存',
+                'settings.promptCacheSettings': 'Prompt Cache',
+                'settings.promptCacheMaxRatio': '最大缓存比例',
+                'settings.promptCacheMaxRatioRange': '范围 0.01-1.00，保存后立即生效。',
+                'settings.promptCacheMaxEntries': '最大缓存容量',
+                'settings.promptCacheMaxEntriesHint': '可保存 256-1,048,576 个 Prompt 指纹，默认 131,072；保存后立即生效，无需重启。',
+                'settings.savePromptCache': '保存缓存设置',
+                'settings.promptCacheSaved': 'Prompt Cache 设置已保存',
+                'settings.promptCacheMaxRatioInvalid': '最大缓存比例必须介于 0.01 和 1.00 之间',
+                'settings.promptCacheMaxEntriesInvalid': '最大缓存容量必须是 256 到 1,048,576 之间的整数',
                 'settings.thinkingSettings': 'Thinking 模式设置',
                 'settings.thinkingSuffix': '触发后缀',
                 'settings.thinkingSuffixHint': '模型名称加此后缀即启用思考模式，如 claude-sonnet-4.5-thinking',
@@ -1466,8 +1698,22 @@
                 'stats.success': 'Success',
                 'stats.failed': 'Failed',
                 'tabs.accounts': 'Accounts',
+                'tabs.traffic': 'Traffic',
                 'tabs.settings': 'Settings',
                 'tabs.api': 'API',
+                'traffic.title': 'Traffic',
+                'traffic.requests': 'Requests',
+                'traffic.totalTokens': 'Total tokens',
+                'traffic.inputTokens': 'Input',
+                'traffic.outputTokens': 'Output',
+                'traffic.cacheCreationTokens': 'Cache creation',
+                'traffic.cacheReadTokens': 'Cache read',
+                'traffic.tokenTrend': 'Token usage trend',
+                'traffic.refresh': 'Refresh',
+                'traffic.updated': 'Updated {0}',
+                'traffic.loading': 'Loading traffic data...',
+                'traffic.empty': 'No traffic data in this time range',
+                'traffic.loadError': 'Failed to load traffic data',
                 'accounts.title': 'Account List',
                 'accounts.add': 'Add Account',
                 'accounts.empty': 'No accounts',
@@ -1504,6 +1750,15 @@
                 'settings.allowOverUsage': 'Allow Over-Usage',
                 'settings.allowOverUsageHint': 'When enabled, accounts will continue to serve requests even after their quota is exhausted',
                 'settings.overUsageSaved': 'Over-usage settings saved',
+                'settings.promptCacheSettings': 'Prompt Cache',
+                'settings.promptCacheMaxRatio': 'Maximum Cache Ratio',
+                'settings.promptCacheMaxRatioRange': '0.01-1.00. Changes take effect immediately.',
+                'settings.promptCacheMaxEntries': 'Maximum Cache Entries',
+                'settings.promptCacheMaxEntriesHint': '256-1,048,576 prompt fingerprints. Default 131,072; changes take effect immediately.',
+                'settings.savePromptCache': 'Save Cache Settings',
+                'settings.promptCacheSaved': 'Prompt cache settings saved',
+                'settings.promptCacheMaxRatioInvalid': 'Maximum cache ratio must be between 0.01 and 1.00',
+                'settings.promptCacheMaxEntriesInvalid': 'Maximum cache entries must be a whole number between 256 and 1,048,576',
                 'settings.thinkingSettings': 'Thinking Mode Settings',
                 'settings.thinkingSuffix': 'Trigger Suffix',
                 'settings.thinkingSuffixHint': 'Add this suffix to model name to enable thinking mode, e.g. claude-sonnet-4.5-thinking',
@@ -1748,6 +2003,7 @@
             updateLangButtons();
             applyTranslations();
             renderAccounts();
+            renderTraffic(trafficData);
         }
         function updateLangButtons() {
             document.querySelectorAll('.lang-btn').forEach(btn => {
@@ -1769,6 +2025,17 @@
         let selectedAccounts = new Set();
         let filterKeyword = '';
         let filterStatus = 'all';
+        let trafficRange = '24h';
+        let trafficData = null;
+        let trafficLastUpdated = null;
+        let trafficLoadSequence = 0;
+        let trafficViewState = 'idle';
+        const trafficSeries = [
+            { key: 'inputTokens', labelKey: 'traffic.inputTokens', color: '#2563eb' },
+            { key: 'outputTokens', labelKey: 'traffic.outputTokens', color: '#16a34a' },
+            { key: 'cacheCreationTokens', labelKey: 'traffic.cacheCreationTokens', color: '#d97706' },
+            { key: 'cacheReadTokens', labelKey: 'traffic.cacheReadTokens', color: '#7c3aed' }
+        ];
 
         // 隐私模式状态管理
         let privacyModeEnabled = true;
@@ -1843,6 +2110,11 @@
             if (password) tryAutoLogin();
             document.getElementById('pwdField').addEventListener('keypress', e => { if (e.key === 'Enter') login(); });
             document.querySelectorAll('.tab').forEach(tab => { tab.onclick = () => switchTab(tab.dataset.tab); });
+            document.querySelectorAll('[data-traffic-range]').forEach(button => {
+                button.onclick = () => loadTraffic(button.dataset.trafficRange);
+            });
+            document.getElementById('trafficRefreshBtn').onclick = () => loadTraffic(trafficRange);
+            window.addEventListener('resize', drawTrafficChart);
         });
         async function tryAutoLogin() {
             // 72h 过期检查
@@ -1903,6 +2175,203 @@
             document.getElementById('statTokens').textContent = formatNum(d.totalTokens || 0);
             document.getElementById('statCredits').textContent = (d.totalCredits || 0).toFixed(1);
         }
+
+        function legacyTrafficNumber(obj, names) {
+            if (!obj || typeof obj !== 'object') return null;
+            for (const name of names) {
+                if (obj[name] === undefined || obj[name] === null || obj[name] === '') continue;
+                const value = Number(obj[name]);
+                if (Number.isFinite(value)) return Math.max(0, value);
+            }
+            return null;
+        }
+
+        function legacyTrafficTimestamp(value, index, total, range) {
+            let timestamp = typeof value === 'number' ? value : NaN;
+            if (typeof value === 'string' && value.trim()) {
+                const numeric = Number(value);
+                timestamp = Number.isFinite(numeric) ? numeric : Date.parse(value);
+            }
+            if (Number.isFinite(timestamp)) {
+                if (timestamp > 0 && timestamp < 1e12) timestamp *= 1000;
+                return timestamp;
+            }
+            const hours = Math.max(1, parseInt(range, 10) || 24);
+            return Date.now() - ((total - 1 - index) / Math.max(1, total - 1)) * hours * 3600000;
+        }
+
+        function normalizeLegacyTraffic(payload, range) {
+            let source = Array.isArray(payload) ? { buckets: payload } : (payload || {});
+            if (source.data && !Array.isArray(source.data) && (source.data.buckets || source.data.points)) source = source.data;
+            const raw = Array.isArray(source.buckets) ? source.buckets :
+                (Array.isArray(source.points) ? source.points : (Array.isArray(source.data) ? source.data : []));
+            const points = raw.map((bucket, index) => {
+                const usage = bucket && (bucket.usage || bucket.tokens) || {};
+                const value = names => {
+                    const direct = legacyTrafficNumber(bucket, names);
+                    const nested = legacyTrafficNumber(usage, names);
+                    return direct === null ? (nested === null ? 0 : nested) : direct;
+                };
+                const timeValue = bucket && (bucket.timestamp || bucket.time || bucket.bucketStart || bucket.bucket_start || bucket.ts);
+                return {
+                    timestamp: legacyTrafficTimestamp(timeValue, index, raw.length, range),
+                    requests: value(['requests', 'requestCount', 'request_count']),
+                    inputTokens: value(['inputTokens', 'input_tokens', 'input']),
+                    outputTokens: value(['outputTokens', 'output_tokens', 'output']),
+                    cacheCreationTokens: value(['cacheCreationTokens', 'cacheCreationInputTokens', 'cache_creation_input_tokens']),
+                    cacheReadTokens: value(['cacheReadTokens', 'cacheReadInputTokens', 'cache_read_input_tokens'])
+                };
+            }).sort((a, b) => a.timestamp - b.timestamp);
+            const reduced = points.reduce((total, point) => {
+                total.requests += point.requests;
+                trafficSeries.forEach(series => { total[series.key] += point[series.key]; });
+                return total;
+            }, { requests: 0, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 });
+            const provided = source.totals || source.summary || {};
+            const totalValue = (names, fallback) => {
+                const value = legacyTrafficNumber(provided, names);
+                return value === null ? fallback : value;
+            };
+            const totals = {
+                requests: totalValue(['requests', 'requestCount', 'request_count', 'totalRequests'], reduced.requests),
+                inputTokens: totalValue(['inputTokens', 'input_tokens'], reduced.inputTokens),
+                outputTokens: totalValue(['outputTokens', 'output_tokens'], reduced.outputTokens),
+                cacheCreationTokens: totalValue(['cacheCreationTokens', 'cacheCreationInputTokens', 'cache_creation_input_tokens'], reduced.cacheCreationTokens),
+                cacheReadTokens: totalValue(['cacheReadTokens', 'cacheReadInputTokens', 'cache_read_input_tokens'], reduced.cacheReadTokens)
+            };
+            const fallbackTotal = totals.inputTokens + totals.outputTokens + totals.cacheCreationTokens + totals.cacheReadTokens;
+            totals.totalTokens = totalValue(['totalTokens', 'total_tokens'], fallbackTotal);
+            return { points, totals };
+        }
+
+        function legacyTrafficFormat(value) {
+            const locale = currentLang === 'zh' ? 'zh-CN' : 'en-US';
+            return Math.round(Number(value) || 0).toLocaleString(locale);
+        }
+
+        function legacyTrafficTime(timestamp, withDate) {
+            const locale = currentLang === 'zh' ? 'zh-CN' : 'en-US';
+            const options = withDate
+                ? { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }
+                : { hour: '2-digit', minute: '2-digit' };
+            return new Intl.DateTimeFormat(locale, options).format(new Date(timestamp));
+        }
+
+        function setLegacyTrafficState(message) {
+            const state = document.getElementById('trafficChartState');
+            state.textContent = message || '';
+            state.classList.toggle('hidden', !message);
+        }
+
+        function renderTraffic(data) {
+            const totals = data && data.totals || {};
+            const fields = {
+                trafficTotalRequests: totals.requests,
+                trafficTotalTokens: totals.totalTokens,
+                trafficInputTokens: totals.inputTokens,
+                trafficOutputTokens: totals.outputTokens,
+                trafficCacheCreationTokens: totals.cacheCreationTokens,
+                trafficCacheReadTokens: totals.cacheReadTokens
+            };
+            Object.keys(fields).forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.textContent = legacyTrafficFormat(fields[id]);
+            });
+            document.querySelectorAll('[data-traffic-range]').forEach(button => {
+                const active = button.dataset.trafficRange === trafficRange;
+                button.classList.toggle('active', active);
+                button.setAttribute('aria-pressed', String(active));
+            });
+            const updated = document.getElementById('trafficUpdatedAt');
+            if (updated) updated.textContent = trafficLastUpdated ? t('traffic.updated', legacyTrafficTime(trafficLastUpdated.getTime(), false)) : '';
+            const hasTraffic = Number(totals.requests) > 0 || Number(totals.totalTokens) > 0;
+            if (trafficViewState === 'loading') setLegacyTrafficState(t('traffic.loading'));
+            else if (trafficViewState === 'error') setLegacyTrafficState(t('traffic.loadError'));
+            else if (data && hasTraffic) setLegacyTrafficState('');
+            else if (data) setLegacyTrafficState(t('traffic.empty'));
+            requestAnimationFrame(drawTrafficChart);
+        }
+
+        async function loadTraffic(range) {
+            trafficRange = ['1h', '6h', '24h'].includes(range) ? range : trafficRange;
+            const sequence = ++trafficLoadSequence;
+            trafficViewState = 'loading';
+            renderTraffic(trafficData);
+            try {
+                const res = await fetch('/admin/api/traffic?range=' + encodeURIComponent(trafficRange), {
+                    headers: { 'X-Admin-Password': password }
+                });
+                const payload = await res.json().catch(() => ({}));
+                if (!res.ok) throw new Error(payload.error || t('traffic.loadError'));
+                if (sequence !== trafficLoadSequence) return;
+                trafficData = normalizeLegacyTraffic(payload, trafficRange);
+                trafficLastUpdated = new Date();
+                trafficViewState = 'ready';
+                renderTraffic(trafficData);
+            } catch (e) {
+                if (sequence !== trafficLoadSequence) return;
+                trafficData = normalizeLegacyTraffic({ buckets: [] }, trafficRange);
+                trafficViewState = 'error';
+                renderTraffic(trafficData);
+            }
+        }
+
+        function drawTrafficChart() {
+            const canvas = document.getElementById('trafficChart');
+            if (!canvas || !trafficData || !trafficData.points.length || canvas.offsetParent === null) return;
+            const width = canvas.clientWidth;
+            const height = canvas.clientHeight;
+            if (width < 80 || height < 80) return;
+            const dpr = Math.min(window.devicePixelRatio || 1, 2);
+            canvas.width = Math.round(width * dpr);
+            canvas.height = Math.round(height * dpr);
+            const ctx = canvas.getContext('2d');
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            ctx.clearRect(0, 0, width, height);
+            const points = trafficData.points;
+            const rawMax = Math.max(0, ...points.flatMap(point => trafficSeries.map(series => point[series.key] || 0)));
+            const yMax = rawMax > 0 ? rawMax * 1.08 : 1;
+            const left = 54;
+            const right = 12;
+            const top = 12;
+            const bottom = 34;
+            const plotWidth = Math.max(1, width - left - right);
+            const plotHeight = Math.max(1, height - top - bottom);
+            const xFor = index => points.length === 1 ? left + plotWidth / 2 : left + index / (points.length - 1) * plotWidth;
+            const yFor = value => top + plotHeight - Math.max(0, value) / yMax * plotHeight;
+            ctx.font = '11px system-ui';
+            ctx.fillStyle = '#64748b';
+            ctx.strokeStyle = '#e2e8f0';
+            ctx.lineWidth = 1;
+            ctx.textBaseline = 'middle';
+            for (let i = 0; i <= 4; i++) {
+                const value = yMax * (4 - i) / 4;
+                const y = top + plotHeight * i / 4;
+                ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(width - right, y); ctx.stroke();
+                ctx.textAlign = 'right';
+                ctx.fillText(formatNum(Math.round(value)), left - 8, y);
+            }
+            const indexes = Array.from(new Set([0, Math.round((points.length - 1) / 2), points.length - 1]));
+            ctx.textBaseline = 'bottom';
+            indexes.forEach((index, position) => {
+                ctx.textAlign = position === 0 ? 'left' : (position === indexes.length - 1 ? 'right' : 'center');
+                ctx.fillText(legacyTrafficTime(points[index].timestamp, trafficRange === '24h'), xFor(index), height - 4);
+            });
+            trafficSeries.forEach(series => {
+                ctx.beginPath();
+                points.forEach((point, index) => {
+                    const x = xFor(index);
+                    const y = yFor(point[series.key] || 0);
+                    if (index === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+                });
+                ctx.strokeStyle = series.color;
+                ctx.lineWidth = 2;
+                ctx.lineJoin = 'round';
+                ctx.lineCap = 'round';
+                ctx.stroke();
+            });
+        }
+
         async function loadAccounts() {
             const res = await fetch('/admin/api/accounts', { headers: { 'X-Admin-Password': password } });
             accountsData = await res.json();
@@ -2474,6 +2943,14 @@
             document.getElementById('requireApiKey').checked = d.requireApiKey;
             document.getElementById('apiKeyInput').value = d.apiKey || '';
             document.getElementById('allowOverUsage').checked = d.allowOverUsage || false;
+            const promptCacheMaxRatio = Number(d.promptCacheMaxRatio);
+            document.getElementById('promptCacheMaxRatio').value = Number.isFinite(promptCacheMaxRatio) && promptCacheMaxRatio > 0 && promptCacheMaxRatio <= 1
+                ? String(promptCacheMaxRatio)
+                : '0.85';
+            const promptCacheMaxEntries = Number(d.promptCacheMaxEntries);
+            document.getElementById('promptCacheMaxEntries').value = Number.isInteger(promptCacheMaxEntries) && promptCacheMaxEntries >= 256
+                ? String(promptCacheMaxEntries)
+                : '131072';
             loadThinkingConfig();
             loadEndpointConfig();
             loadProxyConfig();
@@ -2634,6 +3111,35 @@
             });
             alert(t('settings.overUsageSaved'));
         }
+        async function savePromptCacheConfig() {
+            const ratioInput = document.getElementById('promptCacheMaxRatio');
+            const entriesInput = document.getElementById('promptCacheMaxEntries');
+            const promptCacheMaxRatio = Number(ratioInput.value);
+            if (!Number.isFinite(promptCacheMaxRatio) || promptCacheMaxRatio < 0.01 || promptCacheMaxRatio > 1) {
+                alert(t('settings.promptCacheMaxRatioInvalid'));
+                ratioInput.focus();
+                return;
+            }
+            const promptCacheMaxEntries = Number(entriesInput.value);
+            if (!Number.isInteger(promptCacheMaxEntries) || promptCacheMaxEntries < 256 || promptCacheMaxEntries > 1048576) {
+                alert(t('settings.promptCacheMaxEntriesInvalid'));
+                entriesInput.focus();
+                return;
+            }
+            try {
+                const res = await fetch('/admin/api/settings', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+                    body: JSON.stringify({ promptCacheMaxRatio, promptCacheMaxEntries })
+                });
+                const d = await res.json().catch(() => ({}));
+                if (!res.ok || d.success === false) throw new Error(d.error || t('common.saveFailed'));
+                ratioInput.value = String(promptCacheMaxRatio);
+                entriesInput.value = String(promptCacheMaxEntries);
+                alert(t('settings.promptCacheSaved'));
+            } catch (e) {
+                alert((e && e.message) || t('common.saveFailed'));
+            }
+        }
         async function changePassword() {
             const newPwd = document.getElementById('newPassword').value;
             if (!newPwd) return alert(t('settings.passwordRequired'));
@@ -2655,6 +3161,10 @@
             document.querySelectorAll('.tab').forEach(tabEl => tabEl.classList.toggle('active', tabEl.dataset.tab === tab));
             document.querySelectorAll('.tab-content').forEach(c => c.classList.add('hidden'));
             document.getElementById('tab' + tab.charAt(0).toUpperCase() + tab.slice(1)).classList.remove('hidden');
+            if (tab === 'traffic') {
+                if (!trafficData) loadTraffic(trafficRange);
+                else requestAnimationFrame(drawTrafficChart);
+            }
         }
         async function toggleAccount(id, enabled) {
             await fetch('/admin/api/accounts/' + id, {

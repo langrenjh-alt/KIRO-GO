@@ -47,15 +47,20 @@ type Handler struct {
 	totalTokens     int64
 	totalCredits    float64 // float64 需要用锁保护
 	creditsMu       sync.RWMutex
+	statsMu         sync.Mutex
 	startTime       int64
 	stopRefresh     chan struct{}
 	stopStatsSaver  chan struct{}
+	closeOnce       sync.Once
+	backgroundWG    sync.WaitGroup
 	// 模型缓存
-	cachedModels    []ModelInfo
-	modelsCacheMu   sync.RWMutex
-	modelsCacheTime int64
-	promptCache     *promptCacheTracker
-	tokenRefreshMu  sync.Mutex
+	cachedModels        []ModelInfo
+	modelsCacheMu       sync.RWMutex
+	modelsCacheTime     int64
+	promptCache         *promptCacheTracker
+	promptCacheConfigMu sync.Mutex
+	traffic             *TrafficTracker
+	tokenRefreshMu      sync.Mutex
 	// 请求日志 (环形缓冲区，包含成功和失败)
 	requestLogs   []RequestLog
 	requestLogsMu sync.RWMutex
@@ -246,6 +251,7 @@ func NewHandler() *Handler {
 		stopRefresh:     make(chan struct{}),
 		stopStatsSaver:  make(chan struct{}),
 		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
+		traffic:         NewTrafficTracker(DefaultTrafficRetention),
 	}
 	cachePath := filepath.Join(config.GetConfigDir(), "prompt_cache.json")
 	h.promptCache.Load(cachePath)
@@ -253,10 +259,34 @@ func NewHandler() *Handler {
 	// 启动后台刷新
 	go h.backgroundRefresh()
 	// 启动后台统计保存 (每30秒保存一次)
-	go h.backgroundStatsSaver()
+	h.backgroundWG.Add(1)
+	go func() {
+		defer h.backgroundWG.Done()
+		h.backgroundStatsSaver()
+	}()
 	// 清理过期的 stored responses（>30 天）
 	go purgeExpiredResponses(responsesDefaultTTL)
 	return h
+}
+
+// Close stops background work and waits for final statistics and prompt-cache
+// state to reach disk.
+func (h *Handler) Close() {
+	if h == nil {
+		return
+	}
+	h.closeOnce.Do(func() {
+		if h.stopRefresh != nil {
+			close(h.stopRefresh)
+		}
+		if h.stopStatsSaver != nil {
+			close(h.stopStatsSaver)
+		}
+	})
+	h.backgroundWG.Wait()
+	if h.promptCache != nil {
+		h.promptCache.Stop()
+	}
 }
 
 // backgroundRefresh 后台定时刷新账户信息
@@ -264,8 +294,16 @@ func (h *Handler) backgroundRefresh() {
 	ticker := time.NewTicker(30 * time.Minute) // 每 30 分钟刷新一次
 	defer ticker.Stop()
 
-	// 启动时延迟 10 秒后执行一次
-	time.Sleep(10 * time.Second)
+	// 启动时延迟 10 秒后执行一次，关闭时可立即中断。
+	startupTimer := time.NewTimer(10 * time.Second)
+	select {
+	case <-startupTimer.C:
+	case <-h.stopRefresh:
+		if !startupTimer.Stop() {
+			<-startupTimer.C
+		}
+		return
+	}
 	h.refreshModelsCache()
 	h.refreshAllAccounts()
 
@@ -823,18 +861,37 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
 	thinkingResponseOpts := resolveClaudeThinkingResponseOptions(req.Thinking, thinkingCfg.ClaudeFormat)
 	estimatedInputTokens := estimateClaudeRequestInputTokens(effectiveReq)
-	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, estimatedInputTokens)
+	apiKeyID := apiKeyIDFromContext(r.Context())
+	isolationSeed := claudePromptCacheIsolationSeed(effectiveReq, apiKeyID)
+	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, estimatedInputTokens, isolationSeed)
 
 	// 转换请求
 	kiroPayload := ClaudeToKiro(&req, thinking)
 
 	// Stream or non-stream
-	apiKeyID := apiKeyIDFromContext(r.Context())
 	if req.Stream {
 		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
 	} else {
 		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
 	}
+}
+
+func claudePromptCacheIsolationSeed(req *ClaudeRequest, apiKeyID string) string {
+	apiKeyID = strings.TrimSpace(apiKeyID)
+	if req != nil && req.Metadata != nil {
+		if _, sessionID, ok := strings.Cut(req.Metadata.UserID, "_session_"); ok {
+			if sessionID = strings.TrimSpace(sessionID); sessionID != "" {
+				if apiKeyID != "" {
+					return "key:" + apiKeyID + "|session:" + sessionID
+				}
+				return "session:" + sessionID
+			}
+		}
+	}
+	if apiKeyID != "" {
+		return "key:" + apiKeyID
+	}
+	return ""
 }
 
 // handleClaudeStream Claude 流式响应
@@ -1239,9 +1296,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		// Re-anchor the cache split to the real upstream input total so
 		// input+creation+read stays consistent (cacheUsage was computed against
 		// the pre-call token estimate).
-		if cacheProfile != nil && realInputTokens > 0 {
-			cacheUsage = cacheUsage.splitAgainstTotal(cacheProfile.TotalInputTokens, inputTokens)
-		}
+		cacheUsage = reanchorClaudeCacheUsage(cacheProfile, cacheUsage, inputTokens)
 		outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
 		thinkingOutput := rawThinkingBuilder.String()
 		if thinking && thinkingOutput == "" && extractedReasoning != "" {
@@ -1252,7 +1307,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		}
 		outputTokens = estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, credits, cacheUsage)
 		h.pool.RecordSuccess(account.ID)
 		// h.pool.RecordLatency(account.ID, float64(time.Since(reqStart).Milliseconds()))
 		// ↑ dispatch-only latency EWMA (commit fbc99b1), absent on this cache-only
@@ -1283,6 +1338,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	}
 
 	if lastErr == nil {
+		h.recordFailureWithDetails("claude", model, "", fmt.Errorf("No available accounts"))
 		h.sendClaudeError(w, 503, "api_error", "No available accounts")
 		return
 	}
@@ -1315,6 +1371,8 @@ func (h *Handler) backgroundStatsSaver() {
 
 // saveStats 保存统计到配置文件
 func (h *Handler) saveStats() {
+	h.statsMu.Lock()
+	defer h.statsMu.Unlock()
 	config.UpdateStats(
 		int(atomic.LoadInt64(&h.totalRequests)),
 		int(atomic.LoadInt64(&h.successRequests)),
@@ -1350,19 +1408,45 @@ func (h *Handler) recordSuccess(inputTokens, outputTokens int, credits float64) 
 // When apiKeyID is empty (legacy single-key path or unauthenticated path), only the
 // global counters are updated. Persistence errors are logged but do not propagate.
 func (h *Handler) recordSuccessForApiKey(apiKeyID string, inputTokens, outputTokens int, credits float64) {
+	h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, credits, promptCacheUsage{})
+}
+
+func (h *Handler) recordSuccessForApiKeyWithCache(apiKeyID string, inputTokens, outputTokens int, credits float64, cacheUsage promptCacheUsage) {
+	h.statsMu.Lock()
 	h.recordSuccess(inputTokens, outputTokens, credits)
-	if apiKeyID == "" {
-		return
+	if h.traffic != nil {
+		h.traffic.Record(TrafficObservation{
+			InputTokens:         int64(billedClaudeInputTokens(inputTokens, cacheUsage)),
+			OutputTokens:        int64(outputTokens),
+			CacheCreationTokens: int64(cacheUsage.CacheCreationInputTokens),
+			CacheReadTokens:     int64(cacheUsage.CacheReadInputTokens),
+		})
 	}
-	if err := config.RecordApiKeyUsage(apiKeyID, int64(inputTokens+outputTokens), credits); err != nil {
-		logger.Warnf("[ApiKey] failed to record usage for key %s: %v", apiKeyID, err)
+	h.statsMu.Unlock()
+
+	if apiKeyID != "" {
+		if err := config.RecordApiKeyUsage(apiKeyID, int64(inputTokens+outputTokens), credits); err != nil {
+			logger.Warnf("[ApiKey] failed to record usage for key %s: %v", apiKeyID, err)
+		}
 	}
+}
+
+func reanchorClaudeCacheUsage(profile *promptCacheProfile, usage promptCacheUsage, finalInputTokens int) promptCacheUsage {
+	if profile == nil || finalInputTokens <= 0 {
+		return usage
+	}
+	return usage.splitAgainstTotal(profile.TotalInputTokens, finalInputTokens)
 }
 
 // recordFailureWithDetails records a failure and stores it in the request logs.
 func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, err error) {
+	h.statsMu.Lock()
 	atomic.AddInt64(&h.totalRequests, 1)
 	atomic.AddInt64(&h.failedRequests, 1)
+	if h.traffic != nil {
+		h.traffic.Record(TrafficObservation{})
+	}
+	h.statsMu.Unlock()
 
 	if err == nil {
 		return
@@ -1519,12 +1603,10 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		// Re-anchor the cache split to the real upstream input total so
 		// input+creation+read stays consistent (cacheUsage was computed against
 		// the pre-call token estimate).
-		if cacheProfile != nil && realInputTokens > 0 {
-			cacheUsage = cacheUsage.splitAgainstTotal(cacheProfile.TotalInputTokens, inputTokens)
-		}
+		cacheUsage = reanchorClaudeCacheUsage(cacheProfile, cacheUsage, inputTokens)
 		outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, credits, cacheUsage)
 		h.pool.RecordSuccess(account.ID)
 		// h.pool.RecordLatency(account.ID, float64(time.Since(reqStart).Milliseconds()))
 		// ↑ dispatch-only latency EWMA (commit fbc99b1), absent on this cache-only
@@ -1568,6 +1650,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 	}
 
 	if lastErr == nil {
+		h.recordFailureWithDetails("claude", model, "", fmt.Errorf("No available accounts"))
 		h.sendClaudeError(w, 503, "api_error", "No available accounts")
 		return
 	}
@@ -2014,6 +2097,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	}
 
 	if lastErr == nil {
+		h.recordFailureWithDetails("openai", model, "", fmt.Errorf("No available accounts"))
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 		return
 	}
@@ -2102,6 +2186,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 	}
 
 	if lastErr == nil {
+		h.recordFailureWithDetails("openai", model, "", fmt.Errorf("No available accounts"))
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 		return
 	}
@@ -2269,6 +2354,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetStats(w, r)
 	case path == "/stats/reset" && r.Method == "POST":
 		h.apiResetStats(w, r)
+	case path == "/traffic" && r.Method == "GET":
+		h.apiGetTraffic(w, r)
 	case path == "/logs" && r.Method == "GET":
 		h.apiGetLogs(w, r)
 	case path == "/logs" && r.Method == "DELETE":
@@ -3332,6 +3419,8 @@ func normalizeImportAuthMethod(authMethod, clientID, clientSecret, tokenEndpoint
 }
 
 func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
+	h.statsMu.Lock()
+	defer h.statsMu.Unlock()
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"version":         config.Version,
 		"accounts":        h.pool.Count(),
@@ -3347,11 +3436,13 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"apiKey":         config.GetApiKey(),
-		"requireApiKey":  config.IsApiKeyRequired(),
-		"port":           config.GetPort(),
-		"host":           config.GetHost(),
-		"allowOverUsage": config.GetAllowOverUsage(),
+		"apiKey":                config.GetApiKey(),
+		"requireApiKey":         config.IsApiKeyRequired(),
+		"port":                  config.GetPort(),
+		"host":                  config.GetHost(),
+		"allowOverUsage":        config.GetAllowOverUsage(),
+		"promptCacheMaxRatio":   config.GetPromptCacheMaxRatio(),
+		"promptCacheMaxEntries": config.GetPromptCacheMaxEntries(),
 	})
 }
 
@@ -3400,21 +3491,35 @@ func (h *Handler) apiUpdatePromptFilter(w http.ResponseWriter, r *http.Request) 
 
 func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ApiKey         *string `json:"apiKey,omitempty"`
-		RequireApiKey  *bool   `json:"requireApiKey,omitempty"`
-		Password       string  `json:"password,omitempty"`
-		AllowOverUsage *bool   `json:"allowOverUsage,omitempty"`
+		ApiKey                *string  `json:"apiKey,omitempty"`
+		RequireApiKey         *bool    `json:"requireApiKey,omitempty"`
+		Password              string   `json:"password,omitempty"`
+		AllowOverUsage        *bool    `json:"allowOverUsage,omitempty"`
+		PromptCacheMaxRatio   *float64 `json:"promptCacheMaxRatio,omitempty"`
+		PromptCacheMaxEntries *int     `json:"promptCacheMaxEntries,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
 		return
 	}
-
-	if err := config.UpdateSettingsPatch(req.ApiKey, req.RequireApiKey, req.Password); err != nil {
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+	if req.PromptCacheMaxRatio != nil && (*req.PromptCacheMaxRatio < config.MinPromptCacheRatio || *req.PromptCacheMaxRatio > config.MaxPromptCacheRatio) {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("promptCacheMaxRatio must be between %.2f and %.2f", config.MinPromptCacheRatio, config.MaxPromptCacheRatio)})
 		return
+	}
+	if req.PromptCacheMaxEntries != nil && (*req.PromptCacheMaxEntries < config.MinPromptCacheEntries || *req.PromptCacheMaxEntries > config.MaxPromptCacheEntries) {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("promptCacheMaxEntries must be between %d and %d", config.MinPromptCacheEntries, config.MaxPromptCacheEntries)})
+		return
+	}
+
+	if req.ApiKey != nil || req.RequireApiKey != nil || req.Password != "" {
+		if err := config.UpdateSettingsPatch(req.ApiKey, req.RequireApiKey, req.Password); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
 	}
 
 	// 更新超额使用设置
@@ -3427,11 +3532,25 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		// Rebuild the pool so over-quota accounts are re-included or dropped immediately.
 		h.pool.Reload()
 	}
+	if req.PromptCacheMaxRatio != nil || req.PromptCacheMaxEntries != nil {
+		h.promptCacheConfigMu.Lock()
+		defer h.promptCacheConfigMu.Unlock()
+		if err := config.UpdatePromptCacheSettings(req.PromptCacheMaxRatio, req.PromptCacheMaxEntries); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		if req.PromptCacheMaxEntries != nil && h.promptCache != nil {
+			h.promptCache.SetMaxEntries(config.GetPromptCacheMaxEntries())
+		}
+	}
 
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
 func (h *Handler) apiGetStats(w http.ResponseWriter, r *http.Request) {
+	h.statsMu.Lock()
+	defer h.statsMu.Unlock()
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"totalRequests":   atomic.LoadInt64(&h.totalRequests),
 		"successRequests": atomic.LoadInt64(&h.successRequests),
@@ -3443,6 +3562,13 @@ func (h *Handler) apiGetStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) apiResetStats(w http.ResponseWriter, r *http.Request) {
+	h.statsMu.Lock()
+	defer h.statsMu.Unlock()
+	if err := config.UpdateStats(0, 0, 0, 0, 0); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
 	atomic.StoreInt64(&h.totalRequests, 0)
 	atomic.StoreInt64(&h.successRequests, 0)
 	atomic.StoreInt64(&h.failedRequests, 0)
@@ -3450,8 +3576,41 @@ func (h *Handler) apiResetStats(w http.ResponseWriter, r *http.Request) {
 	h.creditsMu.Lock()
 	h.totalCredits = 0
 	h.creditsMu.Unlock()
-	config.UpdateStats(0, 0, 0, 0, 0)
+	if h.traffic != nil {
+		h.traffic.Reset()
+	}
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+func (h *Handler) apiGetTraffic(w http.ResponseWriter, r *http.Request) {
+	rangeName := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("range")))
+	if rangeName == "" {
+		rangeName = "24h"
+	}
+
+	var window time.Duration
+	switch rangeName {
+	case "1h":
+		window = time.Hour
+	case "6h":
+		window = 6 * time.Hour
+	case "24h":
+		window = 24 * time.Hour
+	default:
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "range must be one of: 1h, 6h, 24h"})
+		return
+	}
+
+	snapshot := h.traffic.Query(window)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"range":         rangeName,
+		"startTime":     snapshot.StartTime,
+		"endTime":       snapshot.EndTime,
+		"bucketSeconds": snapshot.BucketSeconds,
+		"totals":        snapshot.Totals,
+		"buckets":       snapshot.Buckets,
+	})
 }
 
 func (h *Handler) apiGetLogs(w http.ResponseWriter, r *http.Request) {

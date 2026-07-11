@@ -35,6 +35,19 @@
   let customSelectUid = 0;
   let customSelectObserver = null;
   let customSelectRefreshQueued = false;
+  let trafficRange = '24h';
+  let trafficData = null;
+  let trafficLastUpdated = null;
+  let trafficLoadSequence = 0;
+  let trafficViewState = 'idle';
+  let trafficChartLayout = null;
+  let trafficResizeObserver = null;
+  const TRAFFIC_SERIES = [
+    { key: 'inputTokens', labelKey: 'traffic.inputTokens', color: '#2563eb' },
+    { key: 'outputTokens', labelKey: 'traffic.outputTokens', color: '#16a34a' },
+    { key: 'cacheCreationTokens', labelKey: 'traffic.cacheCreationTokens', color: '#d97706' },
+    { key: 'cacheReadTokens', labelKey: 'traffic.cacheReadTokens', color: '#7c3aed' }
+  ];
 
   // DOM helpers
   const $ = (id) => document.getElementById(id);
@@ -132,6 +145,7 @@
     renderAccounts();
     renderPromptRules();
     renderLogs(logsCache);
+    renderTraffic(trafficData);
   }
   function updateLangButtons() {
     qsa('.lang-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.lang === currentLang));
@@ -396,6 +410,7 @@
       btn.setAttribute('aria-label', themeLabel);
       btn.setAttribute('title', themeLabel);
     });
+    requestAnimationFrame(drawTrafficChart);
   }
   function getThemePref() {
     const saved = localStorage.getItem('kiro_theme');
@@ -679,6 +694,329 @@
     $('statFailed').textContent = d.failedRequests || 0;
     $('statTokens').textContent = formatNum(d.totalTokens || 0);
     $('statCredits').textContent = (d.totalCredits || 0).toFixed(1);
+  }
+
+  function trafficNumberFrom(obj, names) {
+    if (!obj || typeof obj !== 'object') return null;
+    for (const name of names) {
+      if (obj[name] === undefined || obj[name] === null || obj[name] === '') continue;
+      const value = Number(obj[name]);
+      if (Number.isFinite(value)) return Math.max(0, value);
+    }
+    return null;
+  }
+
+  function trafficArrayFrom(obj, names) {
+    if (!obj || typeof obj !== 'object') return [];
+    for (const name of names) {
+      const value = obj[name];
+      if (Array.isArray(value)) return value;
+      if (value && Array.isArray(value.data)) return value.data;
+      if (value && Array.isArray(value.values)) return value.values;
+    }
+    return [];
+  }
+
+  function normalizeTrafficTimestamp(value, index, total, range) {
+    let timestamp = NaN;
+    if (typeof value === 'number') {
+      timestamp = value;
+    } else if (typeof value === 'string' && value.trim()) {
+      const numeric = Number(value);
+      timestamp = Number.isFinite(numeric) ? numeric : Date.parse(value);
+    }
+    if (Number.isFinite(timestamp)) {
+      if (timestamp > 0 && timestamp < 1e12) timestamp *= 1000;
+      return timestamp;
+    }
+    const hours = Math.max(1, parseInt(range, 10) || 24);
+    const slots = Math.max(1, total - 1);
+    return Date.now() - ((total - 1 - index) / slots) * hours * 3600000;
+  }
+
+  function normalizeTrafficData(payload, range) {
+    let source = payload;
+    if (Array.isArray(payload)) source = { buckets: payload };
+    if (source && source.data && !Array.isArray(source.data) &&
+      (source.data.buckets || source.data.points || source.data.series)) {
+      source = source.data;
+    }
+    source = source || {};
+
+    let rawBuckets = Array.isArray(source.buckets) ? source.buckets :
+      (Array.isArray(source.points) ? source.points : (Array.isArray(source.data) ? source.data : []));
+
+    if (!rawBuckets.length && source.series && typeof source.series === 'object') {
+      const series = source.series;
+      const sourceTimestamps = trafficArrayFrom(source, ['timestamps', 'times']);
+      const timestamps = sourceTimestamps.length ? sourceTimestamps : trafficArrayFrom(series, ['timestamps', 'times', 'time']);
+      const input = trafficArrayFrom(series, ['inputTokens', 'input_tokens', 'input']);
+      const output = trafficArrayFrom(series, ['outputTokens', 'output_tokens', 'output']);
+      const creation = trafficArrayFrom(series, ['cacheCreationTokens', 'cacheCreationInputTokens', 'cache_creation_input_tokens']);
+      const read = trafficArrayFrom(series, ['cacheReadTokens', 'cacheReadInputTokens', 'cache_read_input_tokens']);
+      const requests = trafficArrayFrom(series, ['requests', 'requestCount', 'request_count']);
+      const length = Math.max(timestamps.length, input.length, output.length, creation.length, read.length, requests.length);
+      rawBuckets = Array.from({ length }, (_, i) => ({
+        timestamp: timestamps[i],
+        inputTokens: input[i],
+        outputTokens: output[i],
+        cacheCreationTokens: creation[i],
+        cacheReadTokens: read[i],
+        requests: requests[i]
+      }));
+    }
+
+    const points = rawBuckets.map((bucket, index) => {
+      const usage = bucket && (bucket.usage || bucket.tokens) || {};
+      const value = (names) => {
+        const direct = trafficNumberFrom(bucket, names);
+        return direct === null ? (trafficNumberFrom(usage, names) || 0) : direct;
+      };
+      return {
+        timestamp: normalizeTrafficTimestamp(
+          bucket && (bucket.timestamp ?? bucket.time ?? bucket.bucketStart ?? bucket.bucket_start ?? bucket.ts),
+          index, rawBuckets.length, range
+        ),
+        inputTokens: value(['inputTokens', 'input_tokens', 'input']),
+        outputTokens: value(['outputTokens', 'output_tokens', 'output']),
+        cacheCreationTokens: value(['cacheCreationTokens', 'cacheCreationInputTokens', 'cache_creation_input_tokens', 'cacheCreation']),
+        cacheReadTokens: value(['cacheReadTokens', 'cacheReadInputTokens', 'cache_read_input_tokens', 'cacheRead']),
+        requests: value(['requests', 'requestCount', 'request_count'])
+      };
+    }).sort((a, b) => a.timestamp - b.timestamp);
+
+    const reduced = points.reduce((acc, point) => {
+      acc.requests += point.requests;
+      TRAFFIC_SERIES.forEach(series => { acc[series.key] += point[series.key]; });
+      return acc;
+    }, { requests: 0, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 });
+    const provided = source.totals || source.summary || {};
+    const totalValue = (names, fallback) => {
+      const value = trafficNumberFrom(provided, names);
+      return value === null ? fallback : value;
+    };
+    const totals = {
+      requests: totalValue(['requests', 'requestCount', 'request_count', 'totalRequests'], reduced.requests),
+      inputTokens: totalValue(['inputTokens', 'input_tokens', 'input'], reduced.inputTokens),
+      outputTokens: totalValue(['outputTokens', 'output_tokens', 'output'], reduced.outputTokens),
+      cacheCreationTokens: totalValue(['cacheCreationTokens', 'cacheCreationInputTokens', 'cache_creation_input_tokens'], reduced.cacheCreationTokens),
+      cacheReadTokens: totalValue(['cacheReadTokens', 'cacheReadInputTokens', 'cache_read_input_tokens'], reduced.cacheReadTokens)
+    };
+    const fallbackTotal = totals.inputTokens + totals.outputTokens + totals.cacheCreationTokens + totals.cacheReadTokens;
+    totals.totalTokens = totalValue(['totalTokens', 'total_tokens', 'tokens'], fallbackTotal);
+    return { range: source.range || range, points, totals };
+  }
+
+  function formatTrafficNumber(value) {
+    const locale = currentLang === 'zh' ? 'zh-CN' : 'en-US';
+    return Math.round(Number(value) || 0).toLocaleString(locale);
+  }
+
+  function formatTrafficAxis(value) {
+    const locale = currentLang === 'zh' ? 'zh-CN' : 'en-US';
+    return new Intl.NumberFormat(locale, { notation: 'compact', maximumFractionDigits: 1 }).format(Math.round(value));
+  }
+
+  function formatTrafficTime(timestamp, withDate) {
+    const locale = currentLang === 'zh' ? 'zh-CN' : 'en-US';
+    const options = withDate
+      ? { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }
+      : { hour: '2-digit', minute: '2-digit' };
+    return new Intl.DateTimeFormat(locale, options).format(new Date(timestamp));
+  }
+
+  function updateTrafficRangeButtons() {
+    qsa('[data-traffic-range]').forEach(btn => {
+      const active = btn.dataset.trafficRange === trafficRange;
+      btn.classList.toggle('active', active);
+      btn.setAttribute('aria-pressed', String(active));
+    });
+  }
+
+  function setTrafficChartState(message) {
+    const state = $('trafficChartState');
+    if (!state) return;
+    state.textContent = message || '';
+    state.classList.toggle('hidden', !message);
+  }
+
+  function renderTraffic(data) {
+    const totals = data && data.totals || {};
+    const fields = {
+      trafficTotalRequests: totals.requests,
+      trafficTotalTokens: totals.totalTokens,
+      trafficInputTokens: totals.inputTokens,
+      trafficOutputTokens: totals.outputTokens,
+      trafficCacheCreationTokens: totals.cacheCreationTokens,
+      trafficCacheReadTokens: totals.cacheReadTokens
+    };
+    Object.entries(fields).forEach(([id, value]) => {
+      const el = $(id);
+      if (el) el.textContent = formatTrafficNumber(value);
+    });
+    updateTrafficRangeButtons();
+    const updated = $('trafficUpdatedAt');
+    if (updated) {
+      updated.textContent = trafficLastUpdated
+        ? t('traffic.updated', formatTrafficTime(trafficLastUpdated.getTime(), false))
+        : '';
+    }
+    const hasTraffic = Number(totals.requests) > 0 || Number(totals.totalTokens) > 0;
+    if (trafficViewState === 'loading') setTrafficChartState(t('traffic.loading'));
+    else if (trafficViewState === 'error') setTrafficChartState(t('traffic.loadError'));
+    else if (data && hasTraffic) setTrafficChartState('');
+    else if (data) setTrafficChartState(t('traffic.empty'));
+    requestAnimationFrame(drawTrafficChart);
+  }
+
+  async function loadTraffic(range) {
+    const nextRange = ['1h', '6h', '24h'].includes(range) ? range : trafficRange;
+    trafficRange = nextRange;
+    updateTrafficRangeButtons();
+    const sequence = ++trafficLoadSequence;
+    const stage = $('trafficChartStage');
+    if (stage) stage.setAttribute('aria-busy', 'true');
+    trafficViewState = 'loading';
+    renderTraffic(trafficData);
+    try {
+      const res = await api('/traffic?range=' + encodeURIComponent(nextRange));
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(payload.error || t('traffic.loadError'));
+      if (sequence !== trafficLoadSequence) return;
+      trafficData = normalizeTrafficData(payload, nextRange);
+      trafficLastUpdated = new Date();
+      trafficViewState = 'ready';
+      renderTraffic(trafficData);
+    } catch (e) {
+      if (sequence !== trafficLoadSequence) return;
+      trafficData = normalizeTrafficData({ buckets: [] }, nextRange);
+      trafficViewState = 'error';
+      renderTraffic(trafficData);
+      toast((e && e.message) || t('traffic.loadError'), 'error');
+    } finally {
+      if (sequence === trafficLoadSequence && stage) stage.setAttribute('aria-busy', 'false');
+    }
+  }
+
+  function drawTrafficChart() {
+    const canvas = $('trafficChart');
+    if (!canvas || !trafficData || !trafficData.points.length || canvas.offsetParent === null) {
+      trafficChartLayout = null;
+      return;
+    }
+    const width = canvas.clientWidth;
+    const height = canvas.clientHeight;
+    if (width < 80 || height < 80) return;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.round(width * dpr);
+    canvas.height = Math.round(height * dpr);
+    const ctx = canvas.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, width, height);
+
+    const styles = getComputedStyle(document.documentElement);
+    const foreground = styles.getPropertyValue('--foreground').trim() || '#111827';
+    const muted = styles.getPropertyValue('--muted-foreground').trim() || '#6b7280';
+    const border = styles.getPropertyValue('--border').trim() || '#e5e7eb';
+    const font = styles.getPropertyValue('--font-sans').trim() || 'system-ui';
+    const points = trafficData.points;
+    const rawMax = Math.max(0, ...points.flatMap(point => TRAFFIC_SERIES.map(series => point[series.key] || 0)));
+    const yMax = rawMax > 0 ? rawMax * 1.08 : 1;
+    const yTicks = 4;
+    ctx.font = '11px ' + font;
+    const widestLabel = Math.max(...Array.from({ length: yTicks + 1 }, (_, i) =>
+      ctx.measureText(formatTrafficAxis(yMax * i / yTicks)).width
+    ));
+    const left = Math.max(44, Math.ceil(widestLabel) + 13);
+    const right = 12;
+    const top = 12;
+    const bottom = 34;
+    const plotWidth = Math.max(1, width - left - right);
+    const plotHeight = Math.max(1, height - top - bottom);
+    const xFor = index => points.length === 1 ? left + plotWidth / 2 : left + (index / (points.length - 1)) * plotWidth;
+    const yFor = value => top + plotHeight - (Math.max(0, value) / yMax) * plotHeight;
+
+    ctx.strokeStyle = border;
+    ctx.fillStyle = muted;
+    ctx.lineWidth = 1;
+    ctx.textBaseline = 'middle';
+    for (let i = 0; i <= yTicks; i++) {
+      const value = yMax * (yTicks - i) / yTicks;
+      const y = top + plotHeight * i / yTicks;
+      ctx.beginPath();
+      ctx.moveTo(left, y);
+      ctx.lineTo(width - right, y);
+      ctx.stroke();
+      ctx.textAlign = 'right';
+      ctx.fillText(formatTrafficAxis(value), left - 8, y);
+    }
+
+    const labelFractions = width < 560 ? [0, 0.5, 1] : [0, 0.25, 0.5, 0.75, 1];
+    const labelIndexes = Array.from(new Set(labelFractions.map(fraction => Math.round((points.length - 1) * fraction))));
+    ctx.textBaseline = 'bottom';
+    labelIndexes.forEach((index, position) => {
+      const x = xFor(index);
+      ctx.textAlign = position === 0 ? 'left' : (position === labelIndexes.length - 1 ? 'right' : 'center');
+      ctx.fillText(formatTrafficTime(points[index].timestamp, trafficRange === '24h'), x, height - 4);
+    });
+
+    TRAFFIC_SERIES.forEach(series => {
+      ctx.beginPath();
+      points.forEach((point, index) => {
+        const x = xFor(index);
+        const y = yFor(point[series.key] || 0);
+        if (index === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.strokeStyle = series.color;
+      ctx.lineWidth = 2;
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+      ctx.stroke();
+      if (points.length === 1) {
+        ctx.fillStyle = series.color;
+        ctx.beginPath();
+        ctx.arc(xFor(0), yFor(points[0][series.key] || 0), 3, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    });
+
+    ctx.strokeStyle = foreground;
+    ctx.globalAlpha = 0.12;
+    ctx.beginPath();
+    ctx.moveTo(left, top + plotHeight);
+    ctx.lineTo(width - right, top + plotHeight);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    trafficChartLayout = { left, right, top, bottom, plotWidth, plotHeight, width, height, points, xFor };
+  }
+
+  function showTrafficTooltip(event) {
+    const tooltip = $('trafficTooltip');
+    const canvas = $('trafficChart');
+    const layout = trafficChartLayout;
+    if (!tooltip || !canvas || !layout || !layout.points.length) return;
+    const rect = canvas.getBoundingClientRect();
+    const pointerX = Math.max(layout.left, Math.min(layout.width - layout.right, event.clientX - rect.left));
+    const ratio = layout.plotWidth ? (pointerX - layout.left) / layout.plotWidth : 0;
+    const index = layout.points.length === 1 ? 0 : Math.max(0, Math.min(layout.points.length - 1, Math.round(ratio * (layout.points.length - 1))));
+    const point = layout.points[index];
+    let html = '<div class="traffic-tooltip-time">' + escapeHtml(formatTrafficTime(point.timestamp, true)) + '</div>';
+    TRAFFIC_SERIES.forEach(series => {
+      html += '<div class="traffic-tooltip-row"><span class="traffic-tooltip-label"><span class="traffic-tooltip-dot" style="--series-color:' + series.color + '"></span>' +
+        escapeHtml(t(series.labelKey)) + '</span><strong>' + escapeHtml(formatTrafficNumber(point[series.key])) + '</strong></div>';
+    });
+    tooltip.innerHTML = html;
+    tooltip.classList.remove('hidden');
+    const left = Math.max(8, Math.min(rect.width - tooltip.offsetWidth - 8, event.clientX - rect.left + 12));
+    const top = Math.max(8, Math.min(rect.height - tooltip.offsetHeight - 8, event.clientY - rect.top + 12));
+    tooltip.style.left = left + 'px';
+    tooltip.style.top = top + 'px';
+  }
+
+  function hideTrafficTooltip() {
+    const tooltip = $('trafficTooltip');
+    if (tooltip) tooltip.classList.add('hidden');
   }
 
   // ===== Logs =====
@@ -1537,6 +1875,14 @@
     const d = await res.json();
     $('requireApiKey').checked = d.requireApiKey;
     $('allowOverUsage').checked = d.allowOverUsage || false;
+    const promptCacheMaxRatio = Number(d.promptCacheMaxRatio);
+    $('promptCacheMaxRatio').value = Number.isFinite(promptCacheMaxRatio) && promptCacheMaxRatio > 0 && promptCacheMaxRatio <= 1
+      ? String(promptCacheMaxRatio)
+      : '0.85';
+    const promptCacheMaxEntries = Number(d.promptCacheMaxEntries);
+    $('promptCacheMaxEntries').value = Number.isInteger(promptCacheMaxEntries) && promptCacheMaxEntries >= 256 && promptCacheMaxEntries <= 1048576
+      ? String(promptCacheMaxEntries)
+      : '131072';
     await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys()]);
     refreshCustomSelects();
   }
@@ -1644,6 +1990,34 @@
     const allowOverUsage = $('allowOverUsage').checked;
     await api('/settings', { method: 'POST', body: JSON.stringify({ allowOverUsage }) });
     toast(t('settings.overUsageSaved'), 'success');
+  }
+  async function savePromptCacheConfig() {
+    const ratioInput = $('promptCacheMaxRatio');
+    const entriesInput = $('promptCacheMaxEntries');
+    const promptCacheMaxRatio = Number(ratioInput.value);
+    if (!Number.isFinite(promptCacheMaxRatio) || promptCacheMaxRatio < 0.01 || promptCacheMaxRatio > 1) {
+      toast(t('settings.promptCacheMaxRatioInvalid'), 'warning');
+      ratioInput.focus();
+      return;
+    }
+    const promptCacheMaxEntries = Number(entriesInput.value);
+    if (!Number.isInteger(promptCacheMaxEntries) || promptCacheMaxEntries < 256 || promptCacheMaxEntries > 1048576) {
+      toast(t('settings.promptCacheMaxEntriesInvalid'), 'warning');
+      entriesInput.focus();
+      return;
+    }
+    try {
+      const res = await api('/settings', {
+        method: 'POST', body: JSON.stringify({ promptCacheMaxRatio, promptCacheMaxEntries })
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.success === false) throw new Error(d.error || t('common.saveFailed'));
+      ratioInput.value = String(promptCacheMaxRatio);
+      entriesInput.value = String(promptCacheMaxEntries);
+      toast(t('settings.promptCacheSaved'), 'success');
+    } catch (e) {
+      toast((e && e.message) || t('common.saveFailed'), 'error');
+    }
   }
   async function changePassword() {
     const np = $('newPassword').value;
@@ -2863,6 +3237,10 @@
     qsa('.tab').forEach(el => el.classList.toggle('active', el.dataset.tab === tab));
     qsa('.tab-content').forEach(c => c.classList.add('hidden'));
     $('tab' + tab.charAt(0).toUpperCase() + tab.slice(1)).classList.remove('hidden');
+    if (tab === 'traffic') {
+      if (!trafficData) loadTraffic(trafficRange);
+      else requestAnimationFrame(drawTrafficChart);
+    }
     if (tab === 'logs') loadLogs();
   }
 
@@ -2984,6 +3362,7 @@
   function bindSettingsEvents() {
     $('saveRequireApiKeyBtn').addEventListener('click', saveRequireApiKey);
     $('saveOverUsageBtn').addEventListener('click', saveOverUsageConfig);
+    $('savePromptCacheBtn').addEventListener('click', savePromptCacheConfig);
     $('saveThinkingBtn').addEventListener('click', saveThinkingConfig);
     $('saveEndpointBtn').addEventListener('click', saveEndpointConfig);
     $('changePasswordBtn').addEventListener('click', changePassword);
@@ -2991,6 +3370,21 @@
     $('saveProxyBtn').addEventListener('click', saveProxyConfig);
     $('resetStatsBtn').addEventListener('click', resetStats);
     bindApiKeyEvents();
+  }
+
+  function bindTrafficEvents() {
+    qsa('[data-traffic-range]').forEach(btn => {
+      btn.addEventListener('click', () => loadTraffic(btn.dataset.trafficRange));
+    });
+    $('trafficRefreshBtn').addEventListener('click', () => loadTraffic(trafficRange));
+    $('trafficChart').addEventListener('pointermove', showTrafficTooltip);
+    $('trafficChart').addEventListener('pointerleave', hideTrafficTooltip);
+    if (typeof ResizeObserver !== 'undefined') {
+      trafficResizeObserver = new ResizeObserver(() => requestAnimationFrame(drawTrafficChart));
+      trafficResizeObserver.observe($('trafficChartStage'));
+    } else {
+      window.addEventListener('resize', () => requestAnimationFrame(drawTrafficChart));
+    }
   }
 
   function bindPromptFilterEvents() {
@@ -3289,6 +3683,7 @@
     bindLoginEvents();
     bindShellEvents();
     bindAccountEvents();
+    bindTrafficEvents();
     bindSettingsEvents();
     bindPromptFilterEvents();
     bindModalEvents();

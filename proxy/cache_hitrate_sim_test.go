@@ -48,7 +48,7 @@ func TestCacheHitRateSimulation(t *testing.T) {
 	}
 
 	run := func(tr *promptCacheTracker, req *ClaudeRequest) {
-		prof := tr.BuildClaudeProfile(req, estimateClaudeRequestInputTokens(req))
+		prof := tr.BuildClaudeProfile(req, estimateClaudeRequestInputTokens(req), "simulation-session")
 		if prof == nil {
 			return
 		}

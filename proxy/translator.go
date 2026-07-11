@@ -120,16 +120,27 @@ func MapModel(model string) string {
 // ==================== Claude API 类型 ====================
 
 type ClaudeRequest struct {
-	Model       string                `json:"model"`
-	Messages    []ClaudeMessage       `json:"messages"`
-	MaxTokens   int                   `json:"max_tokens"`
-	Temperature float64               `json:"temperature,omitempty"`
-	TopP        float64               `json:"top_p,omitempty"`
-	Stream      bool                  `json:"stream,omitempty"`
-	System      interface{}           `json:"system,omitempty"` // string or []SystemBlock
-	Thinking    *ClaudeThinkingConfig `json:"thinking,omitempty"`
-	Tools       []ClaudeTool          `json:"tools,omitempty"`
-	ToolChoice  interface{}           `json:"tool_choice,omitempty"`
+	Model       string                 `json:"model"`
+	Messages    []ClaudeMessage        `json:"messages"`
+	MaxTokens   int                    `json:"max_tokens"`
+	Temperature float64                `json:"temperature,omitempty"`
+	TopP        float64                `json:"top_p,omitempty"`
+	Stream      bool                   `json:"stream,omitempty"`
+	System      interface{}            `json:"system,omitempty"` // string or []SystemBlock
+	Thinking    *ClaudeThinkingConfig  `json:"thinking,omitempty"`
+	Tools       []ClaudeTool           `json:"tools,omitempty"`
+	ToolChoice  interface{}            `json:"tool_choice,omitempty"`
+	Metadata    *ClaudeRequestMetadata `json:"metadata,omitempty"`
+
+	// promptCacheStaticSystemPrefix is internal metadata for system blocks
+	// injected by the proxy. Clients cannot set it through JSON.
+	promptCacheStaticSystemPrefix int
+}
+
+// ClaudeRequestMetadata carries the stable Claude Code session marker used to
+// isolate simulated prompt-cache entries. It is not forwarded to Kiro.
+type ClaudeRequestMetadata struct {
+	UserID string `json:"user_id,omitempty"`
 }
 
 type ClaudeThinkingConfig struct {
@@ -543,6 +554,7 @@ func cloneClaudeRequestForThinking(req *ClaudeRequest, thinking bool) *ClaudeReq
 	cloned := *req
 	if thinking {
 		cloned.System = prependThinkingSystem(req.System)
+		cloned.promptCacheStaticSystemPrefix++
 	}
 	return &cloned
 }

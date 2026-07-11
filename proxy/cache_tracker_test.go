@@ -25,7 +25,7 @@ func TestPromptCacheTrackerComputeAndUpdate(t *testing.T) {
 		Messages: []ClaudeMessage{{Role: "user", Content: "hello world"}},
 	}
 
-	profile := tracker.BuildClaudeProfile(req, 120)
+	profile := tracker.BuildClaudeProfile(req, 120, "test-session")
 	if profile == nil {
 		t.Fatalf("expected cache profile to be built")
 	}
@@ -105,7 +105,7 @@ func TestPromptCacheStableAcrossBillingHeaderDrift(t *testing.T) {
 	}
 
 	req1 := build("x-anthropic-billing-header: cc_version=2.1.87.1; cch=aaaa;")
-	profile1 := tracker.BuildClaudeProfile(req1, 2048)
+	profile1 := tracker.BuildClaudeProfile(req1, 2048, "test-session")
 	if profile1 == nil {
 		t.Fatalf("profile1 should be built")
 	}
@@ -116,7 +116,7 @@ func TestPromptCacheStableAcrossBillingHeaderDrift(t *testing.T) {
 	tracker.Update("acct-1", profile1)
 
 	req2 := build("x-anthropic-billing-header: cc_version=2.1.87.42; cch=bbbb; padding=xxyyzz;")
-	profile2 := tracker.BuildClaudeProfile(req2, 2048)
+	profile2 := tracker.BuildClaudeProfile(req2, 2048, "test-session")
 	if profile2 == nil {
 		t.Fatalf("profile2 should be built")
 	}
@@ -152,13 +152,13 @@ func TestPromptCacheStableWhenBillingHeaderAppearsOrDisappears(t *testing.T) {
 		}
 	}
 
-	withBilling := tracker.BuildClaudeProfile(build(true), 2048)
+	withBilling := tracker.BuildClaudeProfile(build(true), 2048, "test-session")
 	if withBilling == nil {
 		t.Fatalf("profile with billing header should be built")
 	}
 	tracker.Update("acct-1", withBilling)
 
-	withoutBilling := tracker.BuildClaudeProfile(build(false), 2048)
+	withoutBilling := tracker.BuildClaudeProfile(build(false), 2048, "test-session")
 	if withoutBilling == nil {
 		t.Fatalf("profile without billing header should be built")
 	}
@@ -237,7 +237,7 @@ func TestPromptCacheImplicitBreakpointAtMessageEnd(t *testing.T) {
 		System:   baseSystem,
 		Messages: []ClaudeMessage{{Role: "user", Content: "question one"}},
 	}
-	profile1 := tracker.BuildClaudeProfile(req1, 2048)
+	profile1 := tracker.BuildClaudeProfile(req1, 2048, "test-session")
 	if profile1 == nil {
 		t.Fatalf("profile1 should be built")
 	}
@@ -255,7 +255,7 @@ func TestPromptCacheImplicitBreakpointAtMessageEnd(t *testing.T) {
 			{Role: "user", Content: "follow-up question"},
 		},
 	}
-	profile2 := tracker.BuildClaudeProfile(req2, 4096)
+	profile2 := tracker.BuildClaudeProfile(req2, 4096, "test-session")
 	if profile2 == nil {
 		t.Fatalf("profile2 should be built")
 	}

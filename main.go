@@ -14,6 +14,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"kiro-go/config"
 	"kiro-go/logger"
@@ -22,7 +24,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 	"time"
 )
 
@@ -75,7 +79,33 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 	}
 
-	if err := srv.ListenAndServe(); err != nil {
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- srv.ListenAndServe()
+	}()
+
+	shutdownSignal := make(chan os.Signal, 1)
+	signal.Notify(shutdownSignal, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(shutdownSignal)
+
+	var err error
+	select {
+	case err = <-serverErr:
+	case sig := <-shutdownSignal:
+		logger.Infof("Received %s, shutting down", sig)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		shutdownErr := srv.Shutdown(ctx)
+		cancel()
+		handler.Close()
+		err = <-serverErr
+		if shutdownErr != nil {
+			logger.Fatalf("Server shutdown failed: %v", shutdownErr)
+		}
+	}
+
+	// ListenAndServe returns ErrServerClosed after a graceful shutdown.
+	handler.Close()
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logger.Fatalf("Server failed: %v", err)
 	}
 }

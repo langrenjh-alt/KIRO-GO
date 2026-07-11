@@ -55,6 +55,85 @@ func TestUpdateSettingsPatchCanExplicitlyDisableAPIKey(t *testing.T) {
 	}
 }
 
+func TestPromptCacheConfigClampsLegacyOutOfRangeValues(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"promptCacheMaxRatio":0.001,"promptCacheMaxEntries":2097152}`), 0600); err != nil {
+		t.Fatalf("write legacy config: %v", err)
+	}
+	if err := Init(path); err != nil {
+		t.Fatalf("init legacy config: %v", err)
+	}
+	if got := GetPromptCacheMaxRatio(); got != MinPromptCacheRatio {
+		t.Fatalf("cache ratio=%v, want %v", got, MinPromptCacheRatio)
+	}
+	if got := GetPromptCacheMaxEntries(); got != MaxPromptCacheEntries {
+		t.Fatalf("cache capacity=%d, want %d", got, MaxPromptCacheEntries)
+	}
+	if err := UpdatePromptCacheMaxRatio(MinPromptCacheRatio / 2); err == nil {
+		t.Fatal("expected direct ratio update below Admin minimum to fail")
+	}
+}
+
+func TestUpdatePromptCacheSettingsRollsBackOnSaveFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := Init(path); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+	ratio, entries := 0.85, 4096
+	if err := UpdatePromptCacheSettings(&ratio, &entries); err != nil {
+		t.Fatalf("seed cache settings: %v", err)
+	}
+
+	cfgLock.Lock()
+	originalPath := cfgPath
+	cfgPath = t.TempDir() // os.WriteFile cannot replace a directory.
+	cfgLock.Unlock()
+	t.Cleanup(func() {
+		cfgLock.Lock()
+		cfgPath = originalPath
+		cfgLock.Unlock()
+	})
+
+	nextRatio, nextEntries := 0.95, 8192
+	if err := UpdatePromptCacheSettings(&nextRatio, &nextEntries); err == nil {
+		t.Fatal("expected cache settings persistence failure")
+	}
+	if got := GetPromptCacheMaxRatio(); got != ratio {
+		t.Fatalf("cache ratio changed after failed save: got %v want %v", got, ratio)
+	}
+	if got := GetPromptCacheMaxEntries(); got != entries {
+		t.Fatalf("cache capacity changed after failed save: got %d want %d", got, entries)
+	}
+}
+
+func TestUpdateStatsRollsBackOnSaveFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := Init(path); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+	if err := UpdateStats(10, 8, 2, 1200, 3.5); err != nil {
+		t.Fatalf("seed stats: %v", err)
+	}
+
+	cfgLock.Lock()
+	originalPath := cfgPath
+	cfgPath = t.TempDir() // An atomic rename cannot replace a directory.
+	cfgLock.Unlock()
+	t.Cleanup(func() {
+		cfgLock.Lock()
+		cfgPath = originalPath
+		cfgLock.Unlock()
+	})
+
+	if err := UpdateStats(0, 0, 0, 0, 0); err == nil {
+		t.Fatal("expected stats persistence failure")
+	}
+	requests, success, failed, tokens, credits := GetStats()
+	if requests != 10 || success != 8 || failed != 2 || tokens != 1200 || credits != 3.5 {
+		t.Fatalf("stats changed after failed save: got (%d,%d,%d,%d,%v)", requests, success, failed, tokens, credits)
+	}
+}
+
 // TestAccountAllowOverageMigration verifies that a config.json from before the
 // upstream-Overages-switch refactor (which carried `allowOverage: true` per
 // account) is migrated into OverageStatus="ENABLED" on first load, and that

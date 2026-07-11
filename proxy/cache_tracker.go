@@ -2,10 +2,12 @@ package proxy
 
 import (
 	"bytes"
+	"container/heap"
 	"container/list"
 	"crypto/sha256"
 	"encoding/json"
 	"kiro-go/config"
+	"kiro-go/logger"
 	"os"
 	"path/filepath"
 	"sort"
@@ -42,6 +44,7 @@ type promptCacheProfile struct {
 	Breakpoints      []promptCacheBreakpoint
 	TotalInputTokens int
 	Model            string
+	IsolationSeed    string
 }
 
 func minCacheableTokensForModel(model string) int {
@@ -53,15 +56,49 @@ func minCacheableTokensForModel(model string) int {
 }
 
 type promptCacheEntry struct {
-	ExpiresAt time.Time
-	TTL       time.Duration
-	lruElem   *list.Element // back-ref into t.order; Value = fingerprint [32]byte
+	ExpiresAt  time.Time
+	TTL        time.Duration
+	lruElem    *list.Element // back-ref into t.order; Value = fingerprint [32]byte
+	expiryItem *promptCacheExpiryItem
+}
+
+type promptCacheExpiryItem struct {
+	Fingerprint [32]byte
+	ExpiresAt   time.Time
+	index       int
+}
+
+type promptCacheExpiryHeap []*promptCacheExpiryItem
+
+func (h promptCacheExpiryHeap) Len() int { return len(h) }
+func (h promptCacheExpiryHeap) Less(i, j int) bool {
+	return h[i].ExpiresAt.Before(h[j].ExpiresAt)
+}
+func (h promptCacheExpiryHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+	h[i].index = i
+	h[j].index = j
+}
+func (h *promptCacheExpiryHeap) Push(value interface{}) {
+	item := value.(*promptCacheExpiryItem)
+	item.index = len(*h)
+	*h = append(*h, item)
+}
+func (h *promptCacheExpiryHeap) Pop() interface{} {
+	old := *h
+	last := len(old) - 1
+	item := old[last]
+	old[last] = nil
+	item.index = -1
+	*h = old[:last]
+	return item
 }
 
 type promptCacheTracker struct {
 	mu              sync.Mutex
 	entries         map[[32]byte]*promptCacheEntry
 	order           *list.List // front = most-recently-used; Element.Value = [32]byte fingerprint
+	expiryQueue     promptCacheExpiryHeap
 	maxEntries      int
 	maxSupportedTTL time.Duration
 	hits            int64 // atomic — Compute calls returning CacheReadInputTokens > 0
@@ -70,6 +107,7 @@ type promptCacheTracker struct {
 	expirations     int64 // atomic — TTL removals in pruneExpiredLocked
 	dirty           bool
 	stopChan        chan struct{}
+	stopDone        chan struct{}
 	stopOnce        sync.Once
 }
 
@@ -121,6 +159,11 @@ func (t *promptCacheTracker) Load(path string) {
 		}
 		t.putLocked(e.Fingerprint, exp, time.Duration(e.TTLSeconds)*time.Second)
 	}
+	entriesBefore := len(t.entries)
+	t.evictOverflowLocked()
+	if len(t.entries) != entriesBefore {
+		t.dirty = true
+	}
 }
 
 // startSaveLoop launches a background goroutine that flushes the cache to path
@@ -128,7 +171,9 @@ func (t *promptCacheTracker) Load(path string) {
 // stopChan is closed.
 func (t *promptCacheTracker) startSaveLoop(path string, flushInterval time.Duration) {
 	t.stopChan = make(chan struct{})
+	t.stopDone = make(chan struct{})
 	go func() {
+		defer close(t.stopDone)
 		ticker := time.NewTicker(flushInterval)
 		defer ticker.Stop()
 		for {
@@ -144,6 +189,9 @@ func (t *promptCacheTracker) startSaveLoop(path string, flushInterval time.Durat
 }
 
 func (t *promptCacheTracker) Stop() {
+	if t == nil {
+		return
+	}
 	// Idempotent: a second Stop (e.g. test cleanup + main shutdown) would
 	// otherwise close an already-closed channel and panic.
 	t.stopOnce.Do(func() {
@@ -151,6 +199,9 @@ func (t *promptCacheTracker) Stop() {
 			close(t.stopChan)
 		}
 	})
+	if t.stopDone != nil {
+		<-t.stopDone
+	}
 }
 
 func (t *promptCacheTracker) flush(path string) {
@@ -174,11 +225,19 @@ func (t *promptCacheTracker) flush(path string) {
 	t.dirty = false
 	t.mu.Unlock()
 
-	data, _ := json.MarshalIndent(map[string]interface{}{
+	data, err := json.MarshalIndent(map[string]interface{}{
 		"version": 1,
 		"entries": entries,
 	}, "", "  ")
-	_ = writeFileAtomic(path, data)
+	if err == nil {
+		err = writeFileAtomic(path, data)
+	}
+	if err != nil {
+		t.mu.Lock()
+		t.dirty = true
+		t.mu.Unlock()
+		logger.Warnf("[PromptCache] failed to persist cache state: %v", err)
+	}
 }
 
 // writeFileAtomic writes data to path via a temp file in the same directory
@@ -270,7 +329,15 @@ func claudeRequestHasCacheControl(req *ClaudeRequest) bool {
 	return false
 }
 
-func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTokens int) *promptCacheProfile {
+func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTokens int, isolationSeeds ...string) *promptCacheProfile {
+	isolationSeed := ""
+	if len(isolationSeeds) > 0 {
+		isolationSeed = isolationSeeds[0]
+	}
+	if isolationSeed == "" {
+		return nil
+	}
+
 	// Fast path: if no block carries cache_control, no breakpoint can be
 	// produced — explicit breakpoints need TTL > 0, and implicit message-end
 	// breakpoints only fire once an explicit one has set activeTTL > 0. So a
@@ -287,11 +354,20 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 	}
 
 	hasher := sha256.New()
+	writeHashChunk(hasher, canonicalizeCacheValue(map[string]interface{}{
+		"kind": "isolation_seed",
+		"seed": isolationSeed,
+	}))
 	breakpoints := make([]promptCacheBreakpoint, 0)
 	cumulativeTokens := 0
+	excludedPrefixTokens := 0
 	var activeTTL time.Duration
 
 	for _, block := range blocks {
+		if block.ExcludeFromReusablePrefix {
+			excludedPrefixTokens += block.Tokens
+			continue
+		}
 		canonical := canonicalizeCacheValue(block.Value)
 		writeHashChunk(hasher, canonical)
 		cumulativeTokens += block.Tokens
@@ -326,14 +402,16 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 		return nil
 	}
 
-	if totalInputTokens < cumulativeTokens {
-		totalInputTokens = cumulativeTokens
+	accountedTokens := cumulativeTokens + excludedPrefixTokens
+	if totalInputTokens < accountedTokens {
+		totalInputTokens = accountedTokens
 	}
 
 	return &promptCacheProfile{
 		Breakpoints:      breakpoints,
 		TotalInputTokens: totalInputTokens,
 		Model:            req.Model,
+		IsolationSeed:    isolationSeed,
 	}
 }
 
@@ -352,37 +430,14 @@ func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfi
 	minTokens := minCacheableTokensForModel(profile.Model)
 	last := profile.Breakpoints[len(profile.Breakpoints)-1]
 	lastTokens := minInt(last.CumulativeTokens, profile.TotalInputTokens)
+	maxCacheRead := int(float64(profile.TotalInputTokens) * config.GetPromptCacheMaxRatio())
 	now := time.Now()
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.pruneExpiredLocked(now)
 
-	if len(t.entries) == 0 {
-		// First request for this account: report creation only if above threshold.
-		effectiveCreation := lastTokens
-		if effectiveCreation < minTokens {
-			effectiveCreation = 0
-		}
-		cache5m, cache1h := computePromptCacheTTLBreakdown(profile, 0)
-		cache5m, cache1h = clampCacheBreakdownToCreation(cache5m, cache1h, effectiveCreation)
-		return promptCacheUsage{
-			CacheCreationInputTokens:   effectiveCreation,
-			CacheReadInputTokens:       0,
-			CacheCreation5mInputTokens: cache5m,
-			CacheCreation1hInputTokens: cache1h,
-		}
-	}
-
-	// Cap cacheable tokens at 85% of total input to ensure a realistic
-	// uncached portion. The newest content in a request is never fully
-	// served from cache on the current turn.
-	maxCacheable := int(float64(profile.TotalInputTokens) * config.GetPromptCacheMaxRatio())
-	if lastTokens > maxCacheable {
-		lastTokens = maxCacheable
-	}
-
-	matchedTokens := 0
+	rawMatchedTokens := 0
 	for i := len(profile.Breakpoints) - 1; i >= 0; i-- {
 		breakpoint := profile.Breakpoints[i]
 		// Skip breakpoints below the minimum cacheable token threshold.
@@ -390,25 +445,32 @@ func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfi
 			continue
 		}
 		entry, ok := t.entries[breakpoint.Fingerprint]
-		if !ok || entry.ExpiresAt.Before(now) {
+		if !ok || !entry.ExpiresAt.After(now) {
 			continue
 		}
-		entry.ExpiresAt = now.Add(entry.TTL)
+		t.refreshEntryLocked(entry, now.Add(entry.TTL), entry.TTL)
 		t.order.MoveToFront(entry.lruElem)
 		t.dirty = true // hit extends TTL — persist so a flush before the next Update doesn't lose it
-		matchedTokens = minInt(breakpoint.CumulativeTokens, profile.TotalInputTokens)
-		if matchedTokens > lastTokens {
-			matchedTokens = lastTokens
+		rawMatchedTokens = minInt(breakpoint.CumulativeTokens, profile.TotalInputTokens)
+		if rawMatchedTokens > lastTokens {
+			rawMatchedTokens = lastTokens
 		}
 		break
 	}
 
-	creation := maxInt(lastTokens-matchedTokens, 0)
-	cache5m, cache1h := computePromptCacheTTLBreakdown(profile, matchedTokens)
+	creation := maxInt(lastTokens-rawMatchedTokens, 0)
+	if lastTokens < minTokens {
+		creation = 0
+	}
+	cacheRead := rawMatchedTokens
+	if cacheRead > maxCacheRead {
+		cacheRead = maxCacheRead
+	}
+	cache5m, cache1h := computePromptCacheTTLBreakdown(profile, rawMatchedTokens)
 	cache5m, cache1h = clampCacheBreakdownToCreation(cache5m, cache1h, creation)
 	return promptCacheUsage{
 		CacheCreationInputTokens:   creation,
-		CacheReadInputTokens:       matchedTokens,
+		CacheReadInputTokens:       cacheRead,
 		CacheCreation5mInputTokens: cache5m,
 		CacheCreation1hInputTokens: cache1h,
 	}
@@ -425,7 +487,8 @@ func (t *promptCacheTracker) Update(accountID string, profile *promptCacheProfil
 	defer t.mu.Unlock()
 	t.pruneExpiredLocked(now)
 
-	// entries is the global map now (C1: cross-account sharing).
+	// Entries share one bounded map, but the isolation seed is part of every
+	// fingerprint, so tenants cannot match each other's prefixes.
 	for _, breakpoint := range profile.Breakpoints {
 		// Skip breakpoints below the minimum cacheable token threshold.
 		if breakpoint.CumulativeTokens < minTokens {
@@ -438,12 +501,24 @@ func (t *promptCacheTracker) Update(accountID string, profile *promptCacheProfil
 }
 
 func (t *promptCacheTracker) pruneExpiredLocked(now time.Time) {
-	for fingerprint, entry := range t.entries {
-		if !entry.ExpiresAt.After(now) {
-			t.order.Remove(entry.lruElem)
-			delete(t.entries, fingerprint)
-			atomic.AddInt64(&t.expirations, 1)
+	removed := false
+	for t.expiryQueue.Len() > 0 {
+		item := t.expiryQueue[0]
+		if item.ExpiresAt.After(now) {
+			break
 		}
+		heap.Pop(&t.expiryQueue)
+		entry, ok := t.entries[item.Fingerprint]
+		if !ok || entry.expiryItem != item {
+			continue
+		}
+		t.order.Remove(entry.lruElem)
+		delete(t.entries, item.Fingerprint)
+		atomic.AddInt64(&t.expirations, 1)
+		removed = true
+	}
+	if removed {
+		t.dirty = true
 	}
 }
 
@@ -451,13 +526,21 @@ func (t *promptCacheTracker) pruneExpiredLocked(now time.Time) {
 // most-recently-used. Caller holds t.mu.
 func (t *promptCacheTracker) putLocked(fp [32]byte, expiresAt time.Time, ttl time.Duration) {
 	if e, ok := t.entries[fp]; ok {
-		e.ExpiresAt = expiresAt
-		e.TTL = ttl
+		t.refreshEntryLocked(e, expiresAt, ttl)
 		t.order.MoveToFront(e.lruElem)
 		return
 	}
 	elem := t.order.PushFront(fp)
-	t.entries[fp] = &promptCacheEntry{ExpiresAt: expiresAt, TTL: ttl, lruElem: elem}
+	expiryItem := &promptCacheExpiryItem{Fingerprint: fp, ExpiresAt: expiresAt}
+	heap.Push(&t.expiryQueue, expiryItem)
+	t.entries[fp] = &promptCacheEntry{ExpiresAt: expiresAt, TTL: ttl, lruElem: elem, expiryItem: expiryItem}
+}
+
+func (t *promptCacheTracker) refreshEntryLocked(entry *promptCacheEntry, expiresAt time.Time, ttl time.Duration) {
+	entry.ExpiresAt = expiresAt
+	entry.TTL = ttl
+	entry.expiryItem.ExpiresAt = expiresAt
+	heap.Fix(&t.expiryQueue, entry.expiryItem.index)
 }
 
 // evictOverflowLocked bounds the entries map to maxEntries by evicting the
@@ -470,9 +553,38 @@ func (t *promptCacheTracker) evictOverflowLocked() {
 			return
 		}
 		fp := back.Value.([32]byte)
+		entry := t.entries[fp]
 		t.order.Remove(back)
+		if entry != nil && entry.expiryItem != nil && entry.expiryItem.index >= 0 {
+			heap.Remove(&t.expiryQueue, entry.expiryItem.index)
+		}
 		delete(t.entries, fp)
 		atomic.AddInt64(&t.evictions, 1)
+	}
+}
+
+// SetMaxEntries updates the live LRU capacity. Shrinking takes effect before
+// the method returns and evicts the least-recently-used entries first.
+func (t *promptCacheTracker) SetMaxEntries(maxEntries int) {
+	if t == nil {
+		return
+	}
+	if maxEntries < 1 {
+		maxEntries = 1
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.maxEntries == maxEntries {
+		return
+	}
+
+	entriesBefore := len(t.entries)
+	t.maxEntries = maxEntries
+	t.pruneExpiredLocked(time.Now())
+	t.evictOverflowLocked()
+	if len(t.entries) != entriesBefore {
+		t.dirty = true
 	}
 }
 
@@ -551,14 +663,18 @@ func (u promptCacheUsage) splitAgainstTotal(estTotal, realTotal int) promptCache
 }
 
 type cacheablePromptBlock struct {
-	Value        interface{}
-	Tokens       int
-	TTL          time.Duration
-	IsMessageEnd bool
+	Value                     interface{}
+	Tokens                    int
+	TTL                       time.Duration
+	Kind                      string
+	IsMessageEnd              bool
+	ExcludeFromReusablePrefix bool
+	PreserveInReusablePrefix  bool
 }
 
 func flattenClaudeCacheBlocks(req *ClaudeRequest) []cacheablePromptBlock {
 	blocks := make([]cacheablePromptBlock, 0)
+	toolLinks := newToolLinkageNormalizer()
 	blocks = append(blocks, buildCachePreludeBlock(req))
 
 	for toolIndex, tool := range req.Tools {
@@ -574,16 +690,50 @@ func flattenClaudeCacheBlocks(req *ClaudeRequest) []cacheablePromptBlock {
 			Value:  fingerprintValue,
 			Tokens: estimateApproxTokens(canonicalizeCacheValue(fingerprintValue)),
 			TTL:    normalizePromptCacheTTL(extractPromptCacheTTL(tool)),
+			Kind:   "tool",
 		})
 	}
 
 	appendSystemCacheBlocks(&blocks, req.System)
+	markStaticSystemPrefixBlocks(blocks, req.promptCacheStaticSystemPrefix)
 
 	for messageIndex, msg := range req.Messages {
-		appendMessageCacheBlocks(&blocks, messageIndex, msg)
+		appendMessageCacheBlocks(&blocks, messageIndex, msg, toolLinks)
 	}
 
+	markDynamicSystemPrefixBlocks(blocks)
 	return blocks
+}
+
+func markDynamicSystemPrefixBlocks(blocks []cacheablePromptBlock) {
+	firstBreakpoint := -1
+	for i := range blocks {
+		if blocks[i].Kind == "system" && blocks[i].TTL > 0 {
+			firstBreakpoint = i
+			break
+		}
+	}
+	if firstBreakpoint < 0 {
+		return
+	}
+	for i := 0; i < firstBreakpoint; i++ {
+		if blocks[i].Kind == "system" && !blocks[i].PreserveInReusablePrefix {
+			blocks[i].ExcludeFromReusablePrefix = true
+		}
+	}
+}
+
+func markStaticSystemPrefixBlocks(blocks []cacheablePromptBlock, count int) {
+	for i := range blocks {
+		if count <= 0 {
+			return
+		}
+		if blocks[i].Kind != "system" {
+			continue
+		}
+		blocks[i].PreserveInReusablePrefix = true
+		count--
+	}
 }
 
 func buildCachePreludeBlock(req *ClaudeRequest) cacheablePromptBlock {
@@ -595,6 +745,7 @@ func buildCachePreludeBlock(req *ClaudeRequest) cacheablePromptBlock {
 	return cacheablePromptBlock{
 		Value:  prelude,
 		Tokens: estimateApproxTokens(canonicalizeCacheValue(prelude)),
+		Kind:   "request_prelude",
 	}
 }
 
@@ -608,14 +759,14 @@ func appendSystemCacheBlocks(blocks *[]cacheablePromptBlock, system interface{})
 				"type": "text",
 				"text": v,
 			},
-		}, false)
+		}, false, nil)
 	case []interface{}:
 		for i, block := range v {
 			appendPromptBlock(blocks, map[string]interface{}{
 				"kind":         "system",
 				"system_index": i,
 				"block":        block,
-			}, false)
+			}, false, nil)
 		}
 	case []string:
 		for i, block := range v {
@@ -626,12 +777,12 @@ func appendSystemCacheBlocks(blocks *[]cacheablePromptBlock, system interface{})
 					"type": "text",
 					"text": block,
 				},
-			}, false)
+			}, false, nil)
 		}
 	}
 }
 
-func appendMessageCacheBlocks(blocks *[]cacheablePromptBlock, messageIndex int, msg ClaudeMessage) {
+func appendMessageCacheBlocks(blocks *[]cacheablePromptBlock, messageIndex int, msg ClaudeMessage, toolLinks *toolLinkageNormalizer) {
 	role := msg.Role
 	switch content := msg.Content.(type) {
 	case string:
@@ -644,7 +795,7 @@ func appendMessageCacheBlocks(blocks *[]cacheablePromptBlock, messageIndex int, 
 				"type": "text",
 				"text": content,
 			},
-		}, true)
+		}, true, toolLinks)
 	case []interface{}:
 		lastIdx := len(content) - 1
 		for blockIndex, block := range content {
@@ -654,7 +805,7 @@ func appendMessageCacheBlocks(blocks *[]cacheablePromptBlock, messageIndex int, 
 				"role":          role,
 				"block_index":   blockIndex,
 				"block":         block,
-			}, blockIndex == lastIdx)
+			}, blockIndex == lastIdx, toolLinks)
 		}
 	default:
 		if content != nil {
@@ -664,12 +815,12 @@ func appendMessageCacheBlocks(blocks *[]cacheablePromptBlock, messageIndex int, 
 				"role":          role,
 				"block_index":   0,
 				"block":         content,
-			}, true)
+			}, true, toolLinks)
 		}
 	}
 }
 
-func appendPromptBlock(blocks *[]cacheablePromptBlock, wrapper map[string]interface{}, isMessageEnd bool) {
+func appendPromptBlock(blocks *[]cacheablePromptBlock, wrapper map[string]interface{}, isMessageEnd bool, toolLinks *toolLinkageNormalizer) {
 	blockValue := wrapper["block"]
 	ttl := normalizePromptCacheTTL(extractPromptCacheTTL(blockValue))
 
@@ -680,14 +831,85 @@ func appendPromptBlock(blocks *[]cacheablePromptBlock, wrapper map[string]interf
 		return
 	}
 
+	wrapper["block"] = normalizeToolLinkageForCacheFingerprint(blockValue, toolLinks)
 	fingerprintValue := stripCachePositionKeys(wrapper)
-	canonical := canonicalizeCacheValue(fingerprintValue)
+	tokenValue := make(map[string]interface{}, len(fingerprintValue))
+	for key, value := range fingerprintValue {
+		tokenValue[key] = value
+	}
+	tokenValue["block"] = normalizeToolLinkageForCacheFingerprint(wrapper["block"], nil)
+	kind, _ := wrapper["kind"].(string)
 	*blocks = append(*blocks, cacheablePromptBlock{
 		Value:        fingerprintValue,
-		Tokens:       estimateApproxTokens(canonical),
+		Tokens:       estimateApproxTokens(canonicalizeCacheValue(tokenValue)),
 		TTL:          ttl,
+		Kind:         kind,
 		IsMessageEnd: isMessageEnd,
 	})
+}
+
+type toolLinkageNormalizer struct {
+	aliases map[string]string
+	next    int
+}
+
+func newToolLinkageNormalizer() *toolLinkageNormalizer {
+	return &toolLinkageNormalizer{aliases: make(map[string]string)}
+}
+
+func (n *toolLinkageNormalizer) register(rawID string) string {
+	if alias, ok := n.aliases[rawID]; ok {
+		return alias
+	}
+	n.next++
+	alias := "tool-ref-" + strconv.Itoa(n.next)
+	n.aliases[rawID] = alias
+	return alias
+}
+
+func (n *toolLinkageNormalizer) reference(rawID string) string {
+	if alias, ok := n.aliases[rawID]; ok {
+		return alias
+	}
+	return "unresolved-tool-ref"
+}
+
+// normalizeToolLinkageForCacheFingerprint replaces request-local IDs with
+// stable ordinal aliases, preserving result-to-call relationships.
+func normalizeToolLinkageForCacheFingerprint(value interface{}, normalizer *toolLinkageNormalizer) interface{} {
+	block, ok := value.(map[string]interface{})
+	if !ok {
+		return value
+	}
+	blockType, _ := block["type"].(string)
+	blockType = strings.ToLower(blockType)
+	switch blockType {
+	case "tool_use", "tool_result", "server_tool_use", "mcp_tool_use", "mcp_tool_result":
+	default:
+		return value
+	}
+
+	cloned := make(map[string]interface{}, len(block))
+	for key, item := range block {
+		if key == "id" || key == "tool_use_id" {
+			continue
+		}
+		cloned[key] = item
+	}
+	if normalizer == nil {
+		return cloned
+	}
+	switch blockType {
+	case "tool_use", "server_tool_use", "mcp_tool_use":
+		if rawID, ok := block["id"].(string); ok && rawID != "" {
+			cloned["id"] = normalizer.register(rawID)
+		}
+	case "tool_result", "mcp_tool_result":
+		if rawID, ok := block["tool_use_id"].(string); ok && rawID != "" {
+			cloned["tool_use_id"] = normalizer.reference(rawID)
+		}
+	}
+	return cloned
 }
 
 func stripCachePositionKeys(value map[string]interface{}) map[string]interface{} {

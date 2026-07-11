@@ -2,11 +2,15 @@ package proxy
 
 import (
 	"encoding/json"
+	"fmt"
 	"kiro-go/config"
 	accountpool "kiro-go/pool"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -523,5 +527,377 @@ func TestStatsIncludesCacheMetrics(t *testing.T) {
 	}
 	if cache["misses"].(float64) != 1 {
 		t.Fatalf("expected 1 miss, got %v", cache["misses"])
+	}
+}
+
+func TestAdminSettingsPromptCacheMaxRatioHotReload(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.UpdatePromptCacheMaxRatio(0.85); err != nil {
+		t.Fatalf("set initial cache ratio: %v", err)
+	}
+
+	tracker := newPromptCacheTrackerWithCapacity(time.Hour, 16)
+	profile := &promptCacheProfile{
+		Model:            "claude-sonnet-4-6",
+		TotalInputTokens: 2000,
+		Breakpoints: []promptCacheBreakpoint{{
+			Fingerprint:      [32]byte{11},
+			CumulativeTokens: 2000,
+			TTL:              time.Hour,
+		}},
+	}
+	tracker.Update("acct", profile)
+	if got := tracker.Compute("acct", profile).CacheReadInputTokens; got != 1700 {
+		t.Fatalf("expected initial 0.85 ratio to cap cache reads at 1700, got %d", got)
+	}
+
+	h := &Handler{}
+	updateRec := httptest.NewRecorder()
+	updateReq := httptest.NewRequest(http.MethodPost, "/admin/api/settings", strings.NewReader(`{"promptCacheMaxRatio":0.95}`))
+	h.apiUpdateSettings(updateRec, updateReq)
+	if updateRec.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s", updateRec.Code, updateRec.Body.String())
+	}
+	if got := config.GetPromptCacheMaxRatio(); got != 0.95 {
+		t.Fatalf("expected in-memory ratio 0.95, got %v", got)
+	}
+	if got := tracker.Compute("acct", profile).CacheReadInputTokens; got != 1900 {
+		t.Fatalf("expected hot-reloaded 0.95 ratio to cap cache reads at 1900, got %d", got)
+	}
+
+	getRec := httptest.NewRecorder()
+	h.apiGetSettings(getRec, httptest.NewRequest(http.MethodGet, "/admin/api/settings", nil))
+	var settings map[string]interface{}
+	if err := json.NewDecoder(getRec.Body).Decode(&settings); err != nil {
+		t.Fatalf("decode settings: %v", err)
+	}
+	if got := settings["promptCacheMaxRatio"]; got != 0.95 {
+		t.Fatalf("expected settings API ratio 0.95, got %#v", got)
+	}
+
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("reload persisted config: %v", err)
+	}
+	if got := config.GetPromptCacheMaxRatio(); got != 0.95 {
+		t.Fatalf("expected persisted ratio 0.95 after reload, got %v", got)
+	}
+}
+
+func TestAdminSettingsRejectsInvalidPromptCacheMaxRatio(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.UpdatePromptCacheMaxRatio(0.85); err != nil {
+		t.Fatalf("set initial cache ratio: %v", err)
+	}
+
+	h := &Handler{}
+	for _, body := range []string{
+		`{"promptCacheMaxRatio":0}`,
+		`{"promptCacheMaxRatio":0.001}`,
+		`{"promptCacheMaxRatio":-0.1}`,
+		`{"promptCacheMaxRatio":1.01}`,
+	} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/admin/api/settings", strings.NewReader(body))
+		h.apiUpdateSettings(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("body=%s status=%d response=%s", body, rec.Code, rec.Body.String())
+		}
+		if got := config.GetPromptCacheMaxRatio(); got != 0.85 {
+			t.Fatalf("body=%s changed ratio to %v", body, got)
+		}
+	}
+}
+
+func TestClaudePromptCacheIsolationSeed(t *testing.T) {
+	var req ClaudeRequest
+	if err := json.Unmarshal([]byte(`{"metadata":{"user_id":"user_hash_account__session_session-123"}}`), &req); err != nil {
+		t.Fatalf("decode Claude metadata: %v", err)
+	}
+
+	if got := claudePromptCacheIsolationSeed(&req, "client-key-id"); got != "key:client-key-id|session:session-123" {
+		t.Fatalf("session seed = %q", got)
+	}
+	if first, second := claudePromptCacheIsolationSeed(&req, "key-a"), claudePromptCacheIsolationSeed(&req, "key-b"); first == second {
+		t.Fatalf("different client keys shared a session seed: %q", first)
+	}
+	if got := claudePromptCacheIsolationSeed(&req, ""); got != "session:session-123" {
+		t.Fatalf("session-only seed = %q", got)
+	}
+	req.Metadata.UserID = "user-without-session"
+	if got := claudePromptCacheIsolationSeed(&req, "client-key-id"); got != "key:client-key-id" {
+		t.Fatalf("key fallback seed = %q", got)
+	}
+	req.Metadata.UserID = "trailing_session_"
+	if got := claudePromptCacheIsolationSeed(&req, ""); got != "" {
+		t.Fatalf("shared key without session must disable cache, got %q", got)
+	}
+}
+
+func TestReanchorClaudeCacheUsageUsesFinalUpstreamInput(t *testing.T) {
+	profile := &promptCacheProfile{TotalInputTokens: 2000}
+	estimated := promptCacheUsage{
+		CacheCreationInputTokens:   500,
+		CacheReadInputTokens:       1000,
+		CacheCreation5mInputTokens: 500,
+	}
+
+	got := reanchorClaudeCacheUsage(profile, estimated, 1000)
+	if got.CacheCreationInputTokens != 250 || got.CacheReadInputTokens != 500 {
+		t.Fatalf("reanchored usage = %+v, want creation=250 read=500", got)
+	}
+	if total := billedClaudeInputTokens(1000, got) + got.CacheCreationInputTokens + got.CacheReadInputTokens; total != 1000 {
+		t.Fatalf("reanchored token split total = %d, want 1000", total)
+	}
+}
+
+func TestNoAvailableAccountsAreRecordedInTraffic(t *testing.T) {
+	if err := config.Init(t.TempDir() + "/config.json"); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	p := accountpool.GetPool()
+	p.Reload()
+	tracker := NewTrafficTracker(time.Hour)
+	h := &Handler{
+		pool:        p,
+		promptCache: newPromptCacheTrackerWithCapacity(time.Hour, 16),
+		traffic:     tracker,
+	}
+
+	rec := httptest.NewRecorder()
+	h.handleClaudeNonStream(rec, &KiroPayload{}, "claude-sonnet-4.6", false, claudeThinkingResponseOptions{}, 100, nil, "")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := tracker.Query(time.Hour).Totals.Requests; got != 1 {
+		t.Fatalf("traffic requests=%d, want 1", got)
+	}
+	if got := atomic.LoadInt64(&h.failedRequests); got != 1 {
+		t.Fatalf("failed requests=%d, want 1", got)
+	}
+}
+
+func TestHandlerCloseWaitsForPromptCacheFlush(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Init(configPath); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	h := NewHandler()
+	h.promptCache.mu.Lock()
+	h.promptCache.putLocked([32]byte{42}, time.Now().Add(time.Hour), time.Hour)
+	h.promptCache.dirty = true
+	h.promptCache.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		h.Close()
+		h.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Handler.Close did not finish promptly")
+	}
+
+	loaded := newPromptCacheTrackerWithCapacity(time.Hour, 16)
+	loaded.Load(filepath.Join(filepath.Dir(configPath), "prompt_cache.json"))
+	if got := loaded.Stats().Entries; got != 1 {
+		t.Fatalf("flushed prompt cache entries=%d, want 1", got)
+	}
+}
+
+func TestAdminSettingsPromptCacheMaxEntriesHotReload(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.UpdatePromptCacheMaxEntries(300); err != nil {
+		t.Fatalf("set initial capacity: %v", err)
+	}
+
+	tracker := newPromptCacheTrackerWithCapacity(time.Hour, 300)
+	now := time.Now()
+	tracker.mu.Lock()
+	for i := 0; i < 300; i++ {
+		fingerprint := [32]byte{byte(i >> 8), byte(i)}
+		tracker.putLocked(fingerprint, now.Add(time.Hour), time.Hour)
+	}
+	tracker.mu.Unlock()
+
+	h := &Handler{promptCache: tracker}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/settings", strings.NewReader(`{"promptCacheMaxEntries":256}`))
+	h.apiUpdateSettings(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := config.GetPromptCacheMaxEntries(); got != 256 {
+		t.Fatalf("configured capacity = %d, want 256", got)
+	}
+	stats := tracker.Stats()
+	if stats.Capacity != 256 || stats.Entries != 256 || stats.Evictions != 44 {
+		t.Fatalf("live tracker did not shrink immediately: %+v", stats)
+	}
+
+	getRec := httptest.NewRecorder()
+	h.apiGetSettings(getRec, httptest.NewRequest(http.MethodGet, "/admin/api/settings", nil))
+	var settings map[string]interface{}
+	if err := json.NewDecoder(getRec.Body).Decode(&settings); err != nil {
+		t.Fatalf("decode settings: %v", err)
+	}
+	if got := settings["promptCacheMaxEntries"]; got != float64(256) {
+		t.Fatalf("settings capacity = %#v, want 256", got)
+	}
+
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("reload persisted config: %v", err)
+	}
+	if got := config.GetPromptCacheMaxEntries(); got != 256 {
+		t.Fatalf("persisted capacity = %d, want 256", got)
+	}
+}
+
+func TestAdminPromptCacheCapacityConcurrentUpdatesStayInSync(t *testing.T) {
+	if err := config.Init(t.TempDir() + "/config.json"); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	tracker := newPromptCacheTrackerWithCapacity(time.Hour, 4096)
+	h := &Handler{promptCache: tracker}
+	capacities := []int{256, 512, 1024, 2048, 4096, 8192}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 60; i++ {
+		capacity := capacities[i%len(capacities)]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rec := httptest.NewRecorder()
+			body := fmt.Sprintf(`{"promptCacheMaxEntries":%d}`, capacity)
+			h.apiUpdateSettings(rec, httptest.NewRequest(http.MethodPost, "/admin/api/settings", strings.NewReader(body)))
+			if rec.Code != http.StatusOK {
+				t.Errorf("capacity=%d status=%d body=%s", capacity, rec.Code, rec.Body.String())
+			}
+		}()
+	}
+	wg.Wait()
+	if configured, live := config.GetPromptCacheMaxEntries(), tracker.Stats().Capacity; live != configured {
+		t.Fatalf("persisted capacity=%d live capacity=%d", configured, live)
+	}
+}
+
+func TestAdminSettingsRejectsInvalidPromptCacheMaxEntries(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.UpdatePromptCacheMaxEntries(4096); err != nil {
+		t.Fatalf("set initial capacity: %v", err)
+	}
+
+	h := &Handler{promptCache: newPromptCacheTrackerWithCapacity(time.Hour, 4096)}
+	for _, body := range []string{
+		`{"promptCacheMaxEntries":255}`,
+		`{"promptCacheMaxEntries":1048577}`,
+		`{"promptCacheMaxEntries":1.5}`,
+	} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/admin/api/settings", strings.NewReader(body))
+		h.apiUpdateSettings(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("body=%s status=%d response=%s", body, rec.Code, rec.Body.String())
+		}
+		if got := config.GetPromptCacheMaxEntries(); got != 4096 {
+			t.Fatalf("body=%s changed capacity to %d", body, got)
+		}
+	}
+}
+
+func TestAdminTrafficUsesMutuallyExclusiveTokenSeries(t *testing.T) {
+	if err := config.Init(t.TempDir() + "/config.json"); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	now := time.Date(2026, 7, 11, 12, 0, 30, 0, time.UTC)
+	tracker := newTrafficTracker(time.Hour, func() time.Time { return now })
+	h := &Handler{traffic: tracker}
+
+	h.recordSuccessForApiKey("", 100, 20, 0)
+	h.recordSuccessForApiKeyWithCache("", 200, 30, 0, promptCacheUsage{
+		CacheCreationInputTokens: 40,
+		CacheReadInputTokens:     120,
+	})
+	h.recordFailureWithDetails("claude", "model", "account", newAuthError(500, "api_error", "boom"))
+
+	rec := httptest.NewRecorder()
+	h.apiGetTraffic(rec, httptest.NewRequest(http.MethodGet, "/admin/api/traffic?range=1h", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("traffic status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		Range  string          `json:"range"`
+		Totals TrafficCounters `json:"totals"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatalf("decode traffic: %v", err)
+	}
+	want := TrafficCounters{
+		Requests:            3,
+		InputTokens:         140,
+		OutputTokens:        50,
+		CacheCreationTokens: 40,
+		CacheReadTokens:     120,
+	}
+	if response.Range != "1h" || response.Totals != want {
+		t.Fatalf("traffic response range=%q totals=%+v, want %+v", response.Range, response.Totals, want)
+	}
+
+	bad := httptest.NewRecorder()
+	h.apiGetTraffic(bad, httptest.NewRequest(http.MethodGet, "/admin/api/traffic?range=7d", nil))
+	if bad.Code != http.StatusBadRequest {
+		t.Fatalf("invalid range status=%d body=%s", bad.Code, bad.Body.String())
+	}
+
+	reset := httptest.NewRecorder()
+	h.apiResetStats(reset, httptest.NewRequest(http.MethodPost, "/admin/api/stats/reset", nil))
+	if got := tracker.Query(time.Hour).Totals; got != (TrafficCounters{}) {
+		t.Fatalf("traffic was not reset: %+v", got)
+	}
+}
+
+func TestStatsResetIsAtomicWithTrafficRecording(t *testing.T) {
+	if err := config.Init(t.TempDir() + "/config.json"); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	tracker := NewTrafficTracker(time.Hour)
+	h := &Handler{traffic: tracker}
+
+	var wg sync.WaitGroup
+	for worker := 0; worker < 4; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				h.recordSuccessForApiKey("", 1, 0, 0)
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 20; i++ {
+			h.apiResetStats(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/admin/api/stats/reset", nil))
+		}
+	}()
+	wg.Wait()
+
+	globalRequests := uint64(atomic.LoadInt64(&h.totalRequests))
+	trafficRequests := tracker.Query(time.Hour).Totals.Requests
+	if globalRequests != trafficRequests {
+		t.Fatalf("global requests=%d traffic requests=%d", globalRequests, trafficRequests)
 	}
 }

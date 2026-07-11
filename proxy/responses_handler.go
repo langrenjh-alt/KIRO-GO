@@ -213,6 +213,7 @@ func (h *Handler) handleResponsesNonStream(
 	}
 
 	if lastErr == nil {
+		h.recordFailureWithDetails("responses", model, "", fmt.Errorf("No available accounts"))
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 		return
 	}
@@ -566,6 +567,7 @@ func (h *Handler) handleResponsesStream(
 	}
 
 	if lastErr == nil {
+		h.recordFailureWithDetails("responses", model, "", fmt.Errorf("No available accounts"))
 		send("response.failed", map[string]interface{}{
 			"type": "response.failed",
 			"response": map[string]interface{}{
