@@ -427,6 +427,10 @@ sudo ls -lh "${BACKUP_FILE}"
 `prompt_cache.json` 丢失时只会导致缓存冷启动，但 `config.json` 和 `responses/`
 不应随意删除。
 
+从 `97df504` 起，Prompt Cache 指纹格式升级为 v2，用于隔离 5 分钟和 1 小时 TTL
+策略。升级时旧 v1 条目会被忽略，因此首次启动会冷缓存一次；合格请求成功完成后会重新
+写入，随后相同前缀即可命中。这不影响 `config.json`、账号或 Stored Responses。
+
 ## 14. 升级与回滚
 
 升级时，二进制和 `web/` 必须来自同一提交。先将下面的完整提交 SHA 和对应二进制
