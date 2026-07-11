@@ -7,11 +7,11 @@
 
 | 项目 | 值 |
 |---|---|
-| Git 提交 | `6aff5b34e54fdb9b48e39918ca87606f987bc396` |
+| Git 提交 | `97df5048f0b7f56f68543ccad63d358eee53b4e6` |
 | Go 版本 | `go1.22.2` |
 | 目标平台 | `linux/amd64` |
-| 二进制大小 | `6,738,072` 字节 |
-| SHA-256 | `ef03c9ffd1cfaec7b7ddcf57e460d794e0e18bc7d3722e003913857caba354fa` |
+| 二进制大小 | `6,746,264` 字节 |
+| SHA-256 | `728a57a47cb7795f26cbb7fc20fd366054076bfb3c10e7433e7a6955eebbacfd` |
 
 > 上述校验和只适用于该次构建。部署其他版本时，以对应 release 提供的校验和为准。
 
@@ -27,9 +27,9 @@ Kiro-Go 的 Admin 页面没有嵌入二进制。程序会从当前工作目录�
 
 ```text
 /opt/kiro-go/
-├── current -> /opt/kiro-go/releases/6aff5b3
+├── current -> /opt/kiro-go/releases/97df504
 └── releases/
-    └── 6aff5b3/
+    └── 97df504/
         ├── kiro-go
         └── web/
 
@@ -73,7 +73,7 @@ scp dist/kiro-go-linux-amd64 ubuntu@SERVER_IP:/tmp/
 在 Ubuntu 服务器上校验当前构建：
 
 ```bash
-echo 'ef03c9ffd1cfaec7b7ddcf57e460d794e0e18bc7d3722e003913857caba354fa  /tmp/kiro-go-linux-amd64' \
+echo '728a57a47cb7795f26cbb7fc20fd366054076bfb3c10e7433e7a6955eebbacfd  /tmp/kiro-go-linux-amd64' \
   | sha256sum -c -
 file /tmp/kiro-go-linux-amd64
 ```
@@ -87,7 +87,7 @@ ELF 64-bit LSB executable, x86-64, statically linked, stripped
 如果没有单独的 release 资源包，可从同一提交下载 `web/`：
 
 ```bash
-export KIRO_GO_COMMIT=6aff5b34e54fdb9b48e39918ca87606f987bc396
+export KIRO_GO_COMMIT=97df5048f0b7f56f68543ccad63d358eee53b4e6
 mkdir -p /tmp/kiro-go-source
 curl -fL \
   "https://github.com/langrenjh-alt/Kiro-Go/archive/${KIRO_GO_COMMIT}.tar.gz" \
@@ -114,7 +114,7 @@ sudo useradd \
 如果用户已经存在，可跳过 `useradd`。创建目录并安装当前 release：
 
 ```bash
-export RELEASE_ID=6aff5b3
+export RELEASE_ID=97df504
 export RELEASE_DIR="/opt/kiro-go/releases/${RELEASE_ID}"
 
 sudo install -d -o root -g root -m 0755 /opt/kiro-go/releases
