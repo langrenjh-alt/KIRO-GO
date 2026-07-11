@@ -95,20 +95,23 @@ func (h *promptCacheExpiryHeap) Pop() interface{} {
 }
 
 type promptCacheTracker struct {
-	mu              sync.Mutex
-	entries         map[[32]byte]*promptCacheEntry
-	order           *list.List // front = most-recently-used; Element.Value = [32]byte fingerprint
-	expiryQueue     promptCacheExpiryHeap
-	maxEntries      int
-	maxSupportedTTL time.Duration
-	hits            int64 // atomic — Compute calls returning CacheReadInputTokens > 0
-	misses          int64 // atomic — Compute calls returning CacheReadInputTokens == 0
-	evictions       int64 // atomic — LRU pop-backs in evictOverflowLocked
-	expirations     int64 // atomic — TTL removals in pruneExpiredLocked
-	dirty           bool
-	stopChan        chan struct{}
-	stopDone        chan struct{}
-	stopOnce        sync.Once
+	mu                    sync.Mutex
+	entries               map[[32]byte]*promptCacheEntry
+	order                 *list.List // front = most-recently-used; Element.Value = [32]byte fingerprint
+	expiryQueue           promptCacheExpiryHeap
+	maxEntries            int
+	maxSupportedTTL       time.Duration
+	hits                  int64 // atomic — Compute calls returning CacheReadInputTokens > 0
+	misses                int64 // atomic — Compute calls returning CacheReadInputTokens == 0
+	evictions             int64 // atomic — LRU pop-backs in evictOverflowLocked
+	expirations           int64 // atomic — TTL removals in pruneExpiredLocked
+	skippedNoIsolation    int64 // atomic — requests without a stable session or client key
+	skippedNoCacheControl int64 // atomic — requests without an explicit cache marker
+	skippedNoBreakpoints  int64 // atomic — markers that produced no usable breakpoint
+	dirty                 bool
+	stopChan              chan struct{}
+	stopDone              chan struct{}
+	stopOnce              sync.Once
 }
 
 func newPromptCacheTracker(maxTTL time.Duration) *promptCacheTracker {
@@ -335,6 +338,7 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 		isolationSeed = isolationSeeds[0]
 	}
 	if isolationSeed == "" {
+		atomic.AddInt64(&t.skippedNoIsolation, 1)
 		return nil
 	}
 
@@ -346,10 +350,12 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 	// for non-Claude-Code clients that send large prompts without cache_control.
 	// Outcome-identical to the full pass (returns nil iff the pass produces none).
 	if !claudeRequestHasCacheControl(req) {
+		atomic.AddInt64(&t.skippedNoCacheControl, 1)
 		return nil
 	}
 	blocks := flattenClaudeCacheBlocks(req)
 	if len(blocks) == 0 {
+		atomic.AddInt64(&t.skippedNoBreakpoints, 1)
 		return nil
 	}
 
@@ -399,6 +405,7 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 	}
 
 	if len(breakpoints) == 0 {
+		atomic.AddInt64(&t.skippedNoBreakpoints, 1)
 		return nil
 	}
 
@@ -591,12 +598,15 @@ func (t *promptCacheTracker) SetMaxEntries(maxEntries int) {
 // PromptCacheStats is a point-in-time snapshot of cache counters, surfaced via
 // /v1/stats. All counters are cumulative since tracker construction.
 type PromptCacheStats struct {
-	Entries     int   `json:"entries"`
-	Capacity    int   `json:"capacity"`
-	Hits        int64 `json:"hits"`
-	Misses      int64 `json:"misses"`
-	Evictions   int64 `json:"evictions"`
-	Expirations int64 `json:"expirations"`
+	Entries               int   `json:"entries"`
+	Capacity              int   `json:"capacity"`
+	Hits                  int64 `json:"hits"`
+	Misses                int64 `json:"misses"`
+	Evictions             int64 `json:"evictions"`
+	Expirations           int64 `json:"expirations"`
+	SkippedNoIsolation    int64 `json:"skippedNoIsolation"`
+	SkippedNoCacheControl int64 `json:"skippedNoCacheControl"`
+	SkippedNoBreakpoints  int64 `json:"skippedNoBreakpoints"`
 }
 
 func (t *promptCacheTracker) Stats() PromptCacheStats {
@@ -608,12 +618,15 @@ func (t *promptCacheTracker) Stats() PromptCacheStats {
 	capacity := t.maxEntries
 	t.mu.Unlock()
 	return PromptCacheStats{
-		Entries:     entries,
-		Capacity:    capacity,
-		Hits:        atomic.LoadInt64(&t.hits),
-		Misses:      atomic.LoadInt64(&t.misses),
-		Evictions:   atomic.LoadInt64(&t.evictions),
-		Expirations: atomic.LoadInt64(&t.expirations),
+		Entries:               entries,
+		Capacity:              capacity,
+		Hits:                  atomic.LoadInt64(&t.hits),
+		Misses:                atomic.LoadInt64(&t.misses),
+		Evictions:             atomic.LoadInt64(&t.evictions),
+		Expirations:           atomic.LoadInt64(&t.expirations),
+		SkippedNoIsolation:    atomic.LoadInt64(&t.skippedNoIsolation),
+		SkippedNoCacheControl: atomic.LoadInt64(&t.skippedNoCacheControl),
+		SkippedNoBreakpoints:  atomic.LoadInt64(&t.skippedNoBreakpoints),
 	}
 }
 

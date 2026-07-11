@@ -52,6 +52,37 @@ func TestPromptCacheProfileRequiresStableIsolationSeed(t *testing.T) {
 	}
 }
 
+func TestPromptCacheStatsExplainSkippedProfiles(t *testing.T) {
+	tracker := newPromptCacheTrackerWithCapacity(time.Hour, 16)
+	withMarker := &ClaudeRequest{
+		Model: "claude-sonnet-4-6",
+		System: []interface{}{map[string]interface{}{
+			"type":          "text",
+			"text":          strings.Repeat("cacheable ", 500),
+			"cache_control": map[string]interface{}{"type": "ephemeral"},
+		}},
+	}
+	tracker.BuildClaudeProfile(withMarker, 2000)
+
+	withoutMarker := &ClaudeRequest{Model: "claude-sonnet-4-6", System: "plain system"}
+	tracker.BuildClaudeProfile(withoutMarker, 2000, "tenant")
+
+	invalidMarker := &ClaudeRequest{
+		Model: "claude-sonnet-4-6",
+		System: []interface{}{map[string]interface{}{
+			"type":          "text",
+			"text":          strings.Repeat("cacheable ", 500),
+			"cache_control": map[string]interface{}{"type": "persistent"},
+		}},
+	}
+	tracker.BuildClaudeProfile(invalidMarker, 2000, "tenant")
+
+	stats := tracker.Stats()
+	if stats.SkippedNoIsolation != 1 || stats.SkippedNoCacheControl != 1 || stats.SkippedNoBreakpoints != 1 {
+		t.Fatalf("unexpected skipped-profile counters: %+v", stats)
+	}
+}
+
 func TestPromptCacheDynamicSystemBeforeBreakpointIsExcluded(t *testing.T) {
 	tracker := newPromptCacheTrackerWithCapacity(time.Hour, 16)
 	stable := strings.Repeat("stable reusable system instructions ", 220)

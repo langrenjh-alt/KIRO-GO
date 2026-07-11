@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
@@ -862,7 +863,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	thinkingResponseOpts := resolveClaudeThinkingResponseOptions(req.Thinking, thinkingCfg.ClaudeFormat)
 	estimatedInputTokens := estimateClaudeRequestInputTokens(effectiveReq)
 	apiKeyID := apiKeyIDFromContext(r.Context())
-	isolationSeed := claudePromptCacheIsolationSeed(effectiveReq, apiKeyID)
+	isolationSeed := claudePromptCacheIsolationSeed(effectiveReq, apiKeyID, extractProvidedKey(r))
 	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, estimatedInputTokens, isolationSeed)
 
 	// 转换请求
@@ -876,22 +877,29 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	}
 }
 
-func claudePromptCacheIsolationSeed(req *ClaudeRequest, apiKeyID string) string {
+func claudePromptCacheIsolationSeed(req *ClaudeRequest, apiKeyID string, providedKeys ...string) string {
 	apiKeyID = strings.TrimSpace(apiKeyID)
+	keySeed := ""
+	if apiKeyID != "" {
+		keySeed = "key:" + apiKeyID
+	} else if len(providedKeys) > 0 {
+		providedKey := strings.TrimSpace(providedKeys[0])
+		if providedKey != "" {
+			digest := sha256.Sum256([]byte(providedKey))
+			keySeed = fmt.Sprintf("provided-key:%x", digest[:])
+		}
+	}
 	if req != nil && req.Metadata != nil {
 		if _, sessionID, ok := strings.Cut(req.Metadata.UserID, "_session_"); ok {
 			if sessionID = strings.TrimSpace(sessionID); sessionID != "" {
-				if apiKeyID != "" {
-					return "key:" + apiKeyID + "|session:" + sessionID
+				if keySeed != "" {
+					return keySeed + "|session:" + sessionID
 				}
 				return "session:" + sessionID
 			}
 		}
 	}
-	if apiKeyID != "" {
-		return "key:" + apiKeyID
-	}
-	return ""
+	return keySeed
 }
 
 // handleClaudeStream Claude 流式响应

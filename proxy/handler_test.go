@@ -637,6 +637,56 @@ func TestClaudePromptCacheIsolationSeed(t *testing.T) {
 	if got := claudePromptCacheIsolationSeed(&req, ""); got != "" {
 		t.Fatalf("shared key without session must disable cache, got %q", got)
 	}
+
+	providedSeed := claudePromptCacheIsolationSeed(&req, "", "client-secret")
+	if providedSeed == "" || !strings.HasPrefix(providedSeed, "provided-key:") {
+		t.Fatalf("provided key seed = %q", providedSeed)
+	}
+	if strings.Contains(providedSeed, "client-secret") {
+		t.Fatal("provided key was retained in the isolation seed")
+	}
+	if repeat := claudePromptCacheIsolationSeed(&req, "", "client-secret"); repeat != providedSeed {
+		t.Fatalf("provided key seed drifted: first=%q repeat=%q", providedSeed, repeat)
+	}
+	if other := claudePromptCacheIsolationSeed(&req, "", "other-secret"); other == providedSeed {
+		t.Fatal("different provided keys shared an isolation seed")
+	}
+}
+
+func TestPromptCacheProvidedHeaderKeyWorksWithoutAuthContext(t *testing.T) {
+	tracker := newPromptCacheTrackerWithCapacity(time.Hour, 16)
+	claudeReq := &ClaudeRequest{
+		Model: "claude-sonnet-4-6",
+		System: []interface{}{map[string]interface{}{
+			"type":          "text",
+			"text":          strings.Repeat("stable client-key prefix ", 300),
+			"cache_control": map[string]interface{}{"type": "ephemeral"},
+		}},
+		Messages: []ClaudeMessage{{Role: "user", Content: "hello"}},
+	}
+
+	headerReq := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	headerReq.Header.Set("X-Api-Key", "open-client-key")
+	seed := claudePromptCacheIsolationSeed(claudeReq, "", extractProvidedKey(headerReq))
+	profile := tracker.BuildClaudeProfile(claudeReq, estimateClaudeRequestInputTokens(claudeReq), seed)
+	if profile == nil {
+		t.Fatal("provided request header should build a cache profile without an auth context")
+	}
+	if cold := tracker.Compute("account", profile); cold.CacheReadInputTokens != 0 {
+		t.Fatalf("cold request cache_read=%d, want 0", cold.CacheReadInputTokens)
+	}
+	tracker.Update("account", profile)
+	if hot := tracker.Compute("account", profile); hot.CacheReadInputTokens == 0 {
+		t.Fatal("repeated request header key should hit the stored prefix")
+	}
+
+	otherReq := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	otherReq.Header.Set("Authorization", "Bearer other-client-key")
+	otherSeed := claudePromptCacheIsolationSeed(claudeReq, "", extractProvidedKey(otherReq))
+	otherProfile := tracker.BuildClaudeProfile(claudeReq, estimateClaudeRequestInputTokens(claudeReq), otherSeed)
+	if other := tracker.Compute("account", otherProfile); other.CacheReadInputTokens != 0 {
+		t.Fatalf("different request header key cache_read=%d, want 0", other.CacheReadInputTokens)
+	}
 }
 
 func TestReanchorClaudeCacheUsageUsesFinalUpstreamInput(t *testing.T) {
