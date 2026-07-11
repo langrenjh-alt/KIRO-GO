@@ -42,6 +42,11 @@ docker run -d \
   ghcr.io/quorinex/kiro-go:latest
 ```
 
+### Ubuntu 24.04 二进制部署
+
+预编译的 Linux amd64 二进制可使用 systemd 运行。完整的用户权限、HTTPS、升级、
+回滚和排障步骤请参阅 [Ubuntu 24.04 二进制部署指南](docs/ubuntu24-binary-deployment.md)。
+
 ### 源码编译
 
 ```bash
