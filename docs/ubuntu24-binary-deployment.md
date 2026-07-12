@@ -3,35 +3,21 @@
 本文适用于 Ubuntu 24.04 LTS `x86_64` 服务器，以 systemd 运行预编译的
 `kiro-go-linux-amd64`，并以 Nginx 提供 HTTPS 反向代理。
 
-当前已验证构建：
-
-| 项目 | 值 |
-|---|---|
-| Git 提交 | `97df5048f0b7f56f68543ccad63d358eee53b4e6` |
-| Go 版本 | `go1.22.2` |
-| 目标平台 | `linux/amd64` |
-| 二进制大小 | `6,746,264` 字节 |
-| SHA-256 | `728a57a47cb7795f26cbb7fc20fd366054076bfb3c10e7433e7a6955eebbacfd` |
-
-> 上述校验和只适用于该次构建。部署其他版本时，以对应 release 提供的校验和为准。
+部署前请从对应 release 记录版本标识和 SHA-256；校验和只适用于生成它的那次构建。
 
 ## 1. 重要说明
 
-Kiro-Go 的 Admin 页面没有嵌入二进制。程序会从当前工作目录读取
-`web/index.html` 和其他 `web/` 资源。因此必须同时部署：
-
-- `kiro-go-linux-amd64`
-- 与二进制来自同一 Git 提交的完整 `web/` 目录
+Kiro-Go 的 Admin 页面及其静态资源已经嵌入二进制。运行时只需部署
+`kiro-go-linux-amd64`，不需要额外的资源目录。
 
 本文采用以下目录布局：
 
 ```text
 /opt/kiro-go/
-├── current -> /opt/kiro-go/releases/97df504
+├── current -> /opt/kiro-go/releases/RELEASE_ID
 └── releases/
-    └── 97df504/
-        ├── kiro-go
-        └── web/
+    └── RELEASE_ID/
+        └── kiro-go
 
 /etc/kiro-go/kiro-go.env
 /var/lib/kiro-go/config.json
@@ -70,11 +56,11 @@ sudo timedatectl set-ntp true
 scp dist/kiro-go-linux-amd64 ubuntu@SERVER_IP:/tmp/
 ```
 
-在 Ubuntu 服务器上校验当前构建：
+在 Ubuntu 服务器上使用 release 提供的 SHA-256 校验当前构建：
 
 ```bash
-echo '728a57a47cb7795f26cbb7fc20fd366054076bfb3c10e7433e7a6955eebbacfd  /tmp/kiro-go-linux-amd64' \
-  | sha256sum -c -
+export KIRO_GO_SHA256=REPLACE_WITH_RELEASE_SHA256
+echo "${KIRO_GO_SHA256}  /tmp/kiro-go-linux-amd64" | sha256sum -c -
 file /tmp/kiro-go-linux-amd64
 ```
 
@@ -82,20 +68,6 @@ file /tmp/kiro-go-linux-amd64
 
 ```text
 ELF 64-bit LSB executable, x86-64, statically linked, stripped
-```
-
-如果没有单独的 release 资源包，可从同一提交下载 `web/`：
-
-```bash
-export KIRO_GO_COMMIT=97df5048f0b7f56f68543ccad63d358eee53b4e6
-mkdir -p /tmp/kiro-go-source
-curl -fL \
-  "https://github.com/langrenjh-alt/Kiro-Go/archive/${KIRO_GO_COMMIT}.tar.gz" \
-  -o /tmp/kiro-go-source.tar.gz
-tar -xzf /tmp/kiro-go-source.tar.gz \
-  --strip-components=1 \
-  -C /tmp/kiro-go-source
-test -r /tmp/kiro-go-source/web/index.html
 ```
 
 ## 4. 安装程序
@@ -114,21 +86,17 @@ sudo useradd \
 如果用户已经存在，可跳过 `useradd`。创建目录并安装当前 release：
 
 ```bash
-export RELEASE_ID=97df504
+export RELEASE_ID=REPLACE_WITH_RELEASE_ID
 export RELEASE_DIR="/opt/kiro-go/releases/${RELEASE_ID}"
 
 sudo install -d -o root -g root -m 0755 /opt/kiro-go/releases
-sudo install -d -o root -g root -m 0755 "${RELEASE_DIR}/web"
+sudo install -d -o root -g root -m 0755 "${RELEASE_DIR}"
 sudo install -d -o root -g root -m 0750 /etc/kiro-go
 sudo install -d -o kiro-go -g kiro-go -m 0700 /var/lib/kiro-go
 
 sudo install -o root -g root -m 0755 \
   /tmp/kiro-go-linux-amd64 \
   "${RELEASE_DIR}/kiro-go"
-sudo cp -a /tmp/kiro-go-source/web/. "${RELEASE_DIR}/web/"
-sudo chown -R root:root "${RELEASE_DIR}/web"
-sudo find "${RELEASE_DIR}/web" -type d -exec chmod 0755 {} +
-sudo find "${RELEASE_DIR}/web" -type f -exec chmod 0644 {} +
 
 sudo ln -sfn "${RELEASE_DIR}" /opt/kiro-go/current.next
 sudo mv -Tf /opt/kiro-go/current.next /opt/kiro-go/current
@@ -138,7 +106,6 @@ sudo mv -Tf /opt/kiro-go/current.next /opt/kiro-go/current
 
 ```bash
 test -x /opt/kiro-go/current/kiro-go
-test -r /opt/kiro-go/current/web/index.html
 ```
 
 ## 5. 配置环境变量
@@ -217,7 +184,6 @@ Group=kiro-go
 WorkingDirectory=/opt/kiro-go/current
 EnvironmentFile=/etc/kiro-go/kiro-go.env
 ExecStartPre=/usr/bin/test -x /opt/kiro-go/current/kiro-go
-ExecStartPre=/usr/bin/test -r /opt/kiro-go/current/web/index.html
 ExecStart=/opt/kiro-go/current/kiro-go
 Restart=on-failure
 RestartSec=5s
@@ -252,6 +218,7 @@ Prompt Cache。不要使用 `kill -9`；`TimeoutStopSec` 也不要设置得低�
 ```bash
 sudo systemctl status kiro-go --no-pager
 curl -fsS http://127.0.0.1:8080/health | jq
+curl -fsS -o /dev/null http://127.0.0.1:8080/admin
 sudo journalctl -u kiro-go -n 100 --no-pager
 ```
 
@@ -265,8 +232,8 @@ sudo journalctl -u kiro-go -n 100 --no-pager
 }
 ```
 
-`/health` 只说明 HTTP 进程正常，不代表已有可用账号或上游可访问。账号池状态可在
-Admin 页面查看。
+第二条 `curl` 验证二进制内嵌的 Admin 页面也能正常提供。`/health` 只说明 HTTP
+进程正常，不代表已有可用账号或上游可访问。账号池状态可在 Admin 页面查看。
 
 ## 9. 完成首次 Admin 配置
 
@@ -404,7 +371,7 @@ curl -fsS http://127.0.0.1:8080/health | jq
 | Admin 中的出站代理 | 否，立即生效 |
 | `host`、`port` | 是 |
 | systemd 环境变量 | 是 |
-| 二进制或 `web/` | 是 |
+| 二进制 | 是 |
 
 “流量”页面的分钟趋势保存在进程内，服务重启后会清空；累计总统计会保存在
 `config.json`。
@@ -433,29 +400,19 @@ sudo ls -lh "${BACKUP_FILE}"
 
 ## 14. 升级与回滚
 
-升级时，二进制和 `web/` 必须来自同一提交。先将下面的完整提交 SHA 和对应二进制
-SHA-256 替换为新版本的真实值，再下载该提交的 Web 资源：
+升级前先将新版二进制上传到 `/tmp/kiro-go-linux-amd64`，再把下面的 release 标识和
+SHA-256 替换为新版本的真实值：
 
 ```bash
-export NEW_COMMIT=REPLACE_WITH_NEW_FULL_COMMIT_SHA
+export NEW_RELEASE_ID=REPLACE_WITH_NEW_RELEASE_ID
 export NEW_BINARY_SHA256=REPLACE_WITH_NEW_BINARY_SHA256
-export NEW_RELEASE_ID="${NEW_COMMIT:0:12}"
 export NEW_RELEASE_DIR="/opt/kiro-go/releases/${NEW_RELEASE_ID}"
 export OLD_RELEASE_DIR="$(readlink -f /opt/kiro-go/current)"
-export NEW_SOURCE_ROOT="$(mktemp -d)"
 
 echo "${NEW_BINARY_SHA256}  /tmp/kiro-go-linux-amd64" | sha256sum -c -
-mkdir -p "${NEW_SOURCE_ROOT}/tree"
-curl -fL \
-  "https://github.com/langrenjh-alt/Kiro-Go/archive/${NEW_COMMIT}.tar.gz" \
-  -o "${NEW_SOURCE_ROOT}/source.tar.gz"
-tar -xzf "${NEW_SOURCE_ROOT}/source.tar.gz" \
-  --strip-components=1 \
-  -C "${NEW_SOURCE_ROOT}/tree"
-test -r "${NEW_SOURCE_ROOT}/tree/web/index.html"
 ```
 
-确认新的 release 目录尚不存在，再安装二进制和同提交 Web 资源：
+确认新的 release 目录尚不存在，再安装二进制：
 
 ```bash
 if sudo test -e "${NEW_RELEASE_DIR}"; then
@@ -463,14 +420,10 @@ if sudo test -e "${NEW_RELEASE_DIR}"; then
   exit 1
 fi
 
-sudo install -d -o root -g root -m 0755 "${NEW_RELEASE_DIR}/web"
+sudo install -d -o root -g root -m 0755 "${NEW_RELEASE_DIR}"
 sudo install -o root -g root -m 0755 \
   /tmp/kiro-go-linux-amd64 \
   "${NEW_RELEASE_DIR}/kiro-go"
-sudo cp -a "${NEW_SOURCE_ROOT}/tree/web/." "${NEW_RELEASE_DIR}/web/"
-sudo chown -R root:root "${NEW_RELEASE_DIR}/web"
-sudo find "${NEW_RELEASE_DIR}/web" -type d -exec chmod 0755 {} +
-sudo find "${NEW_RELEASE_DIR}/web" -type f -exec chmod 0644 {} +
 ```
 
 切换版本前必须创建一致性备份。备份失败时重新启动旧版本并终止升级：
@@ -511,11 +464,16 @@ sudo systemctl start kiro-go
 
 ### Admin 返回 404 或页面资源缺失
 
-确认 systemd 的 `WorkingDirectory=/opt/kiro-go/current`，并检查：
+Admin 资源位于二进制内部。先确认服务和页面响应，再检查当前运行的二进制校验和与
+release 是否一致：
 
 ```bash
-sudo -u kiro-go test -r /opt/kiro-go/current/web/index.html
+curl -fsS -o /dev/null http://127.0.0.1:8080/admin
+sha256sum /opt/kiro-go/current/kiro-go
+sudo journalctl -u kiro-go -n 100 --no-pager
 ```
+
+如果健康检查正常但 Admin 资源缺失，请重新部署包含内嵌资源的正确 release 二进制。
 
 ### 无法写入配置或 Prompt Cache
 

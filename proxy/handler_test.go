@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"kiro-go/config"
 	accountpool "kiro-go/pool"
@@ -27,6 +28,32 @@ func TestThinkingSourceReasoningFirst(t *testing.T) {
 	}
 	if allowTagSource(&source) {
 		t.Fatalf("expected tag source to be rejected after reasoning source selected")
+	}
+}
+
+func TestClaudeMessagesRejectsOversizedBody(t *testing.T) {
+	h := &Handler{}
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{}`))
+	req.ContentLength = claudeMaxRequestBodyBytes + 1
+	rec := httptest.NewRecorder()
+
+	h.handleClaudeMessagesInternal(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "request_too_large") {
+		t.Fatalf("unexpected error body: %s", rec.Body.String())
+	}
+}
+
+func TestReadRequestBodyLimitWithoutContentLength(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("0123456789"))
+	req.ContentLength = -1
+	_, err := readRequestBodyWithLimit(httptest.NewRecorder(), req, 8)
+	var tooLarge *http.MaxBytesError
+	if !errors.As(err, &tooLarge) || tooLarge.Limit != 8 {
+		t.Fatalf("error = %#v, want MaxBytesError with limit 8", err)
 	}
 }
 
@@ -90,6 +117,7 @@ func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) 
 
 	p := accountpool.GetPool()
 	p.Reload()
+	t.Cleanup(p.WaitForPendingStats)
 	h := &Handler{
 		pool:        p,
 		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),

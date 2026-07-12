@@ -42,16 +42,16 @@
   let trafficViewState = 'idle';
   let trafficChartLayout = null;
   let trafficResizeObserver = null;
+  let trafficHoverIndex = -1;
   const TRAFFIC_SERIES = [
-    { key: 'inputTokens', labelKey: 'traffic.inputTokens', color: '#2563eb' },
-    { key: 'outputTokens', labelKey: 'traffic.outputTokens', color: '#16a34a' },
-    { key: 'cacheCreationTokens', labelKey: 'traffic.cacheCreationTokens', color: '#d97706' },
-    { key: 'cacheReadTokens', labelKey: 'traffic.cacheReadTokens', color: '#7c3aed' }
+    { key: 'cacheReadTokens', labelKey: 'traffic.cacheReadTokens', color: '#2e1065', pattern: 'cross', patternColor: 'rgba(255,255,255,0.68)' },
+    { key: 'inputTokens', labelKey: 'traffic.inputTokens', color: '#0284c7', pattern: 'solid', patternColor: 'rgba(255,255,255,0.45)' },
+    { key: 'cacheCreationTokens', labelKey: 'traffic.cacheCreationTokens', color: '#431407', pattern: 'diagonal', patternColor: 'rgba(255,255,255,0.66)' },
+    { key: 'outputTokens', labelKey: 'traffic.outputTokens', color: '#16a34a', pattern: 'horizontal', patternColor: 'rgba(0,0,0,0.38)' }
   ];
   const TRAFFIC_CACHE_READ_RATE = {
     key: 'cacheReadRate',
-    labelKey: 'traffic.cacheReadRate',
-    color: '#db2777'
+    labelKey: 'traffic.cacheReadRate'
   };
 
   // DOM helpers
@@ -150,6 +150,8 @@
     renderAccounts();
     renderPromptRules();
     renderLogs(logsCache);
+    trafficHoverIndex = -1;
+    hideTrafficTooltip();
     renderTraffic(trafficData);
   }
   function updateLangButtons() {
@@ -818,7 +820,16 @@
     };
     const fallbackTotal = totals.inputTokens + totals.outputTokens + totals.cacheCreationTokens + totals.cacheReadTokens;
     totals.totalTokens = totalValue(['totalTokens', 'total_tokens', 'tokens'], fallbackTotal);
-    return { range: source.range || range, points, totals };
+    const suppliedBucketSeconds = trafficNumberFrom(source, ['bucketSeconds', 'bucket_seconds']);
+    const inferredBucketSeconds = points.length > 1
+      ? Math.max(1, Math.round((points[1].timestamp - points[0].timestamp) / 1000))
+      : 60;
+    return {
+      range: source.range || range,
+      bucketSeconds: suppliedBucketSeconds || inferredBucketSeconds,
+      points,
+      totals
+    };
   }
 
   function formatTrafficNumber(value) {
@@ -835,12 +846,124 @@
     return value === null || !Number.isFinite(Number(value)) ? '--' : Number(value).toFixed(1) + '%';
   }
 
-  function formatTrafficTime(timestamp, withDate) {
+  function formatTrafficTime(timestamp, withDate, compact) {
     const locale = currentLang === 'zh' ? 'zh-CN' : 'en-US';
-    const options = withDate
+    const options = withDate && compact
+      ? { month: '2-digit', day: '2-digit', hour: '2-digit', hour12: false }
+      : withDate
       ? { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }
       : { hour: '2-digit', minute: '2-digit' };
     return new Intl.DateTimeFormat(locale, options).format(new Date(timestamp));
+  }
+
+  function trafficBucketMinutesForChart(pointCount, plotWidth, bucketSeconds) {
+    const preferred = { '1h': 1, '6h': 5, '24h': 15 }[trafficRange] || 1;
+    const sourceMinutes = Math.max(1, Math.ceil((Number(bucketSeconds) || 60) / 60));
+    const maxBuckets = plotWidth < 560 ? 48 : Math.max(48, Math.floor(plotWidth / 7));
+    const spanMinutes = Math.max(sourceMinutes, pointCount * sourceMinutes);
+    const candidates = [1, 2, 5, 10, 15, 30, 60, 120];
+    return candidates.find(minutes =>
+      minutes >= preferred && minutes >= sourceMinutes && Math.ceil(spanMinutes / minutes) <= maxBuckets
+    ) || candidates[candidates.length - 1];
+  }
+
+  function aggregateTrafficPoints(points, bucketMinutes, bucketSeconds) {
+    if (!points.length) return [];
+    const bucketMs = bucketMinutes * 60000;
+    const sourceBucketMs = Math.max(1000, (Number(bucketSeconds) || 60) * 1000);
+    const windowStart = points[0].timestamp;
+    const windowEnd = points[points.length - 1].timestamp + sourceBucketMs;
+    const buckets = new Map();
+
+    points.forEach(point => {
+      const bucketStart = windowStart + Math.floor((point.timestamp - windowStart) / bucketMs) * bucketMs;
+      let bucket = buckets.get(bucketStart);
+      if (!bucket) {
+        bucket = {
+          timestamp: bucketStart,
+          endTimestamp: Math.min(bucketStart + bucketMs, windowEnd),
+          requests: 0,
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheCreationTokens: 0,
+          cacheReadTokens: 0
+        };
+        buckets.set(bucketStart, bucket);
+      }
+      bucket.requests += point.requests || 0;
+      TRAFFIC_SERIES.forEach(series => {
+        bucket[series.key] += point[series.key] || 0;
+      });
+    });
+
+    return Array.from(buckets.values()).map(bucket => {
+      bucket.totalTokens = TRAFFIC_SERIES.reduce((total, series) => total + bucket[series.key], 0);
+      bucket.cacheReadRate = trafficCacheReadRate(
+        bucket.inputTokens,
+        bucket.cacheCreationTokens,
+        bucket.cacheReadTokens
+      );
+      return bucket;
+    });
+  }
+
+  function trafficNiceScale(maxValue) {
+    if (!(maxValue > 0)) return { yMax: 1, yTicks: 4 };
+    const roughStep = maxValue / 5;
+    const magnitude = Math.pow(10, Math.floor(Math.log10(roughStep)));
+    const fraction = roughStep / magnitude;
+    const niceFraction = [1, 1.5, 2, 2.5, 5, 10].find(value => value >= fraction) || 10;
+    const step = niceFraction * magnitude;
+    const yMax = Math.ceil(maxValue / step) * step;
+    return { yMax, yTicks: Math.max(2, Math.round(yMax / step)) };
+  }
+
+  function formatTrafficInterval(point) {
+    const start = formatTrafficTime(point.timestamp, true);
+    if (!(point.endTimestamp > point.timestamp)) return start;
+    return start + ' - ' + formatTrafficTime(point.endTimestamp, true);
+  }
+
+  function trafficSeriesPaint(ctx, series) {
+    if (series.pattern === 'solid') return series.color;
+    const tile = document.createElement('canvas');
+    tile.width = 8;
+    tile.height = 8;
+    const tileCtx = tile.getContext('2d');
+    tileCtx.fillStyle = series.color;
+    tileCtx.fillRect(0, 0, tile.width, tile.height);
+    tileCtx.strokeStyle = series.patternColor;
+    tileCtx.lineWidth = 1.25;
+    tileCtx.beginPath();
+    if (series.pattern === 'cross' || series.pattern === 'diagonal') {
+      tileCtx.moveTo(-1, 7);
+      tileCtx.lineTo(7, -1);
+      tileCtx.moveTo(3, 9);
+      tileCtx.lineTo(9, 3);
+    }
+    if (series.pattern === 'cross') {
+      tileCtx.moveTo(-1, 1);
+      tileCtx.lineTo(7, 9);
+      tileCtx.moveTo(3, -1);
+      tileCtx.lineTo(9, 5);
+    }
+    if (series.pattern === 'horizontal') {
+      tileCtx.moveTo(0, 2);
+      tileCtx.lineTo(8, 2);
+      tileCtx.moveTo(0, 6);
+      tileCtx.lineTo(8, 6);
+    }
+    tileCtx.stroke();
+    return ctx.createPattern(tile, 'repeat') || series.color;
+  }
+
+  function formatTrafficPointA11y(point) {
+    const parts = [formatTrafficInterval(point), t('traffic.totalTokens') + ': ' + formatTrafficNumber(point.totalTokens)];
+    TRAFFIC_SERIES.forEach(series => {
+      parts.push(t(series.labelKey) + ': ' + formatTrafficNumber(point[series.key]));
+    });
+    parts.push(t(TRAFFIC_CACHE_READ_RATE.labelKey) + ': ' + formatTrafficPercent(point[TRAFFIC_CACHE_READ_RATE.key]));
+    return parts.join('. ');
   }
 
   function updateTrafficRangeButtons() {
@@ -890,6 +1013,8 @@
   async function loadTraffic(range) {
     const nextRange = ['1h', '6h', '24h'].includes(range) ? range : trafficRange;
     trafficRange = nextRange;
+    trafficHoverIndex = -1;
+    hideTrafficTooltip();
     updateTrafficRangeButtons();
     const sequence = ++trafficLoadSequence;
     const stage = $('trafficChartStage');
@@ -920,6 +1045,8 @@
     const canvas = $('trafficChart');
     if (!canvas || !trafficData || !trafficData.points.length || canvas.offsetParent === null) {
       trafficChartLayout = null;
+      const bucketSize = $('trafficBucketSize');
+      if (bucketSize && (!trafficData || !trafficData.points.length)) bucketSize.textContent = '';
       return;
     }
     const width = canvas.clientWidth;
@@ -937,23 +1064,31 @@
     const muted = styles.getPropertyValue('--muted-foreground').trim() || '#6b7280';
     const border = styles.getPropertyValue('--border').trim() || '#e5e7eb';
     const font = styles.getPropertyValue('--font-sans').trim() || 'system-ui';
-    const points = trafficData.points;
-    const rawMax = Math.max(0, ...points.flatMap(point => TRAFFIC_SERIES.map(series => point[series.key] || 0)));
-    const yMax = rawMax > 0 ? rawMax * 1.08 : 1;
-    const yTicks = 5;
+    const bucketMinutes = trafficBucketMinutesForChart(
+      trafficData.points.length,
+      Math.max(1, width - 64),
+      trafficData.bucketSeconds
+    );
+    const points = aggregateTrafficPoints(trafficData.points, bucketMinutes, trafficData.bucketSeconds);
+    const bucketSize = $('trafficBucketSize');
+    if (bucketSize) bucketSize.textContent = t('traffic.bucketMinutes', bucketMinutes);
+    const rawMax = Math.max(0, ...points.map(point => point.totalTokens || 0));
+    const scale = trafficNiceScale(rawMax);
+    const yMax = scale.yMax;
+    const yTicks = scale.yTicks;
     ctx.font = '11px ' + font;
     const widestLabel = Math.max(...Array.from({ length: yTicks + 1 }, (_, i) =>
       ctx.measureText(formatTrafficAxis(yMax * i / yTicks)).width
     ));
     const left = Math.max(44, Math.ceil(widestLabel) + 13);
-    const right = 48;
+    const right = 12;
     const top = 12;
     const bottom = 34;
     const plotWidth = Math.max(1, width - left - right);
     const plotHeight = Math.max(1, height - top - bottom);
-    const xFor = index => points.length === 1 ? left + plotWidth / 2 : left + (index / (points.length - 1)) * plotWidth;
+    const slotWidth = plotWidth / points.length;
+    const xFor = index => left + (index + 0.5) * slotWidth;
     const yFor = value => top + plotHeight - (Math.max(0, value) / yMax) * plotHeight;
-    const yForRate = value => top + plotHeight - (Math.max(0, Math.min(100, value)) / 100) * plotHeight;
 
     ctx.strokeStyle = border;
     ctx.fillStyle = muted;
@@ -968,73 +1103,42 @@
       ctx.stroke();
       ctx.textAlign = 'right';
       ctx.fillText(formatTrafficAxis(value), left - 8, y);
-      ctx.fillStyle = TRAFFIC_CACHE_READ_RATE.color;
-      ctx.textAlign = 'left';
-      ctx.fillText(Math.round(100 * (yTicks - i) / yTicks) + '%', width - right + 8, y);
-      ctx.fillStyle = muted;
     }
 
-    const labelFractions = width < 560 ? [0, 0.5, 1] : [0, 0.25, 0.5, 0.75, 1];
+    const labelFractions = width < 380 ? [0, 1] : (width < 560 ? [0, 0.5, 1] : [0, 0.25, 0.5, 0.75, 1]);
     const labelIndexes = Array.from(new Set(labelFractions.map(fraction => Math.round((points.length - 1) * fraction))));
     ctx.textBaseline = 'bottom';
     labelIndexes.forEach((index, position) => {
-      const x = xFor(index);
-      ctx.textAlign = position === 0 ? 'left' : (position === labelIndexes.length - 1 ? 'right' : 'center');
-      ctx.fillText(formatTrafficTime(points[index].timestamp, trafficRange === '24h'), x, height - 4);
+      const isLast = position === labelIndexes.length - 1;
+      const x = position === 0 ? left : (isLast ? width - right : xFor(index));
+      const timestamp = isLast ? points[index].endTimestamp : points[index].timestamp;
+      ctx.textAlign = position === 0 ? 'left' : (isLast ? 'right' : 'center');
+      ctx.fillText(formatTrafficTime(timestamp, trafficRange === '24h', width < 560), x, height - 4);
     });
 
-    TRAFFIC_SERIES.forEach(series => {
-      ctx.beginPath();
-      points.forEach((point, index) => {
-        const x = xFor(index);
-        const y = yFor(point[series.key] || 0);
-        if (index === 0) ctx.moveTo(x, y);
-        else ctx.lineTo(x, y);
+    if (trafficHoverIndex >= 0 && trafficHoverIndex < points.length) {
+      ctx.fillStyle = foreground;
+      ctx.globalAlpha = 0.055;
+      ctx.fillRect(left + trafficHoverIndex * slotWidth, top, slotWidth, plotHeight);
+      ctx.globalAlpha = 1;
+    }
+
+    const gap = Math.min(2, Math.max(0.75, slotWidth * 0.18));
+    const barWidth = Math.max(1, Math.min(22, slotWidth - gap));
+    const seriesPaints = new Map(TRAFFIC_SERIES.map(series => [series.key, trafficSeriesPaint(ctx, series)]));
+    points.forEach((point, index) => {
+      let cumulative = 0;
+      const x = xFor(index) - barWidth / 2;
+      TRAFFIC_SERIES.forEach(series => {
+        const value = Math.max(0, point[series.key] || 0);
+        if (value > 0) {
+          const y = yFor(cumulative + value);
+          const baseY = yFor(cumulative);
+          ctx.fillStyle = seriesPaints.get(series.key) || series.color;
+          ctx.fillRect(x, y, barWidth, baseY - y);
+        }
+        cumulative += value;
       });
-      ctx.strokeStyle = series.color;
-      ctx.lineWidth = 2;
-      ctx.lineJoin = 'round';
-      ctx.lineCap = 'round';
-      ctx.stroke();
-      if (points.length === 1) {
-        ctx.fillStyle = series.color;
-        ctx.beginPath();
-        ctx.arc(xFor(0), yFor(points[0][series.key] || 0), 3, 0, Math.PI * 2);
-        ctx.fill();
-      }
-    });
-
-    ctx.beginPath();
-    let rateSegmentOpen = false;
-    points.forEach((point, index) => {
-      const rate = point[TRAFFIC_CACHE_READ_RATE.key];
-      if (!Number.isFinite(rate)) {
-        rateSegmentOpen = false;
-        return;
-      }
-      const x = xFor(index);
-      const y = yForRate(rate);
-      if (!rateSegmentOpen) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-      rateSegmentOpen = true;
-    });
-    ctx.strokeStyle = TRAFFIC_CACHE_READ_RATE.color;
-    ctx.lineWidth = 1.8;
-    ctx.lineJoin = 'round';
-    ctx.lineCap = 'round';
-    ctx.setLineDash([5, 4]);
-    ctx.stroke();
-    ctx.setLineDash([]);
-    points.forEach((point, index) => {
-      const rate = point[TRAFFIC_CACHE_READ_RATE.key];
-      if (!Number.isFinite(rate)) return;
-      const previousValid = index > 0 && Number.isFinite(points[index - 1][TRAFFIC_CACHE_READ_RATE.key]);
-      const nextValid = index + 1 < points.length && Number.isFinite(points[index + 1][TRAFFIC_CACHE_READ_RATE.key]);
-      if (previousValid || nextValid) return;
-      ctx.fillStyle = TRAFFIC_CACHE_READ_RATE.color;
-      ctx.beginPath();
-      ctx.arc(xFor(index), yForRate(rate), 3, 0, Math.PI * 2);
-      ctx.fill();
     });
 
     ctx.strokeStyle = foreground;
@@ -1044,37 +1148,80 @@
     ctx.lineTo(width - right, top + plotHeight);
     ctx.stroke();
     ctx.globalAlpha = 1;
-    trafficChartLayout = { left, right, top, bottom, plotWidth, plotHeight, width, height, points, xFor };
+    trafficChartLayout = {
+      left, right, top, bottom, plotWidth, plotHeight, width, height,
+      points, xFor, slotWidth, bucketMinutes
+    };
   }
 
-  function showTrafficTooltip(event) {
+  function showTrafficPoint(index, localX, localY) {
     const tooltip = $('trafficTooltip');
     const canvas = $('trafficChart');
     const layout = trafficChartLayout;
     if (!tooltip || !canvas || !layout || !layout.points.length) return;
     const rect = canvas.getBoundingClientRect();
-    const pointerX = Math.max(layout.left, Math.min(layout.width - layout.right, event.clientX - rect.left));
-    const ratio = layout.plotWidth ? (pointerX - layout.left) / layout.plotWidth : 0;
-    const index = layout.points.length === 1 ? 0 : Math.max(0, Math.min(layout.points.length - 1, Math.round(ratio * (layout.points.length - 1))));
+    index = Math.max(0, Math.min(layout.points.length - 1, index));
     const point = layout.points[index];
-    let html = '<div class="traffic-tooltip-time">' + escapeHtml(formatTrafficTime(point.timestamp, true)) + '</div>';
+    const changed = trafficHoverIndex !== index;
+    if (changed) {
+      trafficHoverIndex = index;
+      requestAnimationFrame(drawTrafficChart);
+    }
+    let html = '<div class="traffic-tooltip-time">' + escapeHtml(formatTrafficInterval(point)) + '</div>';
+    html += '<div class="traffic-tooltip-row traffic-tooltip-row--total"><span class="traffic-tooltip-label">' +
+      escapeHtml(t('traffic.totalTokens')) + '</span><strong>' + escapeHtml(formatTrafficNumber(point.totalTokens)) + '</strong></div>';
     TRAFFIC_SERIES.forEach(series => {
       html += '<div class="traffic-tooltip-row"><span class="traffic-tooltip-label"><span class="traffic-tooltip-dot" style="--series-color:' + series.color + '"></span>' +
         escapeHtml(t(series.labelKey)) + '</span><strong>' + escapeHtml(formatTrafficNumber(point[series.key])) + '</strong></div>';
     });
-    html += '<div class="traffic-tooltip-row"><span class="traffic-tooltip-label"><span class="traffic-tooltip-dot" style="--series-color:' + TRAFFIC_CACHE_READ_RATE.color + '"></span>' +
+    html += '<div class="traffic-tooltip-row traffic-tooltip-row--metric"><span class="traffic-tooltip-label">' +
       escapeHtml(t(TRAFFIC_CACHE_READ_RATE.labelKey)) + '</span><strong>' + escapeHtml(formatTrafficPercent(point[TRAFFIC_CACHE_READ_RATE.key])) + '</strong></div>';
     tooltip.innerHTML = html;
     tooltip.classList.remove('hidden');
-    const left = Math.max(8, Math.min(rect.width - tooltip.offsetWidth - 8, event.clientX - rect.left + 12));
-    const top = Math.max(8, Math.min(rect.height - tooltip.offsetHeight - 8, event.clientY - rect.top + 12));
+    const left = Math.max(8, Math.min(rect.width - tooltip.offsetWidth - 8, localX + 12));
+    const top = Math.max(8, Math.min(rect.height - tooltip.offsetHeight - 8, localY + 12));
     tooltip.style.left = left + 'px';
     tooltip.style.top = top + 'px';
+    const a11yValue = $('trafficChartA11yValue');
+    if (a11yValue && changed) a11yValue.textContent = formatTrafficPointA11y(point);
+  }
+
+  function showTrafficTooltip(event) {
+    const canvas = $('trafficChart');
+    const layout = trafficChartLayout;
+    if (!canvas || !layout || !layout.points.length) return;
+    const rect = canvas.getBoundingClientRect();
+    const localX = Math.max(layout.left, Math.min(layout.width - layout.right, event.clientX - rect.left));
+    const ratio = layout.plotWidth ? (localX - layout.left) / layout.plotWidth : 0;
+    const index = Math.max(0, Math.min(layout.points.length - 1, Math.floor(ratio * layout.points.length)));
+    showTrafficPoint(index, localX, event.clientY - rect.top);
+  }
+
+  function handleTrafficChartKeydown(event) {
+    const layout = trafficChartLayout;
+    if (!layout || !layout.points.length) return;
+    let index = trafficHoverIndex >= 0 ? trafficHoverIndex : layout.points.length - 1;
+    switch (event.key) {
+      case 'ArrowLeft': index--; break;
+      case 'ArrowRight': index++; break;
+      case 'Home': index = 0; break;
+      case 'End': index = layout.points.length - 1; break;
+      default: return;
+    }
+    event.preventDefault();
+    index = Math.max(0, Math.min(layout.points.length - 1, index));
+    showTrafficPoint(index, layout.xFor(index), layout.top + 8);
   }
 
   function hideTrafficTooltip() {
     const tooltip = $('trafficTooltip');
     if (tooltip) tooltip.classList.add('hidden');
+    const a11yValue = $('trafficChartA11yValue');
+    if (a11yValue) a11yValue.textContent = '';
+    if (trafficHoverIndex !== -1) {
+      trafficHoverIndex = -1;
+      requestAnimationFrame(drawTrafficChart);
+    }
   }
 
   // ===== Logs =====
@@ -3446,12 +3593,20 @@
     });
     $('trafficRefreshBtn').addEventListener('click', () => loadTraffic(trafficRange));
     $('trafficChart').addEventListener('pointermove', showTrafficTooltip);
+    $('trafficChart').addEventListener('pointerdown', showTrafficTooltip);
     $('trafficChart').addEventListener('pointerleave', hideTrafficTooltip);
+    $('trafficChart').addEventListener('keydown', handleTrafficChartKeydown);
+    $('trafficChart').addEventListener('blur', hideTrafficTooltip);
+    const redrawAfterResize = () => {
+      trafficHoverIndex = -1;
+      hideTrafficTooltip();
+      requestAnimationFrame(drawTrafficChart);
+    };
     if (typeof ResizeObserver !== 'undefined') {
-      trafficResizeObserver = new ResizeObserver(() => requestAnimationFrame(drawTrafficChart));
+      trafficResizeObserver = new ResizeObserver(redrawAfterResize);
       trafficResizeObserver.observe($('trafficChartStage'));
     } else {
-      window.addEventListener('resize', () => requestAnimationFrame(drawTrafficChart));
+      window.addEventListener('resize', redrawAfterResize);
     }
   }
 

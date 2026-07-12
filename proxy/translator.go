@@ -174,9 +174,13 @@ type ImageSource struct {
 }
 
 type ClaudeTool struct {
-	Name        string      `json:"name"`
-	Description string      `json:"description"`
-	InputSchema interface{} `json:"input_schema"`
+	Type           string      `json:"type,omitempty"`
+	Name           string      `json:"name"`
+	Description    string      `json:"description"`
+	InputSchema    interface{} `json:"input_schema"`
+	MaxUses        int         `json:"max_uses,omitempty"`
+	AllowedDomains []string    `json:"allowed_domains,omitempty"`
+	BlockedDomains []string    `json:"blocked_domains,omitempty"`
 }
 
 type ClaudeResponse struct {
@@ -679,6 +683,10 @@ func extractClaudeUserContent(content interface{}) (string, []KiroImage, []KiroT
 					Content:   []KiroResultContent{{Text: resultContent}},
 					Status:    "success",
 				})
+			default:
+				if serverText := extractClaudeServerToolBlockText(block); serverText != "" {
+					text = joinHistoryText(text, serverText)
+				}
 			}
 		}
 	}
@@ -757,6 +765,117 @@ func extractToolResultContent(content interface{}) (string, []KiroImage) {
 	return "", nil
 }
 
+// extractClaudeServerToolBlockText keeps useful server-side tool context in
+// history without presenting the server call as a client-executable Kiro tool.
+func extractClaudeServerToolBlockText(block map[string]interface{}) string {
+	blockType, _ := block["type"].(string)
+	switch blockType {
+	case "server_tool_use", "mcp_tool_use":
+		name, _ := block["name"].(string)
+		name = strings.TrimSpace(name)
+		if name == "" {
+			name = strings.TrimSuffix(blockType, "_use")
+		}
+		label := fmt.Sprintf("Server tool context (%s)", name)
+		if input := formatClaudeServerToolInput(block["input"]); input != "" {
+			return label + ":\n" + input
+		}
+		return label
+	default:
+		if blockType == "tool_result" || !strings.HasSuffix(blockType, "_tool_result") {
+			return ""
+		}
+	}
+
+	parts := make([]string, 0)
+	appendClaudeServerReadableParts(block["content"], &parts)
+	if len(parts) == 0 {
+		appendClaudeServerReadableParts(block, &parts)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+
+	name := strings.TrimSuffix(blockType, "_tool_result")
+	name = strings.ReplaceAll(name, "_", " ")
+	return fmt.Sprintf("Server tool result (%s):\n%s", name, strings.Join(parts, "\n"))
+}
+
+func formatClaudeServerToolInput(input interface{}) string {
+	if input == nil {
+		return ""
+	}
+	if text, ok := input.(string); ok {
+		return strings.TrimSpace(text)
+	}
+	raw, err := json.Marshal(input)
+	if err != nil || string(raw) == "null" || string(raw) == "{}" {
+		return ""
+	}
+	return string(raw)
+}
+
+func appendClaudeServerReadableParts(value interface{}, parts *[]string) {
+	switch v := value.(type) {
+	case string:
+		if text := strings.TrimSpace(v); text != "" {
+			*parts = append(*parts, text)
+		}
+	case []interface{}:
+		for _, item := range v {
+			appendClaudeServerReadableParts(item, parts)
+		}
+	case map[string]interface{}:
+		start := len(*parts)
+
+		text, _ := v["text"].(string)
+		if text = strings.TrimSpace(text); text != "" {
+			*parts = append(*parts, text)
+		}
+
+		title, _ := v["title"].(string)
+		url, _ := v["url"].(string)
+		title = strings.TrimSpace(title)
+		url = strings.TrimSpace(url)
+		switch {
+		case title != "" && url != "":
+			*parts = append(*parts, title+" ("+url+")")
+		case title != "":
+			*parts = append(*parts, title)
+		case url != "":
+			*parts = append(*parts, url)
+		}
+
+		for _, key := range []string{"stdout", "stderr", "error_message", "tool_name"} {
+			if item, ok := v[key].(string); ok {
+				if item = strings.TrimSpace(item); item != "" {
+					*parts = append(*parts, item)
+				}
+			}
+		}
+		if code, ok := v["error_code"].(string); ok && strings.TrimSpace(code) != "" {
+			*parts = append(*parts, "Error: "+strings.TrimSpace(code))
+		}
+		if data, ok := v["data"].(string); ok {
+			mediaType, _ := v["media_type"].(string)
+			if mediaType == "text/plain" && strings.TrimSpace(data) != "" {
+				*parts = append(*parts, strings.TrimSpace(data))
+			}
+		}
+
+		for _, key := range []string{"content", "source", "tool_references", "result", "output"} {
+			if nested, ok := v[key]; ok {
+				appendClaudeServerReadableParts(nested, parts)
+			}
+		}
+		if len(*parts) == start {
+			if encrypted, ok := v["encrypted_content"].(string); ok && encrypted != "" {
+				*parts = append(*parts, "(encrypted server tool result)")
+			}
+		}
+	}
+}
+
 func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse) {
 	var text string
 	var toolUses []KiroToolUse
@@ -790,6 +909,10 @@ func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse) 
 					Name:      name,
 					Input:     input,
 				})
+			default:
+				if serverText := extractClaudeServerToolBlockText(block); serverText != "" {
+					text = joinHistoryText(text, serverText)
+				}
 			}
 		}
 	}
@@ -805,13 +928,21 @@ func convertClaudeTools(tools []ClaudeTool) ([]KiroToolWrapper, map[string]strin
 	result := make([]KiroToolWrapper, 0, len(tools))
 	nameMap := make(map[string]string)
 	for _, tool := range tools {
+		toolType := strings.TrimSpace(tool.Type)
+		if toolType != "" && toolType != "custom" {
+			continue
+		}
+		name := strings.TrimSpace(tool.Name)
+		if name == "" {
+			continue
+		}
 		desc := tool.Description
 		if len(desc) > maxToolDescLen {
 			desc = desc[:maxToolDescLen] + "..."
 		}
-		sanitized := shortenToolName(sanitizeToolName(tool.Name))
-		if sanitized != tool.Name {
-			nameMap[sanitized] = tool.Name
+		sanitized := shortenToolName(sanitizeToolName(name))
+		if sanitized != name {
+			nameMap[sanitized] = name
 		}
 		w := KiroToolWrapper{}
 		w.ToolSpecification.Name = sanitized

@@ -4,23 +4,42 @@ package pool
 
 import (
 	"kiro-go/config"
+	"kiro-go/logger"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-const tokenRefreshSkewSeconds int64 = 120
+const (
+	tokenRefreshSkewSeconds int64 = 120
+	statsPersistAttempts          = 3
+)
 
 // AccountPool 账号池
 type AccountPool struct {
-	mu            sync.RWMutex
-	accounts      []config.Account
-	totalAccounts int
-	currentIndex  uint64
-	cooldowns     map[string]time.Time       // 账号冷却时间
-	errorCounts   map[string]int             // 连续错误计数
-	modelLists    map[string]map[string]bool // accountID → set of modelIDs (from ListAvailableModels)
+	mu              sync.RWMutex
+	statsWriterOnce sync.Once
+	statsWriterMu   sync.Mutex
+	statsWriterCond *sync.Cond
+	statsWrites     sync.WaitGroup
+	statsQueue      []string
+	statsPending    map[string]accountStatsUpdate
+	accounts        []config.Account
+	totalAccounts   int
+	currentIndex    uint64
+	cooldowns       map[string]time.Time       // 账号冷却时间
+	errorCounts     map[string]int             // 连续错误计数
+	modelLists      map[string]map[string]bool // accountID → set of modelIDs (from ListAvailableModels)
+}
+
+type accountStatsUpdate struct {
+	id           string
+	requestCount int
+	errorCount   int
+	totalTokens  int
+	totalCredits float64
+	lastUsed     int64
 }
 
 var (
@@ -49,6 +68,10 @@ func GetPool() *AccountPool {
 func (p *AccountPool) Reload() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// An older persisted snapshot must not replace newer in-memory counters.
+	// UpdateStats also holds p.mu while enqueueing, so no new write can be added
+	// until this barrier has completed.
+	p.statsWrites.Wait()
 	enabled := config.GetEnabledAccounts()
 	allowOverUsage := config.GetAllowOverUsage()
 	var weighted []config.Account
@@ -118,7 +141,7 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 		return copyAccount(acc)
 	}
 
-		// 无可用账号，返回冷却时间最短的（排除额度用尽的，除非允许超额）
+	// 无可用账号，返回冷却时间最短的（排除额度用尽的，除非允许超额）
 	var best *config.Account
 	var earliest time.Time
 	for i := range p.accounts {
@@ -469,8 +492,87 @@ func (p *AccountPool) UpdateStats(id string, tokens int, credits float64) {
 		}
 	}
 	if updated {
-		go config.UpdateAccountStats(id, requestCount, errorCount, totalTokens, totalCredits, lastUsed)
+		p.enqueueStatsWrite(accountStatsUpdate{
+			id:           id,
+			requestCount: requestCount,
+			errorCount:   errorCount,
+			totalTokens:  totalTokens,
+			totalCredits: totalCredits,
+			lastUsed:     lastUsed,
+		})
 	}
+}
+
+func (p *AccountPool) enqueueStatsWrite(update accountStatsUpdate) {
+	p.statsWriterOnce.Do(func() {
+		p.statsPending = make(map[string]accountStatsUpdate)
+		p.statsWriterCond = sync.NewCond(&p.statsWriterMu)
+		go p.runStatsWriter()
+	})
+
+	p.statsWriterMu.Lock()
+	if _, queued := p.statsPending[update.id]; !queued {
+		p.statsWrites.Add(1)
+		p.statsQueue = append(p.statsQueue, update.id)
+	}
+	p.statsPending[update.id] = update
+	p.statsWriterCond.Signal()
+	p.statsWriterMu.Unlock()
+}
+
+func (p *AccountPool) runStatsWriter() {
+	for {
+		p.statsWriterMu.Lock()
+		for len(p.statsQueue) == 0 {
+			p.statsWriterCond.Wait()
+		}
+		id := p.statsQueue[0]
+		p.statsQueue[0] = ""
+		p.statsQueue = p.statsQueue[1:]
+		if len(p.statsQueue) == 0 {
+			p.statsQueue = nil
+		}
+		pending := p.statsPending[id]
+		delete(p.statsPending, id)
+		p.statsWriterMu.Unlock()
+
+		if err := persistAccountStats(pending); err != nil {
+			logger.Warnf("[AccountPool] failed to persist stats for %s: %v", pending.id, err)
+		}
+		p.statsWrites.Done()
+	}
+}
+
+func persistAccountStats(update accountStatsUpdate) error {
+	var err error
+	for attempt := 0; attempt < statsPersistAttempts; attempt++ {
+		err = config.UpdateAccountStats(
+			update.id,
+			update.requestCount,
+			update.errorCount,
+			update.totalTokens,
+			update.totalCredits,
+			update.lastUsed,
+		)
+		if err == nil {
+			return nil
+		}
+		if attempt+1 < statsPersistAttempts {
+			time.Sleep(time.Duration(25*(1<<attempt)) * time.Millisecond)
+		}
+	}
+	return err
+}
+
+// WaitForPendingStats waits until queued per-account persistence attempts have
+// finished. Updates that start after this method returns belong to a later flush.
+func (p *AccountPool) WaitForPendingStats() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.statsWrites.Wait()
 }
 
 // GetAllAccounts 获取所有账号副本

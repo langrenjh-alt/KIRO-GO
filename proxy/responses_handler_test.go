@@ -321,7 +321,7 @@ func setupResponsesTestHandler(t *testing.T) (*Handler, func()) {
 		pool:        p,
 		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
 	}
-	cleanup := func() {}
+	cleanup := p.WaitForPendingStats
 	return h, cleanup
 }
 

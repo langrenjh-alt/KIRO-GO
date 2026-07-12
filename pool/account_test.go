@@ -3,6 +3,7 @@ package pool
 import (
 	"errors"
 	"kiro-go/config"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -323,5 +324,137 @@ func TestReloadDropsOverQuotaAccountWhenAllowOverUsageDisabled(t *testing.T) {
 
 	if got := p.GetNext(); got != nil {
 		t.Fatalf("expected over-quota account to be dropped, got %q", got.ID)
+	}
+}
+
+func TestWaitForPendingStatsPersistsLatestSnapshot(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.AddAccount(config.Account{
+		ID:      "stats-order",
+		Enabled: true,
+	}); err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+
+	p := newTestPool()
+	p.Reload()
+	p.UpdateStats("stats-order", 10, 1.25)
+	p.UpdateStats("stats-order", 20, 2.5)
+	p.WaitForPendingStats()
+
+	for _, account := range config.GetAccounts() {
+		if account.ID != "stats-order" {
+			continue
+		}
+		if account.RequestCount != 2 || account.TotalTokens != 30 || account.TotalCredits != 3.75 {
+			t.Fatalf("unexpected persisted stats: %#v", account)
+		}
+		return
+	}
+	t.Fatal("stats account not found")
+}
+
+func TestReloadPreservesQueuedStatsUpdates(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.AddAccount(config.Account{
+		ID:      "stats-reload",
+		Enabled: true,
+	}); err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+
+	p := newTestPool()
+	p.Reload()
+	p.UpdateStats("stats-reload", 10, 1.25)
+	p.Reload()
+	p.UpdateStats("stats-reload", 20, 2.5)
+	p.WaitForPendingStats()
+
+	account := p.GetByID("stats-reload")
+	if account == nil {
+		t.Fatal("stats account not found")
+	}
+	if account.RequestCount != 2 || account.TotalTokens != 30 || account.TotalCredits != 3.75 {
+		t.Fatalf("reload discarded queued statistics: %#v", account)
+	}
+}
+
+func TestStatsWriterCoalescesBurstWithoutLosingTotals(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.AddAccount(config.Account{
+		ID:      "stats-burst",
+		Enabled: true,
+	}); err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+
+	p := newTestPool()
+	p.Reload()
+	const updates = 512
+	for i := 0; i < updates; i++ {
+		p.UpdateStats("stats-burst", 1, 0.25)
+	}
+	p.WaitForPendingStats()
+
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("reload persisted config: %v", err)
+	}
+	for _, account := range config.GetAccounts() {
+		if account.ID != "stats-burst" {
+			continue
+		}
+		if account.RequestCount != updates || account.TotalTokens != updates || account.TotalCredits != updates*0.25 {
+			t.Fatalf("burst statistics were lost on disk: %#v", account)
+		}
+		return
+	}
+	t.Fatal("persisted stats account not found")
+}
+
+func TestPersistAccountStatsRetriesTransientFailure(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.json")
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.AddAccount(config.Account{ID: "stats-retry", Enabled: true}); err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatalf("remove config directory: %v", err)
+	}
+
+	recreated := make(chan error, 1)
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		recreated <- os.MkdirAll(dir, 0o755)
+	}()
+	err := persistAccountStats(accountStatsUpdate{
+		id:           "stats-retry",
+		requestCount: 1,
+		totalTokens:  42,
+		lastUsed:     time.Now().Unix(),
+	})
+	if mkdirErr := <-recreated; mkdirErr != nil {
+		t.Fatalf("recreate config directory: %v", mkdirErr)
+	}
+	if err != nil {
+		t.Fatalf("persistence did not recover after retry: %v", err)
+	}
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("reload retried config: %v", err)
+	}
+	accounts := config.GetAccounts()
+	if len(accounts) != 1 || accounts[0].RequestCount != 1 || accounts[0].TotalTokens != 42 {
+		t.Fatalf("retried statistics were not persisted: %#v", accounts)
 	}
 }

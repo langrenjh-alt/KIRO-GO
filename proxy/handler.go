@@ -4,12 +4,15 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"kiro-go/auth"
 	"kiro-go/config"
 	"kiro-go/logger"
 	"kiro-go/pool"
+	webassets "kiro-go/web"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -20,7 +23,10 @@ import (
 	"github.com/google/uuid"
 )
 
-const tokenRefreshSkewSeconds int64 = 120
+const (
+	tokenRefreshSkewSeconds   int64 = 120
+	claudeMaxRequestBodyBytes int64 = 32 << 20
+)
 
 // RequestLog stores details about a single API request (success or failure).
 type RequestLog struct {
@@ -40,7 +46,8 @@ const requestLogsMaxSize = 500
 
 // Handler HTTP 处理器
 type Handler struct {
-	pool *pool.AccountPool
+	pool               *pool.AccountPool
+	webSearchMCPCaller webSearchMCPCaller
 	// 运行时统计 (使用原子操作)
 	totalRequests   int64
 	successRequests int64
@@ -271,8 +278,8 @@ func NewHandler() *Handler {
 	return h
 }
 
-// Close stops background work and waits for final statistics and prompt-cache
-// state to reach disk.
+// Close stops background work, waits for queued statistics writes, and flushes
+// prompt-cache state to disk.
 func (h *Handler) Close() {
 	if h == nil {
 		return
@@ -288,6 +295,9 @@ func (h *Handler) Close() {
 	h.backgroundWG.Wait()
 	if h.promptCache != nil {
 		h.promptCache.Stop()
+	}
+	if h.pool != nil {
+		h.pool.WaitForPendingStats()
 	}
 }
 
@@ -441,6 +451,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.serveAdminPage(w, r)
 	case strings.HasPrefix(path, "/admin/api/"):
 		h.handleAdminAPI(w, r)
+	case path == "/admin/index-legacy.html":
+		http.Redirect(w, r, "/admin/", http.StatusPermanentRedirect)
 	case strings.HasPrefix(path, "/admin/"):
 		h.serveStaticFile(w, r)
 
@@ -798,8 +810,13 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
+	body, err := readRequestBodyWithLimit(w, r, claudeMaxRequestBodyBytes)
 	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			h.sendClaudeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "Request body exceeds 32 MiB")
+			return
+		}
 		h.sendClaudeError(w, 400, "invalid_request_error", "Failed to read request body")
 		return
 	}
@@ -840,8 +857,13 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	}
 
 	// 读取请求
-	body, err := io.ReadAll(r.Body)
+	body, err := readRequestBodyWithLimit(w, r, claudeMaxRequestBodyBytes)
 	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			h.sendClaudeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "Request body exceeds 32 MiB")
+			return
+		}
 		h.sendClaudeError(w, 400, "invalid_request_error", "Failed to read request body")
 		return
 	}
@@ -864,6 +886,16 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	thinkingResponseOpts := resolveClaudeThinkingResponseOptions(req.Thinking, thinkingCfg.ClaudeFormat)
 	estimatedInputTokens := estimateClaudeRequestInputTokens(effectiveReq)
 	apiKeyID := apiKeyIDFromContext(r.Context())
+	if hasWebSearchTool(&req) {
+		h.handleWebSearchRequest(w, r.Context(), &req, estimatedInputTokens, apiKeyID)
+		return
+	}
+	if hasNativeWebSearchDeclaration(&req) {
+		err := errors.New("native web_search must be a supported standalone Claude Code WebSearch request")
+		h.recordFailureWithDetails("claude", req.Model, "", err)
+		h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
 	isolationSeed := claudePromptCacheIsolationSeed(effectiveReq, apiKeyID, extractProvidedKey(r))
 	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, estimatedInputTokens, isolationSeed)
 
@@ -876,6 +908,14 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	} else {
 		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
 	}
+}
+
+func readRequestBodyWithLimit(w http.ResponseWriter, r *http.Request, maxBytes int64) ([]byte, error) {
+	if r.ContentLength > maxBytes {
+		return nil, &http.MaxBytesError{Limit: maxBytes}
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+	return io.ReadAll(r.Body)
 }
 
 func claudePromptCacheIsolationSeed(req *ClaudeRequest, apiKeyID string, providedKeys ...string) string {
@@ -3936,13 +3976,23 @@ func (h *Handler) apiGetAccountModelsCached(w http.ResponseWriter, r *http.Reque
 
 // ==================== 静态文件服务 ====================
 
+var embeddedAdminFileServer = http.FileServer(http.FS(webassets.Assets))
+var embeddedAdminStaticServer = http.StripPrefix("/admin", embeddedAdminFileServer)
+
 func (h *Handler) serveAdminPage(w http.ResponseWriter, r *http.Request) {
-	http.ServeFile(w, r, "web/index.html")
+	request := r.Clone(r.Context())
+	request.URL.Path = "/"
+	embeddedAdminFileServer.ServeHTTP(w, request)
 }
 
 func (h *Handler) serveStaticFile(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/admin/")
-	http.ServeFile(w, r, "web/"+path)
+	assetPath := strings.TrimPrefix(r.URL.Path, "/admin/")
+	info, err := fs.Stat(webassets.Assets, assetPath)
+	if err != nil || info.IsDir() {
+		http.NotFound(w, r)
+		return
+	}
+	embeddedAdminStaticServer.ServeHTTP(w, r)
 }
 
 // apiGetThinkingConfig 获取 thinking 配置

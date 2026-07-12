@@ -105,6 +105,17 @@
       font-weight: 600;
       letter-spacing: 0;
     }
+    .traffic-chart-heading {
+      display: flex;
+      align-items: baseline;
+      gap: 0.625rem;
+      min-width: 0;
+    }
+    .traffic-chart-bucket-size {
+      color: var(--muted-foreground);
+      font-size: 0.75rem;
+      white-space: nowrap;
+    }
     .traffic-chart-meta {
       display: flex;
       align-items: center;
@@ -134,12 +145,21 @@
       background: var(--series-color);
       flex: none;
     }
-    .traffic-legend-swatch--rate {
-      width: 0.875rem;
-      height: 0;
-      border-radius: 0;
-      border-top: 2px dashed var(--series-color);
-      background: transparent;
+    .traffic-legend-swatch--diagonal {
+      background:
+        repeating-linear-gradient(135deg, var(--pattern-color) 0 1px, transparent 1px 4px),
+        var(--series-color);
+    }
+    .traffic-legend-swatch--horizontal {
+      background:
+        repeating-linear-gradient(0deg, var(--pattern-color) 0 1px, transparent 1px 4px),
+        var(--series-color);
+    }
+    .traffic-legend-swatch--cross {
+      background:
+        repeating-linear-gradient(45deg, var(--pattern-color) 0 1px, transparent 1px 5px),
+        repeating-linear-gradient(135deg, var(--pattern-color) 0 1px, transparent 1px 5px),
+        var(--series-color);
     }
     .traffic-chart-stage {
       position: relative;
@@ -152,6 +172,21 @@
       display: block;
       width: 100%;
       height: 100%;
+    }
+    .traffic-chart-stage canvas:focus-visible {
+      outline: 2px solid var(--foreground);
+      outline-offset: -2px;
+    }
+    .traffic-chart-a11y {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip-path: inset(50%);
+      white-space: nowrap;
+      border: 0;
     }
     .traffic-chart-state {
       position: absolute;
@@ -200,6 +235,20 @@
       height: 0.5rem;
       border-radius: 50%;
       background: var(--series-color);
+    }
+    .traffic-tooltip-row--total {
+      margin-bottom: 0.25rem;
+      padding-bottom: 0.25rem;
+      border-bottom: 1px solid var(--border);
+    }
+    .traffic-tooltip-row--total .traffic-tooltip-label {
+      color: var(--popover-foreground);
+      font-weight: 600;
+    }
+    .traffic-tooltip-row--metric {
+      margin-top: 0.25rem;
+      padding-top: 0.25rem;
+      border-top: 1px solid var(--border);
     }
     @media (max-width: 960px) {
       .traffic-summary-grid {
@@ -482,7 +531,7 @@
             <span class="traffic-summary-label" data-i18n="traffic.totalTokens"></span>
             <strong class="traffic-summary-value" id="trafficTotalTokens">0</strong>
           </div>
-          <div class="traffic-summary-item" style="--series-color:#2563eb">
+          <div class="traffic-summary-item" style="--series-color:#0284c7">
             <span class="traffic-summary-label" data-i18n="traffic.inputTokens"></span>
             <strong class="traffic-summary-value" id="trafficInputTokens">0</strong>
           </div>
@@ -490,11 +539,11 @@
             <span class="traffic-summary-label" data-i18n="traffic.outputTokens"></span>
             <strong class="traffic-summary-value" id="trafficOutputTokens">0</strong>
           </div>
-          <div class="traffic-summary-item" style="--series-color:#d97706">
+          <div class="traffic-summary-item" style="--series-color:#431407">
             <span class="traffic-summary-label" data-i18n="traffic.cacheCreationTokens"></span>
             <strong class="traffic-summary-value" id="trafficCacheCreationTokens">0</strong>
           </div>
-          <div class="traffic-summary-item" style="--series-color:#7c3aed">
+          <div class="traffic-summary-item" style="--series-color:#2e1065">
             <span class="traffic-summary-label" data-i18n="traffic.cacheReadTokens"></span>
             <strong class="traffic-summary-value" id="trafficCacheReadTokens">0</strong>
           </div>
@@ -502,7 +551,10 @@
 
         <section class="traffic-chart-panel" aria-labelledby="trafficChartTitle">
           <div class="traffic-chart-header">
-            <span class="traffic-chart-title" id="trafficChartTitle" data-i18n="traffic.tokenTrend"></span>
+            <div class="traffic-chart-heading">
+              <span class="traffic-chart-title" id="trafficChartTitle" data-i18n="traffic.tokenTrend"></span>
+              <span class="traffic-chart-bucket-size" id="trafficBucketSize"></span>
+            </div>
             <div class="traffic-chart-meta">
               <span id="trafficUpdatedAt"></span>
               <button type="button" class="icon-btn" id="trafficRefreshBtn" aria-label="" title=""
@@ -511,15 +563,16 @@
               </button>
             </div>
           </div>
-          <div class="traffic-legend" aria-hidden="true">
-            <span class="traffic-legend-item"><span class="traffic-legend-swatch" style="--series-color:#2563eb"></span><span data-i18n="traffic.inputTokens"></span></span>
-            <span class="traffic-legend-item"><span class="traffic-legend-swatch" style="--series-color:#16a34a"></span><span data-i18n="traffic.outputTokens"></span></span>
-            <span class="traffic-legend-item"><span class="traffic-legend-swatch" style="--series-color:#d97706"></span><span data-i18n="traffic.cacheCreationTokens"></span></span>
-            <span class="traffic-legend-item"><span class="traffic-legend-swatch" style="--series-color:#7c3aed"></span><span data-i18n="traffic.cacheReadTokens"></span></span>
-            <span class="traffic-legend-item"><span class="traffic-legend-swatch traffic-legend-swatch--rate" style="--series-color:#db2777"></span><span data-i18n="traffic.cacheReadRate"></span></span>
+          <div class="traffic-legend">
+            <span class="traffic-legend-item"><span class="traffic-legend-swatch traffic-legend-swatch--cross" style="--series-color:#2e1065;--pattern-color:rgba(255,255,255,.68)"></span><span data-i18n="traffic.cacheReadTokens"></span></span>
+            <span class="traffic-legend-item"><span class="traffic-legend-swatch" style="--series-color:#0284c7"></span><span data-i18n="traffic.inputTokens"></span></span>
+            <span class="traffic-legend-item"><span class="traffic-legend-swatch traffic-legend-swatch--diagonal" style="--series-color:#431407;--pattern-color:rgba(255,255,255,.66)"></span><span data-i18n="traffic.cacheCreationTokens"></span></span>
+            <span class="traffic-legend-item"><span class="traffic-legend-swatch traffic-legend-swatch--horizontal" style="--series-color:#16a34a;--pattern-color:rgba(0,0,0,.38)"></span><span data-i18n="traffic.outputTokens"></span></span>
           </div>
           <div class="traffic-chart-stage" id="trafficChartStage">
-            <canvas id="trafficChart" role="img" aria-label="" data-i18n-aria-label="traffic.chartAria"></canvas>
+            <canvas id="trafficChart" role="img" tabindex="0" aria-label="" aria-describedby="trafficChartInstructions trafficChartA11yValue" data-i18n-aria-label="traffic.chartAria"></canvas>
+            <span class="traffic-chart-a11y" id="trafficChartInstructions" data-i18n="traffic.chartKeyboard"></span>
+            <span class="traffic-chart-a11y" id="trafficChartA11yValue" aria-live="polite"></span>
             <div class="traffic-chart-state hidden" id="trafficChartState"></div>
             <div class="traffic-tooltip hidden" id="trafficTooltip"></div>
           </div>
