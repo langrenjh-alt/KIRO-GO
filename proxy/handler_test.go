@@ -47,6 +47,32 @@ func TestClaudeMessagesRejectsOversizedBody(t *testing.T) {
 	}
 }
 
+func TestStructuredOutputValidationAtHTTPEntrypoints(t *testing.T) {
+	h := &Handler{}
+
+	claudeBody := `{"model":"claude-sonnet-4.6","max_tokens":1024,"messages":[{"role":"user","content":"test"}],"output_config":{"format":{"type":"json_schema","schema":[]}}}`
+	for _, path := range []string{"/v1/messages", "/v1/messages/count_tokens"} {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(claudeBody))
+		rec := httptest.NewRecorder()
+		if path == "/v1/messages/count_tokens" {
+			h.handleCountTokens(rec, req)
+		} else {
+			h.handleClaudeMessagesInternal(rec, req)
+		}
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "format.schema") {
+			t.Fatalf("%s status=%d body=%s", path, rec.Code, rec.Body.String())
+		}
+	}
+
+	chatBody := `{"model":"claude-sonnet-4.6","messages":[{"role":"user","content":"test"}],"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object"}}}}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(chatBody))
+	rec := httptest.NewRecorder()
+	h.handleOpenAIChat(rec, req)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "json_schema.name") {
+		t.Fatalf("chat status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestReadRequestBodyLimitWithoutContentLength(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("0123456789"))
 	req.ContentLength = -1
@@ -54,6 +80,59 @@ func TestReadRequestBodyLimitWithoutContentLength(t *testing.T) {
 	var tooLarge *http.MaxBytesError
 	if !errors.As(err, &tooLarge) || tooLarge.Limit != 8 {
 		t.Fatalf("error = %#v, want MaxBytesError with limit 8", err)
+	}
+}
+
+func TestRequestValidationAllowsEmptyUserTurns(t *testing.T) {
+	claudeReq := &ClaudeRequest{
+		Model:     "claude-sonnet-4.6",
+		MaxTokens: 1024,
+		Messages:  []ClaudeMessage{{Role: "user", Content: ""}},
+	}
+	if msg := validateClaudeRequestShape(claudeReq); msg != "" {
+		t.Fatalf("Claude empty user turn rejected: %s", msg)
+	}
+	payload := ClaudeToKiro(claudeReq, false)
+	if strings.TrimSpace(payload.ConversationState.CurrentMessage.UserInputMessage.Content) == "" {
+		t.Fatal("Claude conversion did not synthesize fallback user content")
+	}
+
+	openAIReq := &OpenAIRequest{
+		Model:    "claude-sonnet-4.6",
+		Messages: []OpenAIMessage{{Role: "user", Content: ""}},
+	}
+	if msg := validateOpenAIRequestShape(openAIReq); msg != "" {
+		t.Fatalf("OpenAI empty user turn rejected: %s", msg)
+	}
+	openAIPayload := OpenAIToKiro(openAIReq, false)
+	if strings.TrimSpace(openAIPayload.ConversationState.CurrentMessage.UserInputMessage.Content) == "" {
+		t.Fatal("OpenAI conversion did not synthesize fallback user content")
+	}
+}
+
+func TestClaudeThinkingBudgetMayMeetOrExceedMaxTokens(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		maxTokens    int
+		budgetTokens int
+	}{
+		{name: "equal", maxTokens: 4096, budgetTokens: 4096},
+		{name: "greater", maxTokens: 4096, budgetTokens: 8192},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := &ClaudeRequest{
+				Model:     "claude-opus-4.8",
+				MaxTokens: tc.maxTokens,
+				Thinking: &ClaudeThinkingConfig{
+					Type:         "enabled",
+					BudgetTokens: tc.budgetTokens,
+				},
+				Messages: []ClaudeMessage{{Role: "user", Content: "test"}},
+			}
+			if msg := validateClaudeRequestShape(req); msg != "" {
+				t.Fatalf("budget_tokens=%d max_tokens=%d rejected: %s", tc.budgetTokens, tc.maxTokens, msg)
+			}
+		})
 	}
 }
 
@@ -131,7 +210,7 @@ func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) 
 	}
 
 	rec := httptest.NewRecorder()
-	h.handleClaudeNonStream(rec, payload, "claude-sonnet-4.5", false, claudeThinkingResponseOptions{}, 1, nil, "")
+	h.handleClaudeNonStream(rec, payload, "claude-sonnet-4.5", "claude-sonnet-4.5", false, claudeThinkingResponseOptions{}, 1, nil, "")
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected retry to succeed, status=%d body=%s", rec.Code, rec.Body.String())
@@ -153,6 +232,230 @@ func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) 
 	}
 	if len(resp.Content) == 0 || resp.Content[0].Text != "retried successfully" {
 		t.Fatalf("expected retried response content, got %#v", resp.Content)
+	}
+}
+
+func TestClaudeNonStreamDoesNotRotateAccountsForMalformedToolJSON(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	for _, account := range []config.Account{
+		{
+			ID:          "protocol-first",
+			Enabled:     true,
+			AccessToken: "token-protocol-first",
+			ProfileArn:  "arn:aws:codewhisperer:profile/protocol-first",
+		},
+		{
+			ID:          "protocol-second",
+			Enabled:     true,
+			AccessToken: "token-protocol-second",
+			ProfileArn:  "arn:aws:codewhisperer:profile/protocol-second",
+		},
+	} {
+		if err := config.AddAccount(account); err != nil {
+			t.Fatalf("add account %s: %v", account.ID, err)
+		}
+	}
+	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
+		t.Fatalf("set preferred endpoint: %v", err)
+	}
+	if err := config.UpdateEndpointFallback(false); err != nil {
+		t.Fatalf("disable endpoint fallback: %v", err)
+	}
+
+	var requests int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+			"toolUseId": "toolu_bad",
+			"name":      "broken",
+			"input":     `{"unterminated":`,
+			"stop":      true,
+		}))
+	}))
+	defer server.Close()
+	defer swapKiroEndpointsForTest(t, server)()
+
+	p := accountpool.GetPool()
+	p.Reload()
+	t.Cleanup(p.WaitForPendingStats)
+	h := &Handler{pool: p, promptCache: newPromptCacheTracker(defaultPromptCacheTTL)}
+	payload := &KiroPayload{}
+	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
+		Content: "hello",
+		ModelID: "claude-sonnet-4.5",
+		Origin:  "AI_EDITOR",
+	}
+
+	rec := httptest.NewRecorder()
+	h.handleClaudeNonStream(rec, payload, "claude-sonnet-4.5", "claude-sonnet-4.5", false, claudeThinkingResponseOptions{}, 1, nil, "")
+
+	if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), "upstream_tool_json_error") {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := atomic.LoadInt32(&requests); got != 1 {
+		t.Fatalf("upstream requests=%d, want 1 without account rotation", got)
+	}
+	for _, account := range config.GetAccounts() {
+		if !account.Enabled {
+			t.Fatalf("protocol error disabled healthy account %q", account.ID)
+		}
+	}
+}
+
+func TestClaudeStreamNativeReasoningProtocol(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.AddAccount(config.Account{
+		ID:          "stream-protocol",
+		Enabled:     true,
+		AccessToken: "token-stream-protocol",
+		ProfileArn:  "arn:aws:codewhisperer:profile/stream-protocol",
+	}); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
+		t.Fatalf("set preferred endpoint: %v", err)
+	}
+	if err := config.UpdateEndpointFallback(false); err != nil {
+		t.Fatalf("disable endpoint fallback: %v", err)
+	}
+
+	frames := [][]byte{
+		awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{
+			"signature":       "real-signature",
+			"redactedContent": "encrypted-thinking",
+		}),
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "final answer"}),
+		awsEventStreamFrameWithHeaders(t, map[string]string{
+			":message-type":   "exception",
+			":exception-type": "ContentLengthExceededException",
+		}, map[string]interface{}{"message": "maximum output reached"}),
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		for _, frame := range frames {
+			_, _ = w.Write(frame)
+		}
+	}))
+	defer server.Close()
+
+	oldEndpoints := kiroEndpoints
+	kiroEndpoints = []kiroEndpoint{{URL: server.URL, Origin: "AI_EDITOR", Name: "test"}}
+	defer func() { kiroEndpoints = oldEndpoints }()
+	oldClient := kiroHttpStore.Load()
+	kiroHttpStore.Store(&http.Client{Timeout: time.Second, Transport: &http.Transport{}})
+	defer kiroHttpStore.Store(oldClient)
+
+	p := accountpool.GetPool()
+	p.Reload()
+	t.Cleanup(p.WaitForPendingStats)
+	h := &Handler{pool: p, promptCache: newPromptCacheTracker(defaultPromptCacheTTL)}
+	payload := &KiroPayload{}
+	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
+		Content: "hello",
+		ModelID: "claude-sonnet-4.6",
+		Origin:  "AI_EDITOR",
+	}
+
+	rec := httptest.NewRecorder()
+	h.handleClaudeStream(
+		rec,
+		payload,
+		"claude-sonnet-4.6",
+		"claude-sonnet-4-6-thinking",
+		true,
+		claudeThinkingResponseOptions{Format: "thinking"},
+		10,
+		nil,
+		"",
+	)
+
+	events := decodeWebSearchSSE(t, rec.Body.String())
+	positions := map[string]int{}
+	thinkingIndex := -1
+	var messageDelta map[string]interface{}
+	for i, event := range events {
+		switch event.Name {
+		case "message_start":
+			message := event.Data["message"].(map[string]interface{})
+			if message["model"] != "claude-sonnet-4-6-thinking" {
+				t.Fatalf("response model = %#v", message["model"])
+			}
+			usage := message["usage"].(map[string]interface{})
+			if usage["output_tokens"] != float64(1) || usage["service_tier"] != "standard" {
+				t.Fatalf("message_start usage = %#v", usage)
+			}
+		case "ping":
+			positions["ping"] = i
+		case "content_block_start":
+			block := event.Data["content_block"].(map[string]interface{})
+			switch block["type"] {
+			case "thinking":
+				thinkingIndex = int(event.Data["index"].(float64))
+				positions["thinking_start"] = i
+			case "redacted_thinking":
+				if block["data"] != "encrypted-thinking" {
+					t.Fatalf("redacted data = %#v", block["data"])
+				}
+				positions["redacted_start"] = i
+			case "text":
+				positions["text_start"] = i
+			}
+		case "content_block_delta":
+			delta := event.Data["delta"].(map[string]interface{})
+			if delta["type"] == "signature_delta" {
+				if delta["signature"] != "real-signature" {
+					t.Fatalf("signature delta = %#v", delta)
+				}
+				positions["signature"] = i
+			}
+		case "content_block_stop":
+			if thinkingIndex >= 0 && int(event.Data["index"].(float64)) == thinkingIndex {
+				positions["thinking_stop"] = i
+			}
+		case "message_delta":
+			messageDelta = event.Data
+		}
+	}
+
+	for _, name := range []string{"ping", "thinking_start", "signature", "thinking_stop", "redacted_start", "text_start"} {
+		if _, ok := positions[name]; !ok {
+			t.Fatalf("missing %s event in %s", name, rec.Body.String())
+		}
+	}
+	if !(positions["thinking_start"] < positions["ping"] &&
+		positions["ping"] < positions["signature"] &&
+		positions["signature"] < positions["thinking_stop"] &&
+		positions["thinking_stop"] < positions["redacted_start"] &&
+		positions["redacted_start"] < positions["text_start"]) {
+		t.Fatalf("invalid reasoning block order: %#v", positions)
+	}
+	if messageDelta == nil {
+		t.Fatal("missing message_delta")
+	}
+	delta := messageDelta["delta"].(map[string]interface{})
+	if delta["stop_reason"] != "max_tokens" {
+		t.Fatalf("stop reason = %#v", delta["stop_reason"])
+	}
+	if value, exists := delta["stop_sequence"]; !exists || value != nil {
+		t.Fatalf("stop_sequence = %#v, exists=%v", value, exists)
+	}
+	if value, exists := delta["stop_details"]; !exists || value != nil {
+		t.Fatalf("stop_details = %#v, exists=%v", value, exists)
+	}
+	usage := messageDelta["usage"].(map[string]interface{})
+	details, ok := usage["output_tokens_details"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("message_delta usage is missing thinking details: %#v", usage)
+	}
+	wantThinkingTokens := estimateClaudeOutputTokensWithRedacted("", "", []string{"encrypted-thinking"}, nil)
+	if details["thinking_tokens"] != float64(wantThinkingTokens) {
+		t.Fatalf("thinking_tokens = %#v, want %d", details["thinking_tokens"], wantThinkingTokens)
 	}
 }
 
@@ -397,10 +700,16 @@ func TestValidateClaudeThinkingConfig(t *testing.T) {
 			expectError: true,
 		},
 		{
-			name:        "enabled budget must stay below max tokens",
+			name:        "enabled budget may equal max tokens for proxy compatibility",
 			thinking:    &ClaudeThinkingConfig{Type: "enabled", BudgetTokens: 4096},
 			maxTokens:   4096,
-			expectError: true,
+			expectError: false,
+		},
+		{
+			name:        "enabled budget may exceed max tokens for proxy compatibility",
+			thinking:    &ClaudeThinkingConfig{Type: "enabled", BudgetTokens: 8192},
+			maxTokens:   4096,
+			expectError: false,
 		},
 		{
 			name:        "disabled rejects display",
@@ -749,7 +1058,7 @@ func TestNoAvailableAccountsAreRecordedInTraffic(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	h.handleClaudeNonStream(rec, &KiroPayload{}, "claude-sonnet-4.6", false, claudeThinkingResponseOptions{}, 100, nil, "")
+	h.handleClaudeNonStream(rec, &KiroPayload{}, "claude-sonnet-4.6", "claude-sonnet-4.6", false, claudeThinkingResponseOptions{}, 100, nil, "")
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}

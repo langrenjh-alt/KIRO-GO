@@ -3,6 +3,8 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -795,6 +797,10 @@ func writeWebSearchResponse(
 		inputTokens = 1
 	}
 	content, summary, outputTokens := buildWebSearchContent(result)
+	responseModel := req.Model
+	if strings.TrimSpace(req.responseModel) != "" {
+		responseModel = req.responseModel
+	}
 
 	if !req.Stream {
 		body := map[string]interface{}{
@@ -802,10 +808,14 @@ func writeWebSearchResponse(
 			"type":          "message",
 			"role":          "assistant",
 			"content":       content,
-			"model":         req.Model,
+			"model":         responseModel,
 			"stop_reason":   "end_turn",
 			"stop_sequence": nil,
+			"stop_details":  nil,
 			"usage":         buildWebSearchUsage(inputTokens, outputTokens),
+			"context_management": map[string]interface{}{
+				"applied_edits": []interface{}{},
+			},
 		}
 		encoded, err := json.Marshal(body)
 		if err != nil {
@@ -823,7 +833,7 @@ func writeWebSearchResponse(
 	if !ok {
 		return 0, fmt.Errorf("streaming web search response is not supported by the response writer")
 	}
-	streamBody, err := renderWebSearchSSE(req.Model, result, content, summary, inputTokens, outputTokens)
+	streamBody, err := renderWebSearchSSE(responseModel, result, content, summary, inputTokens, outputTokens)
 	if err != nil {
 		return 0, err
 	}
@@ -839,17 +849,15 @@ func writeWebSearchResponse(
 }
 
 func buildWebSearchContent(result *webSearchResultSet) ([]interface{}, string, int) {
-	decision := fmt.Sprintf("I'll search for %q.", result.Query)
 	summary := generateWebSearchSummary(result)
 	searchResults := buildWebSearchResultContent(result.Results)
+	citations := buildWebSearchCitations(result.Results)
 	content := []interface{}{
-		map[string]interface{}{"type": "text", "text": decision},
 		map[string]interface{}{
-			"id":     result.ToolUseID,
-			"type":   "server_tool_use",
-			"name":   webSearchToolName,
-			"input":  map[string]interface{}{"query": result.Query},
-			"caller": map[string]interface{}{"type": "direct"},
+			"id":    result.ToolUseID,
+			"type":  "server_tool_use",
+			"name":  webSearchToolName,
+			"input": map[string]interface{}{"query": result.Query},
 		},
 		map[string]interface{}{
 			"type":        "web_search_tool_result",
@@ -857,11 +865,12 @@ func buildWebSearchContent(result *webSearchResultSet) ([]interface{}, string, i
 			"content":     searchResults,
 			"caller":      map[string]interface{}{"type": "direct"},
 		},
-		map[string]interface{}{"type": "text", "text": summary},
+		map[string]interface{}{"type": "text", "text": summary, "citations": citations},
 	}
 
 	resultJSON, _ := json.Marshal(searchResults)
-	outputTokens := estimateApproxTokens(decision) + estimateApproxTokens(summary) + estimateApproxTokens(string(resultJSON))
+	citationJSON, _ := json.Marshal(citations)
+	outputTokens := estimateApproxTokens(summary) + estimateApproxTokens(string(resultJSON)) + estimateApproxTokens(string(citationJSON))
 	if outputTokens < 1 {
 		outputTokens = 1
 	}
@@ -883,11 +892,34 @@ func buildWebSearchResultContent(results []webSearchResult) []map[string]interfa
 			"type":              "web_search_result",
 			"title":             result.Title,
 			"url":               result.URL,
-			"encrypted_content": snippet,
+			"encrypted_content": opaqueWebSearchValue(result.URL, result.Title, snippet),
 			"page_age":          pageAge,
 		})
 	}
 	return content
+}
+
+func buildWebSearchCitations(results []webSearchResult) []map[string]interface{} {
+	citations := make([]map[string]interface{}, 0, len(results))
+	for _, result := range results {
+		citedText := ""
+		if result.Snippet != nil {
+			citedText = truncateWebSearchSnippet(strings.TrimSpace(*result.Snippet), 500)
+		}
+		citations = append(citations, map[string]interface{}{
+			"type":            "web_search_result_location",
+			"url":             result.URL,
+			"title":           result.Title,
+			"encrypted_index": opaqueWebSearchValue(result.URL, result.Title),
+			"cited_text":      citedText,
+		})
+	}
+	return citations
+}
+
+func opaqueWebSearchValue(parts ...string) string {
+	digest := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
+	return base64.RawStdEncoding.EncodeToString(digest[:])
 }
 
 func generateWebSearchSummary(result *webSearchResultSet) string {
@@ -928,6 +960,12 @@ func buildWebSearchUsage(inputTokens, outputTokens int) map[string]interface{} {
 		"output_tokens":               outputTokens,
 		"cache_creation_input_tokens": 0,
 		"cache_read_input_tokens":     0,
+		"cache_creation": map[string]interface{}{
+			"ephemeral_5m_input_tokens": 0,
+			"ephemeral_1h_input_tokens": 0,
+		},
+		"service_tier":  "standard",
+		"inference_geo": "not_available",
 		"server_tool_use": map[string]interface{}{
 			"web_search_requests": 1,
 			"web_fetch_requests":  0,
@@ -955,25 +993,36 @@ func renderWebSearchSSE(
 			"model":         model,
 			"stop_reason":   nil,
 			"stop_sequence": nil,
+			"stop_details":  nil,
 			"usage":         messageStartUsage,
+			"context_management": map[string]interface{}{
+				"applied_edits": []interface{}{},
+			},
 		},
 	}); err != nil {
 		return nil, err
 	}
-
-	decision, _ := content[0].(map[string]interface{})["text"].(string)
-	if err := appendWebSearchTextBlock(&body, 0, []string{decision}); err != nil {
-		return nil, err
-	}
 	if err := appendWebSearchSSEEvent(&body, "content_block_start", map[string]interface{}{
 		"type":  "content_block_start",
-		"index": 1,
+		"index": 0,
 		"content_block": map[string]interface{}{
-			"id":     result.ToolUseID,
-			"type":   "server_tool_use",
-			"name":   webSearchToolName,
-			"input":  map[string]interface{}{},
-			"caller": map[string]interface{}{"type": "direct"},
+			"id":    result.ToolUseID,
+			"type":  "server_tool_use",
+			"name":  webSearchToolName,
+			"input": map[string]interface{}{},
+		},
+	}); err != nil {
+		return nil, err
+	}
+	if err := appendWebSearchSSEEvent(&body, "ping", map[string]interface{}{"type": "ping"}); err != nil {
+		return nil, err
+	}
+	if err := appendWebSearchSSEEvent(&body, "content_block_delta", map[string]interface{}{
+		"type":  "content_block_delta",
+		"index": 0,
+		"delta": map[string]interface{}{
+			"type":         "input_json_delta",
+			"partial_json": "",
 		},
 	}); err != nil {
 		return nil, err
@@ -984,7 +1033,7 @@ func renderWebSearchSSE(
 	}
 	if err := appendWebSearchSSEEvent(&body, "content_block_delta", map[string]interface{}{
 		"type":  "content_block_delta",
-		"index": 1,
+		"index": 0,
 		"delta": map[string]interface{}{
 			"type":         "input_json_delta",
 			"partial_json": string(inputJSON),
@@ -993,30 +1042,39 @@ func renderWebSearchSSE(
 		return nil, err
 	}
 	if err := appendWebSearchSSEEvent(&body, "content_block_stop", map[string]interface{}{
-		"type": "content_block_stop", "index": 1,
+		"type": "content_block_stop", "index": 0,
 	}); err != nil {
 		return nil, err
 	}
 	if err := appendWebSearchSSEEvent(&body, "content_block_start", map[string]interface{}{
 		"type":          "content_block_start",
-		"index":         2,
-		"content_block": content[2],
+		"index":         1,
+		"content_block": content[1],
 	}); err != nil {
 		return nil, err
 	}
 	if err := appendWebSearchSSEEvent(&body, "content_block_stop", map[string]interface{}{
-		"type": "content_block_stop", "index": 2,
+		"type": "content_block_stop", "index": 1,
 	}); err != nil {
 		return nil, err
 	}
-	if err := appendWebSearchTextBlock(&body, 3, chunkWebSearchText(summary, webSearchSummaryChunkRunes)); err != nil {
+	summaryBlock, _ := content[2].(map[string]interface{})
+	citations, _ := summaryBlock["citations"].([]map[string]interface{})
+	if err := appendWebSearchCitedTextBlock(&body, 2, chunkWebSearchText(summary, webSearchSummaryChunkRunes), citations); err != nil {
 		return nil, err
 	}
 	if err := appendWebSearchSSEEvent(&body, "message_delta", map[string]interface{}{
-		"type":  "message_delta",
-		"delta": map[string]interface{}{"stop_reason": "end_turn"},
+		"type": "message_delta",
+		"delta": map[string]interface{}{
+			"stop_reason":   "end_turn",
+			"stop_sequence": nil,
+			"stop_details":  nil,
+		},
 		"usage": map[string]interface{}{
-			"output_tokens": outputTokens,
+			"input_tokens":                inputTokens,
+			"cache_creation_input_tokens": 0,
+			"cache_read_input_tokens":     0,
+			"output_tokens":               outputTokens,
 			"server_tool_use": map[string]interface{}{
 				"web_search_requests": 1,
 				"web_fetch_requests":  0,
@@ -1031,6 +1089,44 @@ func renderWebSearchSSE(
 		return nil, err
 	}
 	return body.Bytes(), nil
+}
+
+func appendWebSearchCitedTextBlock(body *bytes.Buffer, index int, chunks []string, citations []map[string]interface{}) error {
+	if err := appendWebSearchSSEEvent(body, "content_block_start", map[string]interface{}{
+		"type":  "content_block_start",
+		"index": index,
+		"content_block": map[string]interface{}{
+			"type":      "text",
+			"text":      "",
+			"citations": []interface{}{},
+		},
+	}); err != nil {
+		return err
+	}
+	for _, citation := range citations {
+		if err := appendWebSearchSSEEvent(body, "content_block_delta", map[string]interface{}{
+			"type":  "content_block_delta",
+			"index": index,
+			"delta": map[string]interface{}{
+				"type":     "citations_delta",
+				"citation": citation,
+			},
+		}); err != nil {
+			return err
+		}
+	}
+	for _, chunk := range chunks {
+		if err := appendWebSearchSSEEvent(body, "content_block_delta", map[string]interface{}{
+			"type":  "content_block_delta",
+			"index": index,
+			"delta": map[string]interface{}{"type": "text_delta", "text": chunk},
+		}); err != nil {
+			return err
+		}
+	}
+	return appendWebSearchSSEEvent(body, "content_block_stop", map[string]interface{}{
+		"type": "content_block_stop", "index": index,
+	})
 }
 
 func appendWebSearchTextBlock(body *bytes.Buffer, index int, chunks []string) error {

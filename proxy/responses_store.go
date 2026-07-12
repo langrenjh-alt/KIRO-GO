@@ -58,6 +58,9 @@ func saveResponse(resp *ResponsesObject) error {
 		Model:              resp.Model,
 		Output:             resp.Output,
 		Usage:              resp.Usage,
+		Reasoning:          resp.Reasoning,
+		Text:               resp.Text,
+		IncompleteDetails:  resp.IncompleteDetails,
 		PreviousResponseID: resp.PreviousResponseID,
 		Metadata:           resp.Metadata,
 		Instructions:       resp.Instructions,
@@ -107,6 +110,9 @@ func loadResponse(id string) (*ResponsesObject, error) {
 		Model:              doc.Model,
 		Output:             doc.Output,
 		Usage:              doc.Usage,
+		Reasoning:          doc.Reasoning,
+		Text:               doc.Text,
+		IncompleteDetails:  doc.IncompleteDetails,
 		PreviousResponseID: doc.PreviousResponseID,
 		Metadata:           doc.Metadata,
 		Instructions:       doc.Instructions,
@@ -186,17 +192,20 @@ func sanitizeResponseID(id string) string {
 }
 
 type storedResponseDoc struct {
-	ID                 string               `json:"id"`
-	Object             string               `json:"object"`
-	CreatedAt          int64                `json:"created_at"`
-	Status             string               `json:"status"`
-	Model              string               `json:"model"`
-	Output             []ResponseOutputItem `json:"output"`
-	Usage              ResponsesUsage       `json:"usage"`
-	PreviousResponseID string               `json:"previous_response_id,omitempty"`
-	Metadata           map[string]string    `json:"metadata,omitempty"`
-	Instructions       string               `json:"instructions,omitempty"`
-	StoredInput        json.RawMessage      `json:"stored_input,omitempty"`
-	OwnerKeyID         string               `json:"owner_key_id,omitempty"`
-	StoredAt           int64                `json:"stored_at"`
+	ID                 string                      `json:"id"`
+	Object             string                      `json:"object"`
+	CreatedAt          int64                       `json:"created_at"`
+	Status             string                      `json:"status"`
+	Model              string                      `json:"model"`
+	Output             []ResponseOutputItem        `json:"output"`
+	Usage              ResponsesUsage              `json:"usage"`
+	Reasoning          *ResponsesReasoningConfig   `json:"reasoning,omitempty"`
+	Text               *ResponsesTextConfig        `json:"text,omitempty"`
+	IncompleteDetails  *ResponsesIncompleteDetails `json:"incomplete_details,omitempty"`
+	PreviousResponseID string                      `json:"previous_response_id,omitempty"`
+	Metadata           map[string]string           `json:"metadata,omitempty"`
+	Instructions       string                      `json:"instructions,omitempty"`
+	StoredInput        json.RawMessage             `json:"stored_input,omitempty"`
+	OwnerKeyID         string                      `json:"owner_key_id,omitempty"`
+	StoredAt           int64                       `json:"stored_at"`
 }

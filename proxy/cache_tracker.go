@@ -1151,6 +1151,8 @@ func buildClaudeUsageMap(inputTokens, outputTokens int, usage promptCacheUsage, 
 	result := map[string]interface{}{
 		"input_tokens":  billedClaudeInputTokens(inputTokens, usage),
 		"output_tokens": outputTokens,
+		"service_tier":  "standard",
+		"inference_geo": "not_available",
 	}
 	if !includeCache {
 		return result

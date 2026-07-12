@@ -31,6 +31,37 @@ func TestResponsesParseStringInput(t *testing.T) {
 	}
 }
 
+func TestBuildResponsesObjectEchoesReasoningAndTextConfig(t *testing.T) {
+	strict := true
+	req := &ResponsesRequest{
+		Reasoning: &ResponsesReasoningConfig{Effort: "medium", Summary: "auto"},
+		Text: &ResponsesTextConfig{Format: &ResponsesTextFormat{
+			Type:   "json_schema",
+			Name:   "answer",
+			Schema: json.RawMessage(`{"type":"object"}`),
+			Strict: &strict,
+		}},
+	}
+	resp := buildResponsesObject("resp_test", "claude-opus-4.8", "{}", nil, 1, 1, req)
+	if resp.Reasoning == nil || resp.Reasoning.Effort != "medium" || resp.Reasoning.Summary != "auto" {
+		t.Fatalf("reasoning config = %#v", resp.Reasoning)
+	}
+	if resp.Text == nil || resp.Text.Format == nil || resp.Text.Format.Type != "json_schema" {
+		t.Fatalf("text config = %#v", resp.Text)
+	}
+}
+
+func TestResponsesRejectsInvalidStructuredOutput(t *testing.T) {
+	h := &Handler{}
+	body := strings.NewReader(`{"model":"claude-sonnet-4.6","input":"test","text":{"format":{"type":"json_schema","schema":{"type":"object"}}}}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", body)
+	rec := httptest.NewRecorder()
+	h.handleOpenAIResponses(rec, req)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "text.format.name") {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestResponsesParseArrayInput(t *testing.T) {
 	raw := json.RawMessage(`[
 		{"type":"message","role":"user","content":[{"type":"input_text","text":"first"}]},
@@ -427,5 +458,65 @@ func TestResponsesStreamSSE(t *testing.T) {
 	}
 	if !strings.Contains(bodyStr, "stream chunk") {
 		t.Fatalf("expected stream content delta, got:\n%s", bodyStr)
+	}
+}
+
+func TestResponsesStreamReasoningIDsMatchTerminalOutput(t *testing.T) {
+	h, cleanup := setupResponsesTestHandler(t)
+	defer cleanup()
+	frames := [][]byte{
+		awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{"text": "reasoning summary"}),
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "final answer"}),
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		for _, frame := range frames {
+			_, _ = w.Write(frame)
+		}
+	}))
+	defer server.Close()
+	defer swapKiroEndpointsForTest(t, server)()
+
+	body := strings.NewReader(`{"model":"claude-opus-4.8","input":"test","stream":true,"store":false,"reasoning":{"effort":"high","summary":"auto"}}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", body)
+	rec := httptest.NewRecorder()
+	h.handleOpenAIResponses(rec, req)
+
+	events := decodeWebSearchSSE(t, rec.Body.String())
+	doneIDs := make(map[int]string)
+	var terminalOutput []interface{}
+	var terminalUsage map[string]interface{}
+	for _, event := range events {
+		if event.Name == "response.output_item.done" {
+			index := int(event.Data["output_index"].(float64))
+			item := event.Data["item"].(map[string]interface{})
+			doneIDs[index], _ = item["id"].(string)
+		}
+		if event.Name == "response.completed" {
+			response := event.Data["response"].(map[string]interface{})
+			terminalOutput, _ = response["output"].([]interface{})
+			terminalUsage, _ = response["usage"].(map[string]interface{})
+		}
+	}
+	if len(terminalOutput) != 2 || len(doneIDs) != 2 {
+		t.Fatalf("terminal output=%#v done IDs=%#v\n%s", terminalOutput, doneIDs, rec.Body.String())
+	}
+	for index, raw := range terminalOutput {
+		item := raw.(map[string]interface{})
+		if item["id"] != doneIDs[index] {
+			t.Fatalf("output[%d].id=%v, streamed=%v", index, item["id"], doneIDs[index])
+		}
+	}
+	details := terminalUsage["output_tokens_details"].(map[string]interface{})
+	if details["reasoning_tokens"].(float64) <= 0 {
+		t.Fatalf("usage = %#v", terminalUsage)
+	}
+	for _, expected := range []string{
+		"event: response.reasoning_summary_text.delta",
+		"event: response.reasoning_summary_text.done",
+		"event: response.output_text.done",
+	} {
+		if !strings.Contains(rec.Body.String(), expected) {
+			t.Fatalf("missing %s\n%s", expected, rec.Body.String())
+		}
 	}
 }

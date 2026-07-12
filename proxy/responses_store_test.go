@@ -103,4 +103,25 @@ func TestLoadResponseForOwnerIsolation(t *testing.T) {
 			t.Fatalf("loaded ID mismatch: got %q", loaded.ID)
 		}
 	})
+
+	t.Run("reasoning and text configuration round trip", func(t *testing.T) {
+		resp := makeResponse("resp_protocol_config", "key-A")
+		resp.Status = "incomplete"
+		resp.Reasoning = &ResponsesReasoningConfig{Effort: "high", Summary: "auto"}
+		resp.Text = &ResponsesTextConfig{Format: &ResponsesTextFormat{Type: "json_object"}}
+		resp.IncompleteDetails = &ResponsesIncompleteDetails{Reason: "max_output_tokens"}
+		if err := saveResponse(resp); err != nil {
+			t.Fatalf("save: %v", err)
+		}
+		loaded, err := loadResponseForOwner(resp.ID, "key-A")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if loaded.Reasoning == nil || loaded.Reasoning.Effort != "high" || loaded.Text == nil || loaded.Text.Format == nil {
+			t.Fatalf("stored protocol config = reasoning:%#v text:%#v", loaded.Reasoning, loaded.Text)
+		}
+		if loaded.IncompleteDetails == nil || loaded.IncompleteDetails.Reason != "max_output_tokens" {
+			t.Fatalf("stored incomplete details = %#v", loaded.IncompleteDetails)
+		}
+	})
 }

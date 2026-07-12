@@ -4,48 +4,17 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
+	"hash/crc32"
 	"kiro-go/config"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 )
 
-func TestNormalizeChunkBasicProgression(t *testing.T) {
-	prev := ""
-
-	if got := normalizeChunk("abc", &prev); got != "abc" {
-		t.Fatalf("expected first chunk to pass through, got %q", got)
-	}
-	if got := normalizeChunk("abcde", &prev); got != "de" {
-		t.Fatalf("expected appended delta, got %q", got)
-	}
-}
-
-func TestNormalizeChunkPrefixRewindDoesNotReplay(t *testing.T) {
-	prev := ""
-
-	_ = normalizeChunk("abcde", &prev)
-	if got := normalizeChunk("abc", &prev); got != "" {
-		t.Fatalf("expected rewind chunk to be ignored, got %q", got)
-	}
-	if prev != "abcde" {
-		t.Fatalf("expected previous snapshot to remain longest version, got %q", prev)
-	}
-	if got := normalizeChunk("abcdef", &prev); got != "f" {
-		t.Fatalf("expected only unseen suffix after rewind, got %q", got)
-	}
-}
-
-func TestNormalizeChunkOverlapDelta(t *testing.T) {
-	prev := "hello world"
-
-	if got := normalizeChunk("world!!!", &prev); got != "!!!" {
-		t.Fatalf("expected overlap suffix delta, got %q", got)
-	}
-}
-
-func TestParseEventStreamFinishesPendingToolUseOnEOF(t *testing.T) {
+func TestParseEventStreamRejectsPendingToolUseOnEOF(t *testing.T) {
 	stream := bytes.NewReader(awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
 		"toolUseId": "toolu_1",
 		"name":      "mcpIdaProMcpStatus",
@@ -54,6 +23,7 @@ func TestParseEventStreamFinishesPendingToolUseOnEOF(t *testing.T) {
 
 	var toolUses []KiroToolUse
 	var completed bool
+	var callbackErr error
 	err := parseEventStream(stream, &KiroStreamCallback{
 		OnToolUse: func(toolUse KiroToolUse) {
 			toolUses = append(toolUses, toolUse)
@@ -61,21 +31,338 @@ func TestParseEventStreamFinishesPendingToolUseOnEOF(t *testing.T) {
 		OnComplete: func(_, _ int) {
 			completed = true
 		},
+		OnError: func(err error) {
+			callbackErr = err
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "stream ended before stop=true") {
+		t.Fatalf("expected incomplete tool use error, got %v", err)
+	}
+	if callbackErr == nil || callbackErr.Error() != err.Error() {
+		t.Fatalf("expected OnError to receive parse error, got %v", callbackErr)
+	}
+	if completed {
+		t.Fatalf("completion callback must not run after an incomplete tool use")
+	}
+	if len(toolUses) != 0 {
+		t.Fatalf("incomplete tool use must not be emitted, got %#v", toolUses)
+	}
+}
+
+func TestParseEventStreamRejectsInvalidCRC(t *testing.T) {
+	frame := awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "hello"})
+	frame[len(frame)-5] ^= 0xff
+
+	var callbackErr error
+	err := parseEventStream(bytes.NewReader(frame), &KiroStreamCallback{
+		OnError: func(err error) { callbackErr = err },
+	})
+	if err == nil || !strings.Contains(err.Error(), "message CRC") {
+		t.Fatalf("expected message CRC error, got %v", err)
+	}
+	if callbackErr == nil || callbackErr.Error() != err.Error() {
+		t.Fatalf("expected OnError to receive CRC error, got %v", callbackErr)
+	}
+}
+
+func TestParseEventStreamRejectsOversizedFrameBeforeAllocation(t *testing.T) {
+	prelude := make([]byte, 12)
+	binary.BigEndian.PutUint32(prelude[:4], maxKiroEventStreamFrameBytes+1)
+	binary.BigEndian.PutUint32(prelude[8:12], crc32.ChecksumIEEE(prelude[:8]))
+
+	err := parseEventStream(bytes.NewReader(prelude), nil)
+	if err == nil || !strings.Contains(err.Error(), "frame length") {
+		t.Fatalf("expected oversized frame error, got %v", err)
+	}
+}
+
+func TestParseEventStreamPassesRepeatedDeltaTextThrough(t *testing.T) {
+	stream := bytes.NewReader(bytes.Join([][]byte{
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "test"}),
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "test"}),
+	}, nil))
+	var content strings.Builder
+	if err := parseEventStream(stream, &KiroStreamCallback{
+		OnText: func(text string, _ bool) { content.WriteString(text) },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := content.String(); got != "testtest" {
+		t.Fatalf("delta content = %q, want repeated text intact", got)
+	}
+}
+
+func TestParseEventStreamTreatsContentLengthExceededAsMaxTokens(t *testing.T) {
+	stream := bytes.NewReader(bytes.Join([][]byte{
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "partial answer"}),
+		awsEventStreamFrameWithHeaders(t, map[string]string{
+			":message-type":   "exception",
+			":exception-type": "ContentLengthExceededException",
+		}, map[string]interface{}{"message": "maximum output reached"}),
+	}, nil))
+	var content, stopReason string
+	var completed bool
+	err := parseEventStream(stream, &KiroStreamCallback{
+		OnText:       func(text string, _ bool) { content += text },
+		OnStopReason: func(reason string) { stopReason = reason },
+		OnComplete:   func(_, _ int) { completed = true },
+	})
+	if err != nil {
+		t.Fatalf("content length termination returned error: %v", err)
+	}
+	if content != "partial answer" || stopReason != "max_tokens" || !completed {
+		t.Fatalf("content=%q stop=%q completed=%v", content, stopReason, completed)
+	}
+}
+
+func TestParseEventStreamPreservesStructuredReasoning(t *testing.T) {
+	stream := bytes.NewReader(bytes.Join([][]byte{
+		awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{
+			"text":            "thinking",
+			"signature":       "signed-thinking",
+			"redactedContent": "encrypted-thinking",
+		}),
+		awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{
+			"text": "thinking further",
+		}),
+	}, nil))
+
+	var reasoning []KiroReasoningContentEvent
+	var legacyThinking []string
+	err := parseEventStream(stream, &KiroStreamCallback{
+		OnText: func(text string, isThinking bool) {
+			if isThinking {
+				legacyThinking = append(legacyThinking, text)
+			}
+		},
+		OnReasoning: func(event KiroReasoningContentEvent) {
+			reasoning = append(reasoning, event)
+		},
 	})
 	if err != nil {
 		t.Fatalf("unexpected parse error: %v", err)
 	}
-	if !completed {
-		t.Fatalf("expected stream completion callback")
+	if len(reasoning) != 2 {
+		t.Fatalf("expected two reasoning callbacks, got %#v", reasoning)
 	}
-	if len(toolUses) != 1 {
-		t.Fatalf("expected pending tool use to be emitted on EOF, got %d", len(toolUses))
+	if reasoning[0].Text != "thinking" || reasoning[0].Signature != "signed-thinking" || reasoning[0].RedactedContent != "encrypted-thinking" {
+		t.Fatalf("reasoning fields were not preserved: %#v", reasoning[0])
 	}
-	if toolUses[0].ToolUseID != "toolu_1" || toolUses[0].Name != "mcpIdaProMcpStatus" {
-		t.Fatalf("unexpected tool use: %#v", toolUses[0])
+	if reasoning[1].Text != "thinking further" {
+		t.Fatalf("expected reasoning delta to pass through unchanged, got %q", reasoning[1].Text)
 	}
-	if got := toolUses[0].Input["server"]; got != "ida-pro-mcp" {
-		t.Fatalf("expected parsed tool input, got %#v", toolUses[0].Input)
+	if len(legacyThinking) != 0 {
+		t.Fatalf("OnReasoning must replace the legacy thinking callback, got %#v", legacyThinking)
+	}
+}
+
+func TestParseEventStreamPreservesSignatureAndRedactedOnlyReasoning(t *testing.T) {
+	stream := bytes.NewReader(bytes.Join([][]byte{
+		awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{"signature": "signature-only"}),
+		awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{"redacted_content": "redacted-only"}),
+	}, nil))
+
+	var reasoning []KiroReasoningContentEvent
+	err := parseEventStream(stream, &KiroStreamCallback{
+		OnReasoning: func(event KiroReasoningContentEvent) {
+			reasoning = append(reasoning, event)
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	if len(reasoning) != 2 || reasoning[0].Signature != "signature-only" || reasoning[1].RedactedContent != "redacted-only" {
+		t.Fatalf("signature/redacted-only events were lost: %#v", reasoning)
+	}
+}
+
+func TestParseEventStreamKeepsLegacyReasoningTextCallback(t *testing.T) {
+	stream := bytes.NewReader(awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{
+		"text":      "legacy thinking",
+		"signature": "not-exposed-by-legacy-callback",
+	}))
+
+	var text string
+	var thinking bool
+	err := parseEventStream(stream, &KiroStreamCallback{
+		OnText: func(chunk string, isThinking bool) {
+			text += chunk
+			thinking = isThinking
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	if text != "legacy thinking" || !thinking {
+		t.Fatalf("legacy reasoning callback changed: text=%q thinking=%v", text, thinking)
+	}
+}
+
+func TestParseEventStreamAccumulatesInterleavedToolUsesByID(t *testing.T) {
+	stream := bytes.NewReader(bytes.Join([][]byte{
+		awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+			"toolUseId": "toolu_a", "name": "alpha", "input": `{"value":`,
+		}),
+		awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+			"toolUseId": "toolu_b", "name": "beta", "input": `{"value":`,
+		}),
+		awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+			"toolUseId": "toolu_a", "name": "alpha", "input": `1}`, "stop": true,
+		}),
+		awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+			"toolUseId": "toolu_b", "name": "beta", "input": `2}`, "stop": true,
+		}),
+	}, nil))
+
+	var toolUses []KiroToolUse
+	err := parseEventStream(stream, &KiroStreamCallback{
+		OnToolUse: func(toolUse KiroToolUse) {
+			toolUses = append(toolUses, toolUse)
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	if len(toolUses) != 2 {
+		t.Fatalf("expected two completed tool uses, got %#v", toolUses)
+	}
+	if toolUses[0].ToolUseID != "toolu_a" || toolUses[0].Name != "alpha" || toolUses[0].Input["value"] != json.Number("1") {
+		t.Fatalf("first tool fragments were mixed: %#v", toolUses[0])
+	}
+	if toolUses[1].ToolUseID != "toolu_b" || toolUses[1].Name != "beta" || toolUses[1].Input["value"] != json.Number("2") {
+		t.Fatalf("second tool fragments were mixed: %#v", toolUses[1])
+	}
+}
+
+func TestParseEventStreamRejectsInvalidCompletedToolJSON(t *testing.T) {
+	stream := bytes.NewReader(awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+		"toolUseId": "toolu_bad",
+		"name":      "broken",
+		"input":     `{"unterminated":`,
+		"stop":      true,
+	}))
+
+	var callbackErr error
+	var completed bool
+	var toolUses []KiroToolUse
+	err := parseEventStream(stream, &KiroStreamCallback{
+		OnToolUse:  func(toolUse KiroToolUse) { toolUses = append(toolUses, toolUse) },
+		OnComplete: func(_, _ int) { completed = true },
+		OnError:    func(err error) { callbackErr = err },
+	})
+	if err == nil || !strings.Contains(err.Error(), "invalid JSON for tool use") {
+		t.Fatalf("expected invalid tool JSON error, got %v", err)
+	}
+	if callbackErr == nil || callbackErr.Error() != err.Error() {
+		t.Fatalf("expected OnError to receive invalid JSON error, got %v", callbackErr)
+	}
+	if completed || len(toolUses) != 0 {
+		t.Fatalf("invalid tool JSON must not complete or emit: completed=%v tools=%#v", completed, toolUses)
+	}
+}
+
+func TestParseEventStreamPreservesLargeToolIntegers(t *testing.T) {
+	stream := bytes.NewReader(awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+		"toolUseId": "toolu_large",
+		"name":      "lookup",
+		"input":     `{"id":9007199254740993}`,
+		"stop":      true,
+	}))
+	var toolUse KiroToolUse
+	if err := parseEventStream(stream, &KiroStreamCallback{
+		OnToolUse: func(value KiroToolUse) { toolUse = value },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := toolUse.Input["id"]; got != json.Number("9007199254740993") {
+		t.Fatalf("large integer = %#v", got)
+	}
+	raw, err := json.Marshal(toolUse.Input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != `{"id":9007199254740993}` {
+		t.Fatalf("large integer JSON = %s", raw)
+	}
+}
+
+func TestToolUseAccumulatorRejectsOversizedInput(t *testing.T) {
+	accumulator := newToolUseAccumulator()
+	err := accumulator.push(map[string]interface{}{
+		"toolUseId": "toolu_large",
+		"name":      "lookup",
+		"input":     strings.Repeat("x", maxKiroToolInputBytes+1),
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("expected oversized tool input error, got %v", err)
+	}
+}
+
+func TestToolUseAccumulatorLimitsActiveTools(t *testing.T) {
+	accumulator := newToolUseAccumulator()
+	for i := 0; i < maxKiroActiveToolUses; i++ {
+		if err := accumulator.push(map[string]interface{}{
+			"toolUseId": fmt.Sprintf("toolu_%d", i),
+			"name":      "lookup",
+		}, nil); err != nil {
+			t.Fatalf("tool %d: %v", i, err)
+		}
+	}
+	err := accumulator.push(map[string]interface{}{
+		"toolUseId": "toolu_over_limit",
+		"name":      "lookup",
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "too many active") {
+		t.Fatalf("expected active tool limit error, got %v", err)
+	}
+}
+
+func TestParseEventStreamPropagatesErrorAndExceptionFrames(t *testing.T) {
+	tests := []struct {
+		name        string
+		headers     map[string]string
+		payload     map[string]interface{}
+		wantMessage string
+	}{
+		{
+			name: "error",
+			headers: map[string]string{
+				":message-type": "error",
+				":error-code":   "BadRequest",
+			},
+			payload:     map[string]interface{}{"message": "request rejected"},
+			wantMessage: "Kiro stream error BadRequest: request rejected",
+		},
+		{
+			name: "exception",
+			headers: map[string]string{
+				":message-type":   "exception",
+				":exception-type": "ValidationException",
+			},
+			payload:     map[string]interface{}{"errorMessage": "invalid tool"},
+			wantMessage: "Kiro stream exception ValidationException: invalid tool",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stream := bytes.NewReader(awsEventStreamFrameWithHeaders(t, tt.headers, tt.payload))
+			var callbackErr error
+			var completed bool
+			err := parseEventStream(stream, &KiroStreamCallback{
+				OnError:    func(err error) { callbackErr = err },
+				OnComplete: func(_, _ int) { completed = true },
+			})
+			if err == nil || err.Error() != tt.wantMessage {
+				t.Fatalf("expected %q, got %v", tt.wantMessage, err)
+			}
+			if callbackErr == nil || callbackErr.Error() != err.Error() {
+				t.Fatalf("expected OnError to receive stream error, got %v", callbackErr)
+			}
+			if completed {
+				t.Fatalf("completion callback must not run after a stream error")
+			}
+		})
 	}
 }
 
@@ -246,26 +533,38 @@ func assertProxyURL(t *testing.T, got *url.URL, want string) {
 
 func awsEventStreamFrame(t *testing.T, eventType string, payload map[string]interface{}) []byte {
 	t.Helper()
+	return awsEventStreamFrameWithHeaders(t, map[string]string{
+		":message-type": "event",
+		":event-type":   eventType,
+	}, payload)
+}
+
+func awsEventStreamFrameWithHeaders(t *testing.T, stringHeaders map[string]string, payload map[string]interface{}) []byte {
+	t.Helper()
 
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
 		t.Fatalf("marshal payload: %v", err)
 	}
 
-	headerValue := []byte(eventType)
-	headers := make([]byte, 0, 1+len(":event-type")+1+2+len(headerValue))
-	headers = append(headers, byte(len(":event-type")))
-	headers = append(headers, []byte(":event-type")...)
-	headers = append(headers, byte(7))
-	headers = append(headers, byte(len(headerValue)>>8), byte(len(headerValue)))
-	headers = append(headers, headerValue...)
+	var headers []byte
+	for name, value := range stringHeaders {
+		headerValue := []byte(value)
+		headers = append(headers, byte(len(name)))
+		headers = append(headers, []byte(name)...)
+		headers = append(headers, byte(7))
+		headers = append(headers, byte(len(headerValue)>>8), byte(len(headerValue)))
+		headers = append(headers, headerValue...)
+	}
 
 	totalLength := 12 + len(headers) + len(payloadBytes) + 4
 	frame := make([]byte, 12, totalLength)
 	binary.BigEndian.PutUint32(frame[0:4], uint32(totalLength))
 	binary.BigEndian.PutUint32(frame[4:8], uint32(len(headers)))
+	binary.BigEndian.PutUint32(frame[8:12], crc32.ChecksumIEEE(frame[:8]))
 	frame = append(frame, headers...)
 	frame = append(frame, payloadBytes...)
 	frame = append(frame, 0, 0, 0, 0)
+	binary.BigEndian.PutUint32(frame[len(frame)-4:], crc32.ChecksumIEEE(frame[:len(frame)-4]))
 	return frame
 }

@@ -363,19 +363,34 @@ func TestWriteWebSearchResponseNonStream(t *testing.T) {
 		t.Fatalf("unexpected response envelope: %#v", response)
 	}
 	blocks, ok := response["content"].([]interface{})
-	if !ok || len(blocks) != 4 {
+	if !ok || len(blocks) != 3 {
 		t.Fatalf("content = %#v", response["content"])
 	}
-	serverUse := blocks[1].(map[string]interface{})
+	serverUse := blocks[0].(map[string]interface{})
 	if serverUse["type"] != "server_tool_use" || serverUse["id"] != result.ToolUseID {
 		t.Fatalf("server tool block = %#v", serverUse)
 	}
-	toolResult := blocks[2].(map[string]interface{})
+	if _, exists := serverUse["caller"]; exists {
+		t.Fatalf("server tool block must not contain caller: %#v", serverUse)
+	}
+	toolResult := blocks[1].(map[string]interface{})
 	if toolResult["type"] != "web_search_tool_result" || toolResult["tool_use_id"] != result.ToolUseID {
 		t.Fatalf("tool result block = %#v", toolResult)
 	}
-	if !strings.Contains(blocks[3].(map[string]interface{})["text"].(string), "https://example.com/article") {
-		t.Fatalf("summary does not contain source URL: %#v", blocks[3])
+	caller := toolResult["caller"].(map[string]interface{})
+	if caller["type"] != "direct" {
+		t.Fatalf("tool result caller = %#v", caller)
+	}
+	searchResult := toolResult["content"].([]interface{})[0].(map[string]interface{})
+	if searchResult["encrypted_content"] == *result.Results[0].Snippet || strings.TrimSpace(searchResult["encrypted_content"].(string)) == "" {
+		t.Fatalf("encrypted_content must be opaque: %#v", searchResult)
+	}
+	if !strings.Contains(blocks[2].(map[string]interface{})["text"].(string), "https://example.com/article") {
+		t.Fatalf("summary does not contain source URL: %#v", blocks[2])
+	}
+	citations := blocks[2].(map[string]interface{})["citations"].([]interface{})
+	if len(citations) == 0 || citations[0].(map[string]interface{})["type"] != "web_search_result_location" {
+		t.Fatalf("citations = %#v", citations)
 	}
 	usage := response["usage"].(map[string]interface{})
 	serverUsage := usage["server_tool_use"].(map[string]interface{})
@@ -407,6 +422,7 @@ func TestWriteWebSearchResponseStream(t *testing.T) {
 		`"type":"server_tool_use"`,
 		`"type":"input_json_delta"`,
 		`"type":"web_search_tool_result"`,
+		`"type":"citations_delta"`,
 		`"tool_use_id":"srvtoolu_test"`,
 		"https://example.com/article",
 		`"web_search_requests":1`,
@@ -418,25 +434,36 @@ func TestWriteWebSearchResponseStream(t *testing.T) {
 	}
 
 	events := decodeWebSearchSSE(t, body)
-	var sawEmptyServerInput, sawQueryDelta bool
-	for _, event := range events {
+	var sawEmptyServerInput, sawEmptyInputDelta, sawQueryDelta bool
+	positions := map[string]int{}
+	for eventIndex, event := range events {
 		index, _ := event.Data["index"].(float64)
-		if event.Name == "content_block_start" && int(index) == 1 {
+		if event.Name == "content_block_start" && int(index) == 0 {
 			block, _ := event.Data["content_block"].(map[string]interface{})
 			input, _ := block["input"].(map[string]interface{})
 			sawEmptyServerInput = block["type"] == "server_tool_use" && len(input) == 0
+			positions["server_start"] = eventIndex
 		}
-		if event.Name == "content_block_delta" && int(index) == 1 {
+		if event.Name == "ping" {
+			positions["ping"] = eventIndex
+		}
+		if event.Name == "content_block_delta" && int(index) == 0 {
 			delta, _ := event.Data["delta"].(map[string]interface{})
 			partial, _ := delta["partial_json"].(string)
+			if delta["type"] == "input_json_delta" && partial == "" {
+				sawEmptyInputDelta = true
+			}
 			var input map[string]interface{}
 			if delta["type"] == "input_json_delta" && json.Unmarshal([]byte(partial), &input) == nil {
 				sawQueryDelta = input["query"] == result.Query
 			}
 		}
 	}
-	if !sawEmptyServerInput || !sawQueryDelta {
-		t.Fatalf("invalid streamed server tool input: empty_start=%v query_delta=%v", sawEmptyServerInput, sawQueryDelta)
+	if !sawEmptyServerInput || !sawEmptyInputDelta || !sawQueryDelta {
+		t.Fatalf("invalid streamed server tool input: empty_start=%v empty_delta=%v query_delta=%v", sawEmptyServerInput, sawEmptyInputDelta, sawQueryDelta)
+	}
+	if positions["server_start"] >= positions["ping"] {
+		t.Fatalf("ping must follow server tool start: %#v", positions)
 	}
 }
 
@@ -452,7 +479,7 @@ func TestWriteWebSearchResponseEmptyResultsStillCountsSearch(t *testing.T) {
 		t.Fatalf("decode response: %v", err)
 	}
 	blocks := response["content"].([]interface{})
-	toolResult := blocks[2].(map[string]interface{})
+	toolResult := blocks[1].(map[string]interface{})
 	content := toolResult["content"].([]interface{})
 	if len(content) != 0 || toolResult["tool_use_id"] != result.ToolUseID {
 		t.Fatalf("unexpected empty result block: %#v", toolResult)

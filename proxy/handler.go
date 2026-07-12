@@ -107,8 +107,27 @@ func validateClaudeRequestShape(req *ClaudeRequest) string {
 	if msg := validateClaudeThinkingConfig(req.Thinking, req.MaxTokens); msg != "" {
 		return msg
 	}
+	if req.OutputConfig != nil {
+		if msg := validateClaudeOutputFormat(req.OutputConfig.Format); msg != "" {
+			return msg
+		}
+	}
+	if msg := validateClaudeStopSequences(req.StopSequences); msg != "" {
+		return msg
+	}
+	if choice, err := resolveToolChoice(req.ToolChoice); err != nil {
+		return err.Error()
+	} else {
+		names := make([]string, 0, len(req.Tools))
+		for _, tool := range req.Tools {
+			names = append(names, tool.Name)
+		}
+		if msg := validateResolvedToolChoice(choice, names); msg != "" {
+			return msg
+		}
+	}
 
-	hasUserContext := false
+	hasUserMessage := false
 	lastRole := ""
 	for _, msg := range req.Messages {
 		role := strings.TrimSpace(msg.Role)
@@ -119,18 +138,14 @@ func validateClaudeRequestShape(req *ClaudeRequest) string {
 		if role != "user" {
 			continue
 		}
-
-		text, images, toolResults := extractClaudeUserContent(msg.Content)
-		if normalizeUserContent(text, len(images) > 0) != "" || len(toolResults) > 0 {
-			hasUserContext = true
-		}
+		hasUserMessage = true
 	}
 
 	if lastRole == "assistant" {
 		return "assistant-prefill final message is not supported; last message must be user"
 	}
-	if !hasUserContext {
-		return "at least one non-empty user message is required"
+	if !hasUserMessage {
+		return "at least one user message is required"
 	}
 	return ""
 }
@@ -151,9 +166,6 @@ func validateClaudeThinkingConfig(thinking *ClaudeThinkingConfig, maxTokens int)
 		}
 		if thinking.BudgetTokens < 1024 {
 			return "thinking.budget_tokens must be at least 1024"
-		}
-		if maxTokens > 0 && thinking.BudgetTokens >= maxTokens {
-			return "thinking.budget_tokens must be less than max_tokens"
 		}
 	case "adaptive":
 		if thinking.BudgetTokens != 0 {
@@ -208,9 +220,26 @@ func validateOpenAIRequestShape(req *OpenAIRequest) string {
 	if len(req.Messages) == 0 {
 		return "messages must not be empty"
 	}
+	if msg := validateOpenAIResponseFormat(req.ResponseFormat); msg != "" {
+		return msg
+	}
+	if _, err := resolveOpenAIStopSequences(req.Stop); err != nil {
+		return err.Error()
+	}
+	if choice, err := resolveToolChoice(req.ToolChoice); err != nil {
+		return err.Error()
+	} else {
+		names := make([]string, 0, len(req.Tools))
+		for _, tool := range req.Tools {
+			names = append(names, tool.Function.Name)
+		}
+		if msg := validateResolvedToolChoice(choice, names); msg != "" {
+			return msg
+		}
+	}
 
 	hasNonSystem := false
-	hasUserContext := false
+	hasUserMessage := false
 	lastRole := ""
 	for _, msg := range req.Messages {
 		role := strings.TrimSpace(msg.Role)
@@ -225,10 +254,7 @@ func validateOpenAIRequestShape(req *OpenAIRequest) string {
 		if role != "user" {
 			continue
 		}
-		text, images := extractOpenAIUserContent(msg.Content)
-		if normalizeUserContent(text, len(images) > 0) != "" {
-			hasUserContext = true
-		}
+		hasUserMessage = true
 	}
 
 	if !hasNonSystem {
@@ -237,8 +263,8 @@ func validateOpenAIRequestShape(req *OpenAIRequest) string {
 	if lastRole == "assistant" {
 		return "assistant-prefill final message is not supported; last message must be user or tool"
 	}
-	if !hasUserContext {
-		return "at least one non-empty user message is required"
+	if !hasUserMessage {
+		return "at least one user message is required"
 	}
 	return ""
 }
@@ -830,9 +856,32 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 		h.sendClaudeError(w, 400, "invalid_request_error", msg)
 		return
 	}
+	if req.OutputConfig != nil {
+		if msg := validateClaudeOutputFormat(req.OutputConfig.Format); msg != "" {
+			h.sendClaudeError(w, 400, "invalid_request_error", msg)
+			return
+		}
+	}
+	if msg := validateClaudeStopSequences(req.StopSequences); msg != "" {
+		h.sendClaudeError(w, 400, "invalid_request_error", msg)
+		return
+	}
+	if choice, choiceErr := resolveToolChoice(req.ToolChoice); choiceErr != nil {
+		h.sendClaudeError(w, 400, "invalid_request_error", choiceErr.Error())
+		return
+	} else {
+		names := make([]string, 0, len(req.Tools))
+		for _, tool := range req.Tools {
+			names = append(names, tool.Name)
+		}
+		if msg := validateResolvedToolChoice(choice, names); msg != "" {
+			h.sendClaudeError(w, 400, "invalid_request_error", msg)
+			return
+		}
+	}
 
 	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
+	actualModel, thinking := resolveClaudeRequestThinkingMode(&req, thinkingCfg.Suffix)
 	req.Model = actualModel
 	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
 
@@ -880,17 +929,22 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
+	requestedModel := req.Model
+	actualModel, thinking := resolveClaudeRequestThinkingMode(&req, thinkingCfg.Suffix)
 	req.Model = actualModel
+	req.responseModel = requestedModel
 	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
 	thinkingResponseOpts := resolveClaudeThinkingResponseOptions(req.Thinking, thinkingCfg.ClaudeFormat)
 	estimatedInputTokens := estimateClaudeRequestInputTokens(effectiveReq)
 	apiKeyID := apiKeyIDFromContext(r.Context())
-	if hasWebSearchTool(&req) {
-		h.handleWebSearchRequest(w, r.Context(), &req, estimatedInputTokens, apiKeyID)
+	toolChoice, _ := resolveToolChoice(req.ToolChoice)
+	selectedReq := req
+	selectedReq.Tools = filterClaudeToolsForChoice(req.Tools, toolChoice)
+	if hasWebSearchTool(&selectedReq) {
+		h.handleWebSearchRequest(w, r.Context(), &selectedReq, estimatedInputTokens, apiKeyID)
 		return
 	}
-	if hasNativeWebSearchDeclaration(&req) {
+	if hasNativeWebSearchDeclaration(&selectedReq) {
 		err := errors.New("native web_search must be a supported standalone Claude Code WebSearch request")
 		h.recordFailureWithDetails("claude", req.Model, "", err)
 		h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
@@ -904,9 +958,9 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// Stream or non-stream
 	if req.Stream {
-		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeStream(w, kiroPayload, req.Model, requestedModel, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
 	} else {
-		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeNonStream(w, kiroPayload, req.Model, requestedModel, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
 	}
 }
 
@@ -944,7 +998,7 @@ func claudePromptCacheIsolationSeed(req *ClaudeRequest, apiKeyID string, provide
 }
 
 // handleClaudeStream Claude 流式响应
-func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model, responseModel string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -964,6 +1018,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	excluded := make(map[string]bool)
 	var lastErr error
 	messageStarted := false
+	pingSent := false
 	var messageStartUsage promptCacheUsage
 
 	ensureMessageStart := func() {
@@ -977,13 +1032,24 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				"type":          "message",
 				"role":          "assistant",
 				"content":       []interface{}{},
-				"model":         model,
+				"model":         responseModel,
 				"stop_reason":   nil,
 				"stop_sequence": nil,
-				"usage":         buildClaudeUsageMap(startInputTokens, 0, messageStartUsage, cacheProfile != nil),
+				"stop_details":  nil,
+				"usage":         buildClaudeUsageMap(startInputTokens, 1, messageStartUsage, true),
+				"context_management": map[string]interface{}{
+					"applied_edits": []interface{}{},
+				},
 			},
 		})
 		messageStarted = true
+	}
+	sendInitialPing := func() {
+		if pingSent {
+			return
+		}
+		h.sendSSE(w, flusher, "ping", map[string]interface{}{"type": "ping"})
+		pingSent = true
 	}
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
@@ -1007,12 +1073,35 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		var nextContentIndex int
 		var rawContentBuilder strings.Builder
 		var rawThinkingBuilder strings.Builder
+		var redactedThinking []string
+		var pendingThinkingSignature string
+		var reasoningSignature string
+		var contextWindowExceeded bool
+		var upstreamStopReason string
+		stopFilter := newStopSequenceFilter(payload.StopSequences)
 		activeBlockIndex := -1
 		activeBlockType := ""
+		thinkingBlockEmitted := false
 
 		closeActiveBlock := func() {
 			if activeBlockIndex < 0 {
 				return
+			}
+			if activeBlockType == "thinking" {
+				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+					"type":  "content_block_delta",
+					"index": activeBlockIndex,
+					"delta": map[string]string{"type": "thinking_delta", "thinking": ""},
+				})
+				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+					"type":  "content_block_delta",
+					"index": activeBlockIndex,
+					"delta": map[string]string{
+						"type":      "signature_delta",
+						"signature": claudeThinkingSignature(pendingThinkingSignature),
+					},
+				})
+				pendingThinkingSignature = ""
 			}
 			h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
 				"type":  "content_block_stop",
@@ -1033,12 +1122,14 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			nextContentIndex++
 
 			if blockType == "thinking" {
+				thinkingBlockEmitted = true
 				h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
 					"type":  "content_block_start",
 					"index": idx,
 					"content_block": map[string]string{
-						"type":     "thinking",
-						"thinking": "",
+						"type":      "thinking",
+						"thinking":  "",
+						"signature": "",
 					},
 				})
 			} else {
@@ -1054,6 +1145,14 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 
 			activeBlockIndex = idx
 			activeBlockType = blockType
+			sendInitialPing()
+		}
+		flushPendingSignatureBlock := func() {
+			if stopFilter.Matched() != "" || !thinking || thinkingFormat != "thinking" || pendingThinkingSignature == "" || activeBlockType == "thinking" {
+				return
+			}
+			startContentBlock("thinking")
+			closeActiveBlock()
 		}
 
 		var textBuffer string
@@ -1063,17 +1162,51 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		var thinkingStarted bool
 		var eventThinkingOpen bool
 
+		emitRedactedThinking := func(data string) {
+			if stopFilter.Matched() != "" || !thinking || thinkingFormat != "thinking" || data == "" {
+				return
+			}
+			ensureMessageStart()
+			flushPendingSignatureBlock()
+			closeActiveBlock()
+			eventThinkingOpen = false
+			thinkingStarted = false
+
+			idx := nextContentIndex
+			nextContentIndex++
+			h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+				"type":  "content_block_start",
+				"index": idx,
+				"content_block": map[string]string{
+					"type": "redacted_thinking",
+					"data": data,
+				},
+			})
+			sendInitialPing()
+			h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
+				"type":  "content_block_stop",
+				"index": idx,
+			})
+		}
+
+		emitTextDelta := func(text string) {
+			if text == "" {
+				return
+			}
+			startContentBlock("text")
+			h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": activeBlockIndex,
+				"delta": map[string]string{"type": "text_delta", "text": text},
+			})
+		}
+
 		sendText := func(text string, thinkingState int) {
 			if thinkingState == 0 {
-				if text == "" {
-					return
-				}
-				startContentBlock("text")
-				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
-					"type":  "content_block_delta",
-					"index": activeBlockIndex,
-					"delta": map[string]string{"type": "text_delta", "text": text},
-				})
+				emitTextDelta(stopFilter.Push(text))
+				return
+			}
+			if stopFilter.Matched() != "" {
 				return
 			}
 
@@ -1147,7 +1280,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 
 		processClaudeText := func(text string, isThinking bool, forceFlush bool) {
 			if isThinking && !thinking {
-				return
+				isThinking = false
 			}
 
 			if isThinking {
@@ -1256,18 +1389,40 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				if text == "" {
 					return
 				}
-				if isThinking {
+				if isThinking && thinking {
 					rawThinkingBuilder.WriteString(text)
 				} else {
 					rawContentBuilder.WriteString(text)
 				}
+				if !isThinking {
+					flushPendingSignatureBlock()
+				}
 				processClaudeText(text, isThinking, false)
 			},
+			OnReasoning: func(event KiroReasoningContentEvent) {
+				if thinking && thinkingFormat == "thinking" && event.Signature != "" {
+					pendingThinkingSignature = event.Signature
+					reasoningSignature = event.Signature
+				}
+				if event.Text != "" {
+					if thinking {
+						rawThinkingBuilder.WriteString(event.Text)
+					} else {
+						rawContentBuilder.WriteString(event.Text)
+					}
+					processClaudeText(event.Text, true, false)
+				}
+				if thinking && event.RedactedContent != "" {
+					redactedThinking = append(redactedThinking, event.RedactedContent)
+				}
+				emitRedactedThinking(event.RedactedContent)
+			},
 			OnToolUse: func(tu KiroToolUse) {
+				flushPendingSignatureBlock()
 				processClaudeText("", false, true)
-				rawContentBuilder.WriteString(tu.Name)
-				if b, err := json.Marshal(tu.Input); err == nil {
-					rawContentBuilder.Write(b)
+				emitTextDelta(stopFilter.Flush())
+				if stopFilter.Matched() != "" {
+					return
 				}
 
 				toolUses = append(toolUses, tu)
@@ -1281,12 +1436,14 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 					"type":  "content_block_start",
 					"index": idx,
 					"content_block": map[string]interface{}{
-						"type":  "tool_use",
-						"id":    tu.ToolUseID,
-						"name":  tu.Name,
-						"input": map[string]interface{}{},
+						"type":   "tool_use",
+						"id":     tu.ToolUseID,
+						"name":   tu.Name,
+						"input":  map[string]interface{}{},
+						"caller": map[string]interface{}{"type": "direct"},
 					},
 				})
+				sendInitialPing()
 
 				inputJSON, _ := json.Marshal(tu.Input)
 				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
@@ -1307,17 +1464,35 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				inputTokens = inTok
 				outputTokens = outTok
 			},
+			OnStopReason: func(reason string) {
+				upstreamStopReason = reason
+			},
 			OnCredits: func(c float64) {
 				credits = c
 			},
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				if pct >= 100 {
+					contextWindowExceeded = true
+				}
 			},
 		}
 
 		err := CallKiroAPI(account, payload, callback)
 		if err != nil {
 			lastErr = err
+			if code, protocolErr := kiroStreamProtocolErrorCode(err); protocolErr {
+				h.recordFailureWithDetails("claude", model, account.ID, err)
+				if !messageStarted {
+					h.sendClaudeError(w, http.StatusBadGateway, code, err.Error())
+				} else {
+					h.sendSSE(w, flusher, "error", map[string]interface{}{
+						"type":  "error",
+						"error": map[string]string{"type": code, "message": err.Error()},
+					})
+				}
+				return
+			}
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			if !messageStarted {
@@ -1331,7 +1506,9 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			return
 		}
 
+		flushPendingSignatureBlock()
 		processClaudeText("", false, true)
+		emitTextDelta(stopFilter.Flush())
 		if eventThinkingOpen {
 			sendText("", 3)
 		}
@@ -1347,6 +1524,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		// the pre-call token estimate).
 		cacheUsage = reanchorClaudeCacheUsage(cacheProfile, cacheUsage, inputTokens)
 		outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
+		outputContent, matchedStopSequence := truncateAtStopSequence(outputContent, payload.StopSequences)
 		thinkingOutput := rawThinkingBuilder.String()
 		if thinking && thinkingOutput == "" && extractedReasoning != "" {
 			thinkingOutput = extractedReasoning
@@ -1354,7 +1532,15 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		if !thinking {
 			thinkingOutput = ""
 		}
-		outputTokens = estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
+		thinkingOnly := (thinkingBlockEmitted || len(redactedThinking) > 0) && outputContent == "" && len(toolUses) == 0 && matchedStopSequence == ""
+		if thinkingOnly {
+			emitTextDelta(" ")
+			closeActiveBlock()
+			if upstreamStopReason == "" {
+				upstreamStopReason = "max_tokens"
+			}
+		}
+		outputTokens = estimateClaudeOutputTokensWithRedacted(outputContent, thinkingOutput, redactedThinking, toolUses)
 
 		h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, credits, cacheUsage)
 		h.pool.RecordSuccess(account.ID)
@@ -1366,18 +1552,31 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		h.promptCache.Update(account.ID, cacheProfile)
 		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
-		stopReason := "end_turn"
-		if len(toolUses) > 0 {
-			stopReason = "tool_use"
+		stopReason := resolveClaudeStopReason(len(toolUses), contextWindowExceeded, upstreamStopReason)
+		var stopSequence interface{}
+		if matchedStopSequence != "" {
+			stopReason = "stop_sequence"
+			stopSequence = matchedStopSequence
 		}
 
 		ensureMessageStart()
+		sendInitialPing()
+		finalUsage := buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, true)
+		if thinking {
+			addClaudeReasoningUsageDetails(finalUsage, ClaudeReasoningResult{
+				Text:      thinkingOutput,
+				Signature: reasoningSignature,
+				Redacted:  redactedThinking,
+			}, thinkingBlockEmitted)
+		}
 		h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
 			"type": "message_delta",
 			"delta": map[string]interface{}{
-				"stop_reason": stopReason,
+				"stop_reason":   stopReason,
+				"stop_sequence": stopSequence,
+				"stop_details":  nil,
 			},
-			"usage": buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil),
+			"usage": finalUsage,
 		})
 
 		h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
@@ -1578,7 +1777,7 @@ func (h *Handler) getRequestLogs() []RequestLog {
 }
 
 // handleClaudeNonStream Claude 非流式响应
-func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model, responseModel string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
 	excluded := make(map[string]bool)
 	var lastErr error
 	reqStart := time.Now()
@@ -1598,37 +1797,82 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 
 		var content string
 		var thinkingContent string
+		var thinkingSignature string
+		var redactedThinking []string
 		var toolUses []KiroToolUse
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var contextWindowExceeded bool
+		var upstreamStopReason string
+		var matchedStopSequence string
+		updateStopSequenceState := func() {
+			if matchedStopSequence != "" {
+				return
+			}
+			visibleContent, _ := extractThinkingFromContent(content)
+			_, matchedStopSequence = truncateAtStopSequence(visibleContent, payload.StopSequences)
+		}
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
 				if isThinking {
-					thinkingContent += text
+					if thinking {
+						thinkingContent += text
+					} else {
+						content += text
+						updateStopSequenceState()
+					}
 				} else {
 					content += text
+					updateStopSequenceState()
+				}
+			},
+			OnReasoning: func(event KiroReasoningContentEvent) {
+				if thinking {
+					thinkingContent += event.Text
+					if event.Signature != "" {
+						thinkingSignature = event.Signature
+					}
+					if event.RedactedContent != "" {
+						redactedThinking = append(redactedThinking, event.RedactedContent)
+					}
+				} else {
+					content += event.Text
+					updateStopSequenceState()
 				}
 			},
 			OnToolUse: func(tu KiroToolUse) {
-				toolUses = append(toolUses, tu)
+				if matchedStopSequence == "" {
+					toolUses = append(toolUses, tu)
+				}
 			},
 			OnComplete: func(inTok, outTok int) {
 				inputTokens = inTok
 				outputTokens = outTok
+			},
+			OnStopReason: func(reason string) {
+				upstreamStopReason = reason
 			},
 			OnCredits: func(c float64) {
 				credits = c
 			},
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				if pct >= 100 {
+					contextWindowExceeded = true
+				}
 			},
 		}
 
 		err := CallKiroAPI(account, payload, callback)
 		if err != nil {
 			lastErr = err
+			if code, protocolErr := kiroStreamProtocolErrorCode(err); protocolErr {
+				h.recordFailureWithDetails("claude", model, account.ID, err)
+				h.sendClaudeError(w, http.StatusBadGateway, code, err.Error())
+				return
+			}
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			continue
@@ -1636,12 +1880,21 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 
 		thinkingFormat := thinkingOpts.Format
 		finalContent, extractedReasoning := extractThinkingFromContent(content)
+		finalContent, finalMatchedStopSequence := truncateAtStopSequence(finalContent, payload.StopSequences)
+		if matchedStopSequence == "" {
+			matchedStopSequence = finalMatchedStopSequence
+		}
 		rawThinkingContent := thinkingContent
 		if thinking && rawThinkingContent == "" && extractedReasoning != "" {
 			rawThinkingContent = extractedReasoning
 		}
 		if !thinking {
 			rawThinkingContent = ""
+			thinkingSignature = ""
+			redactedThinking = nil
+		}
+		if finalContent == "" && len(toolUses) == 0 && (rawThinkingContent != "" || thinkingSignature != "" || len(redactedThinking) > 0) && upstreamStopReason == "" {
+			upstreamStopReason = "max_tokens"
 		}
 
 		if realInputTokens > 0 {
@@ -1653,7 +1906,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		// input+creation+read stays consistent (cacheUsage was computed against
 		// the pre-call token estimate).
 		cacheUsage = reanchorClaudeCacheUsage(cacheProfile, cacheUsage, inputTokens)
-		outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
+		outputTokens = estimateClaudeOutputTokensWithRedacted(finalContent, rawThinkingContent, redactedThinking, toolUses)
 
 		h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, credits, cacheUsage)
 		h.pool.RecordSuccess(account.ID)
@@ -1683,7 +1936,24 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			}
 		}
 
-		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model)
+		reasoningResult := ClaudeReasoningResult{Text: responseThinkingContent}
+		if thinkingFormat == "thinking" {
+			reasoningResult.Signature = thinkingSignature
+			reasoningResult.Redacted = redactedThinking
+		}
+		resp := KiroToClaudeResponseWithReasoning(finalContent, reasoningResult, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, responseModel)
+		if thinking {
+			resp.Usage.OutputTokensDetails = claudeReasoningUsageDetails(ClaudeReasoningResult{
+				Text:      rawThinkingContent,
+				Signature: thinkingSignature,
+				Redacted:  redactedThinking,
+			}, includeEmptyThinkingBlock)
+		}
+		resp.StopReason = resolveClaudeStopReason(len(toolUses), contextWindowExceeded, upstreamStopReason)
+		if matchedStopSequence != "" {
+			resp.StopReason = "stop_sequence"
+			resp.StopSequence = &matchedStopSequence
+		}
 		resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
 		resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
 		resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
@@ -1745,7 +2015,8 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
+	requestedModel := req.Model
+	actualModel, thinking := resolveOpenAIThinkingMode(req.Model, req.ReasoningEffort, thinkingCfg.Suffix)
 	req.Model = actualModel
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
 
@@ -1753,14 +2024,15 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	if req.Stream {
-		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
+		h.handleOpenAIStream(w, kiroPayload, req.Model, requestedModel, thinking, includeUsage, estimatedInputTokens, apiKeyID)
 	} else {
-		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		h.handleOpenAINonStream(w, kiroPayload, req.Model, requestedModel, thinking, estimatedInputTokens, apiKeyID)
 	}
 }
 
 // handleOpenAIStream OpenAI 流式响应
-func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model, responseModel string, thinking, includeUsage bool, estimatedInputTokens int, apiKeyID string) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1775,6 +2047,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 
 	chatID := "chatcmpl-" + uuid.New().String()
+	created := time.Now().Unix()
 	excluded := make(map[string]bool)
 	var lastErr error
 	reqStart := time.Now()
@@ -1804,10 +2077,52 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		var thinkingSource thinkingStreamSource
 		var thinkingStarted bool
 		var eventThinkingOpen bool
+		var upstreamStopReason string
+		var contextWindowExceeded bool
 		responseStarted := false
+		assistantRoleSent := false
+		stopFilter := newStopSequenceFilter(payload.StopSequences)
+		bypassStopFilter := false
+
+		writeChunk := func(choices []map[string]interface{}, usage map[string]int) {
+			chunk := map[string]interface{}{
+				"id":      chatID,
+				"object":  "chat.completion.chunk",
+				"created": created,
+				"model":   responseModel,
+				"choices": choices,
+			}
+			if usage != nil {
+				chunk["usage"] = usage
+			}
+			data, _ := json.Marshal(chunk)
+			fmt.Fprintf(w, "data: %s\n\n", string(data))
+			flusher.Flush()
+			responseStarted = true
+		}
+
+		ensureAssistantRole := func() {
+			if assistantRoleSent {
+				return
+			}
+			writeChunk([]map[string]interface{}{{
+				"index": 0,
+				"delta": map[string]string{
+					"role":    "assistant",
+					"content": "",
+				},
+				"finish_reason": nil,
+			}}, nil)
+			assistantRoleSent = true
+		}
 
 		sendChunk := func(content string, thinkingState int) {
 			if content == "" && thinkingState == 2 {
+				return
+			}
+			if thinkingState == 0 && !bypassStopFilter {
+				content = stopFilter.Push(content)
+			} else if thinkingState > 0 && stopFilter.Matched() != "" {
 				return
 			}
 
@@ -1835,7 +2150,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 						"id":      chatID,
 						"object":  "chat.completion.chunk",
 						"created": time.Now().Unix(),
-						"model":   model,
+						"model":   responseModel,
 						"choices": []map[string]interface{}{{
 							"index":         0,
 							"delta":         map[string]string{"content": text},
@@ -1859,7 +2174,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 						"id":      chatID,
 						"object":  "chat.completion.chunk",
 						"created": time.Now().Unix(),
-						"model":   model,
+						"model":   responseModel,
 						"choices": []map[string]interface{}{{
 							"index":         0,
 							"delta":         map[string]string{"content": text},
@@ -1874,7 +2189,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 						"id":      chatID,
 						"object":  "chat.completion.chunk",
 						"created": time.Now().Unix(),
-						"model":   model,
+						"model":   responseModel,
 						"choices": []map[string]interface{}{{
 							"index":         0,
 							"delta":         map[string]string{"reasoning_content": content},
@@ -1890,7 +2205,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 					"id":      chatID,
 					"object":  "chat.completion.chunk",
 					"created": time.Now().Unix(),
-					"model":   model,
+					"model":   responseModel,
 					"choices": []map[string]interface{}{{
 						"index":         0,
 						"delta":         map[string]string{"content": content},
@@ -1898,15 +2213,26 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 					}},
 				}
 			}
+			ensureAssistantRole()
+			chunk["created"] = created
 			data, _ := json.Marshal(chunk)
 			fmt.Fprintf(w, "data: %s\n\n", string(data))
 			flusher.Flush()
 			responseStarted = true
 		}
+		flushPendingStopText := func() {
+			pending := stopFilter.Flush()
+			if pending == "" {
+				return
+			}
+			bypassStopFilter = true
+			sendChunk(pending, 0)
+			bypassStopFilter = false
+		}
 
 		processText := func(text string, isThinking bool, forceFlush bool) {
 			if isThinking && !thinking {
-				return
+				isThinking = false
 			}
 
 			if isThinking {
@@ -2012,10 +2338,10 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
-				if text == "" {
+				if text == "" || stopFilter.Matched() != "" {
 					return
 				}
-				if isThinking {
+				if isThinking && thinking {
 					rawReasoningBuilder.WriteString(text)
 				} else {
 					rawContentBuilder.WriteString(text)
@@ -2024,10 +2350,12 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			},
 			OnToolUse: func(tu KiroToolUse) {
 				processText("", false, true)
+				flushPendingStopText()
+				if stopFilter.Matched() != "" {
+					return
+				}
 
 				args, _ := json.Marshal(tu.Input)
-				rawContentBuilder.WriteString(tu.Name)
-				rawContentBuilder.Write(args)
 				tc := ToolCall{ID: tu.ToolUseID, Type: "function"}
 				tc.Function.Name = tu.Name
 				tc.Function.Arguments = string(args)
@@ -2037,7 +2365,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 					"id":      chatID,
 					"object":  "chat.completion.chunk",
 					"created": time.Now().Unix(),
-					"model":   model,
+					"model":   responseModel,
 					"choices": []map[string]interface{}{{
 						"index": 0,
 						"delta": map[string]interface{}{
@@ -2055,6 +2383,8 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 					}},
 				}
 				toolCallIndex++
+				ensureAssistantRole()
+				chunk["created"] = created
 				data, _ := json.Marshal(chunk)
 				fmt.Fprintf(w, "data: %s\n\n", string(data))
 				flusher.Flush()
@@ -2064,17 +2394,30 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				inputTokens = inTok
 				outputTokens = outTok
 			},
+			OnStopReason: func(reason string) {
+				upstreamStopReason = reason
+			},
 			OnCredits: func(c float64) {
 				credits = c
 			},
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				if pct >= 100 {
+					contextWindowExceeded = true
+				}
 			},
 		}
 
 		err := CallKiroAPI(account, payload, callback)
 		if err != nil {
 			lastErr = err
+			if code, protocolErr := kiroStreamProtocolErrorCode(err); protocolErr {
+				h.recordFailureWithDetails("openai", model, account.ID, err)
+				if !responseStarted {
+					h.sendOpenAIError(w, http.StatusBadGateway, code, err.Error())
+				}
+				return
+			}
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			if !responseStarted {
@@ -2085,6 +2428,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		}
 
 		processText("", false, true)
+		flushPendingStopText()
 		if eventThinkingOpen {
 			sendChunk("", 3)
 		}
@@ -2095,6 +2439,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			inputTokens = estimatedInputTokens
 		}
 		outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
+		outputContent, matchedStopSequence := truncateAtStopSequence(outputContent, payload.StopSequences)
 		reasoningOutput := rawReasoningBuilder.String()
 		if thinking && reasoningOutput == "" && extractedReasoning != "" {
 			reasoningOutput = extractedReasoning
@@ -2118,28 +2463,27 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		finishReason := "stop"
-		if len(toolCalls) > 0 {
+		if matchedStopSequence != "" {
+			finishReason = "stop"
+		} else if upstreamStopReason != "" || contextWindowExceeded {
+			finishReason = "length"
+		} else if len(toolCalls) > 0 {
 			finishReason = "tool_calls"
 		}
 
-		chunk := map[string]interface{}{
-			"id":      chatID,
-			"object":  "chat.completion.chunk",
-			"created": time.Now().Unix(),
-			"model":   model,
-			"choices": []map[string]interface{}{{
-				"index":         0,
-				"delta":         map[string]interface{}{},
-				"finish_reason": finishReason,
-			}},
-			"usage": map[string]int{
+		ensureAssistantRole()
+		writeChunk([]map[string]interface{}{{
+			"index":         0,
+			"delta":         map[string]string{"content": ""},
+			"finish_reason": finishReason,
+		}}, nil)
+		if includeUsage {
+			writeChunk([]map[string]interface{}{}, map[string]int{
 				"prompt_tokens":     inputTokens,
 				"completion_tokens": outputTokens,
 				"total_tokens":      inputTokens + outputTokens,
-			},
+			})
 		}
-		data, _ := json.Marshal(chunk)
-		fmt.Fprintf(w, "data: %s\n\n", string(data))
 		fmt.Fprintf(w, "data: [DONE]\n\n")
 		flusher.Flush()
 		return
@@ -2156,7 +2500,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 }
 
 // handleOpenAINonStream OpenAI 非流式响应
-func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model, responseModel string, thinking bool, estimatedInputTokens int, apiKeyID string) {
 	excluded := make(map[string]bool)
 	var lastErr error
 	reqStart := time.Now()
@@ -2179,32 +2523,68 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var upstreamStopReason string
+		var contextWindowExceeded bool
+		var matchedStopSequence string
+		updateStopSequenceState := func() {
+			if matchedStopSequence != "" {
+				return
+			}
+			visibleContent, _ := extractThinkingFromContent(content)
+			_, matchedStopSequence = truncateAtStopSequence(visibleContent, payload.StopSequences)
+		}
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
+				if matchedStopSequence != "" {
+					return
+				}
 				if isThinking {
-					reasoningContent += text
+					if thinking {
+						reasoningContent += text
+					} else {
+						content += text
+						updateStopSequenceState()
+					}
 				} else {
 					content += text
+					updateStopSequenceState()
 				}
 			},
-			OnToolUse:  func(tu KiroToolUse) { toolUses = append(toolUses, tu) },
-			OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
-			OnCredits:  func(c float64) { credits = c },
+			OnToolUse: func(tu KiroToolUse) {
+				if matchedStopSequence == "" {
+					toolUses = append(toolUses, tu)
+				}
+			},
+			OnComplete:   func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
+			OnStopReason: func(reason string) { upstreamStopReason = reason },
+			OnCredits:    func(c float64) { credits = c },
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				if pct >= 100 {
+					contextWindowExceeded = true
+				}
 			},
 		}
 
 		err := CallKiroAPI(account, payload, callback)
 		if err != nil {
 			lastErr = err
+			if code, protocolErr := kiroStreamProtocolErrorCode(err); protocolErr {
+				h.recordFailureWithDetails("openai", model, account.ID, err)
+				h.sendOpenAIError(w, http.StatusBadGateway, code, err.Error())
+				return
+			}
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			continue
 		}
 
 		finalContent, extractedReasoning := extractThinkingFromContent(content)
+		finalContent, finalMatchedStopSequence := truncateAtStopSequence(finalContent, payload.StopSequences)
+		if matchedStopSequence == "" {
+			matchedStopSequence = finalMatchedStopSequence
+		}
 		if thinking && reasoningContent == "" && extractedReasoning != "" {
 			reasoningContent = extractedReasoning
 		} else if !thinking {
@@ -2228,7 +2608,16 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
-		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat)
+		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, responseModel, thinkingFormat)
+		if matchedStopSequence != "" {
+			if choices, ok := resp["choices"].([]map[string]interface{}); ok && len(choices) > 0 {
+				choices[0]["finish_reason"] = "stop"
+			}
+		} else if upstreamStopReason != "" || contextWindowExceeded {
+			if choices, ok := resp["choices"].([]map[string]interface{}); ok && len(choices) > 0 {
+				choices[0]["finish_reason"] = "length"
+			}
+		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		json.NewEncoder(w).Encode(resp)
 		return

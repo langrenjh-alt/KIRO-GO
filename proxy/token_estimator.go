@@ -52,6 +52,13 @@ func estimateClaudeRequestInputTokens(req *ClaudeRequest) int {
 	}
 
 	total := estimateClaudeValueTokens(req.System)
+	if choice, err := resolveToolChoice(req.ToolChoice); err == nil {
+		total += estimateApproxTokens(toolChoiceInstruction(choice))
+	}
+	if req.OutputConfig != nil {
+		total += estimateApproxTokens(claudeStructuredOutputInstruction(req.OutputConfig.Format))
+	}
+	total += estimateApproxTokens(stopSequencesInstruction(req.StopSequences))
 
 	for _, msg := range req.Messages {
 		total += estimateClaudeValueTokens(msg.Content)
@@ -67,8 +74,15 @@ func estimateClaudeRequestInputTokens(req *ClaudeRequest) int {
 }
 
 func estimateClaudeOutputTokens(content, thinkingContent string, toolUses []KiroToolUse) int {
+	return estimateClaudeOutputTokensWithRedacted(content, thinkingContent, nil, toolUses)
+}
+
+func estimateClaudeOutputTokensWithRedacted(content, thinkingContent string, redactedThinking []string, toolUses []KiroToolUse) int {
 	total := estimateApproxTokens(content)
 	total += estimateApproxTokens(thinkingContent)
+	for _, redacted := range redactedThinking {
+		total += estimateApproxTokens(redacted)
+	}
 
 	for _, tu := range toolUses {
 		total += estimateApproxTokens(tu.Name)
@@ -157,6 +171,13 @@ func estimateOpenAIRequestInputTokens(req *OpenAIRequest) int {
 	}
 
 	total := 0
+	total += estimateApproxTokens(openAIStructuredOutputInstruction(req.ResponseFormat))
+	if choice, err := resolveToolChoice(req.ToolChoice); err == nil {
+		total += estimateApproxTokens(toolChoiceInstruction(choice))
+	}
+	if stopSequences, err := resolveOpenAIStopSequences(req.Stop); err == nil {
+		total += estimateApproxTokens(stopSequencesInstruction(stopSequences))
+	}
 
 	for _, msg := range req.Messages {
 		total += estimateOpenAIContentTokens(msg.Content)

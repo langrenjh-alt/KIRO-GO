@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -279,8 +280,121 @@ func TestKiroToClaudeResponseCanEmitEmptyThinkingBlock(t *testing.T) {
 	if resp.Content[0].Thinking != "" {
 		t.Fatalf("expected omitted thinking block to have empty content, got %#v", resp.Content[0].Thinking)
 	}
+	if resp.Content[0].Signature != claudeThinkingSignaturePlaceholder {
+		t.Fatalf("expected a non-empty fallback signature, got %#v", resp.Content[0].Signature)
+	}
 	if resp.Content[1].Type != "text" || resp.Content[1].Text != "final answer" {
 		t.Fatalf("expected text block to be preserved, got %#v", resp.Content[1])
+	}
+}
+
+func TestKiroToClaudeResponsePreservesNativeReasoningAndProtocolEnvelope(t *testing.T) {
+	resp := KiroToClaudeResponseWithReasoning(
+		"final answer",
+		ClaudeReasoningResult{
+			Text:      "native thinking",
+			Signature: "real-signature",
+			Redacted:  []string{"encrypted-thinking"},
+		},
+		false,
+		[]KiroToolUse{{ToolUseID: "toolu_1", Name: "lookup", Input: map[string]interface{}{"q": "x"}}},
+		10,
+		20,
+		"claude-sonnet-4-6",
+	)
+
+	if len(resp.Content) != 4 {
+		t.Fatalf("content block count = %d, want 4: %#v", len(resp.Content), resp.Content)
+	}
+	if block := resp.Content[0]; block.Type != "thinking" || block.Thinking != "native thinking" || block.Signature != "real-signature" {
+		t.Fatalf("thinking block = %#v", block)
+	}
+	if block := resp.Content[1]; block.Type != "redacted_thinking" || block.Data != "encrypted-thinking" {
+		t.Fatalf("redacted block = %#v", block)
+	}
+	if block := resp.Content[2]; block.Type != "text" || block.Text != "final answer" {
+		t.Fatalf("text block = %#v", block)
+	}
+	if block := resp.Content[3]; block.Type != "tool_use" || block.Caller == nil || block.Caller.Type != "direct" {
+		t.Fatalf("tool block = %#v", block)
+	}
+	if resp.StopReason != "tool_use" || resp.StopSequence != nil || resp.StopDetails != nil {
+		t.Fatalf("stop fields = reason:%q sequence:%v details:%v", resp.StopReason, resp.StopSequence, resp.StopDetails)
+	}
+	if len(resp.ContextManagement.AppliedEdits) != 0 {
+		t.Fatalf("context management = %#v", resp.ContextManagement)
+	}
+	if resp.Usage.CacheCreation == nil || resp.Usage.ServiceTier != "standard" || resp.Usage.InferenceGeo != "not_available" {
+		t.Fatalf("usage envelope = %#v", resp.Usage)
+	}
+	wantThinkingTokens := estimateClaudeOutputTokensWithRedacted("", "native thinking", []string{"encrypted-thinking"}, nil)
+	if resp.Usage.OutputTokensDetails == nil || resp.Usage.OutputTokensDetails.ThinkingTokens != wantThinkingTokens {
+		t.Fatalf("thinking usage = %#v, want %d", resp.Usage.OutputTokensDetails, wantThinkingTokens)
+	}
+
+	raw, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{
+		`"stop_sequence":null`,
+		`"stop_details":null`,
+		`"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}`,
+		`"context_management":{"applied_edits":[]}`,
+	} {
+		if !strings.Contains(string(raw), field) {
+			t.Fatalf("response JSON is missing %s: %s", field, raw)
+		}
+	}
+}
+
+func TestKiroToClaudeResponsePreservesSignatureOnlyThinking(t *testing.T) {
+	resp := KiroToClaudeResponseWithReasoning(
+		"answer",
+		ClaudeReasoningResult{Signature: "real-signature"},
+		false,
+		nil,
+		1,
+		1,
+		"claude-opus-4.8",
+	)
+	if len(resp.Content) != 2 {
+		t.Fatalf("content = %#v", resp.Content)
+	}
+	if block := resp.Content[0]; block.Type != "thinking" || block.Thinking != "" || block.Signature != "real-signature" {
+		t.Fatalf("signature-only thinking block = %#v", block)
+	}
+	if resp.Usage.OutputTokensDetails == nil {
+		t.Fatal("signature-only response is missing thinking token details")
+	}
+
+	plain := KiroToClaudeResponse("answer", "", false, nil, 1, 1, "claude-opus-4.8")
+	if plain.Usage.OutputTokensDetails != nil {
+		t.Fatalf("plain response unexpectedly contains thinking details: %#v", plain.Usage.OutputTokensDetails)
+	}
+}
+
+func TestClaudeAssistantThinkingRoundTripsIntoKiroHistory(t *testing.T) {
+	req := &ClaudeRequest{
+		Model: "claude-opus-4.8",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "first"},
+			{Role: "assistant", Content: []interface{}{
+				map[string]interface{}{"type": "thinking", "thinking": "prior reasoning", "signature": "opaque"},
+				map[string]interface{}{"type": "text", "text": "prior answer"},
+			}},
+			{Role: "user", Content: "continue"},
+		},
+	}
+	payload := ClaudeToKiro(req, true)
+	var assistantContent string
+	for _, message := range payload.ConversationState.History {
+		if message.AssistantResponseMessage != nil {
+			assistantContent = message.AssistantResponseMessage.Content
+		}
+	}
+	if !strings.Contains(assistantContent, "<thinking>prior reasoning</thinking>") || !strings.Contains(assistantContent, "prior answer") {
+		t.Fatalf("assistant history = %q", assistantContent)
 	}
 }
 
