@@ -2,8 +2,14 @@ package proxy
 
 import (
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"kiro-go/config"
+	accountpool "kiro-go/pool"
 )
 
 func TestClaudeToolDecodesServerToolMetadata(t *testing.T) {
@@ -11,7 +17,10 @@ func TestClaudeToolDecodesServerToolMetadata(t *testing.T) {
 	err := json.Unmarshal([]byte(`{
 		"type":"web_search_20260209",
 		"name":"web_search",
+		"model":"claude-opus-4-8",
 		"max_uses":4,
+		"max_tokens":2048,
+		"caching":{"type":"ephemeral","ttl":"5m"},
 		"allowed_domains":["example.com"],
 		"blocked_domains":["blocked.example"]
 	}`), &tool)
@@ -22,11 +31,148 @@ func TestClaudeToolDecodesServerToolMetadata(t *testing.T) {
 	if tool.Type != "web_search_20260209" || tool.MaxUses != 4 {
 		t.Fatalf("server tool metadata was not retained: %#v", tool)
 	}
+	if tool.Model != "claude-opus-4-8" || tool.MaxTokens != 2048 || tool.Caching == nil {
+		t.Fatalf("server tool model settings were not retained: %#v", tool)
+	}
 	if len(tool.AllowedDomains) != 1 || tool.AllowedDomains[0] != "example.com" {
 		t.Fatalf("allowed_domains was not retained: %#v", tool.AllowedDomains)
 	}
 	if len(tool.BlockedDomains) != 1 || tool.BlockedDomains[0] != "blocked.example" {
 		t.Fatalf("blocked_domains was not retained: %#v", tool.BlockedDomains)
+	}
+}
+
+func TestHandleAdvisorRequestExecutesAdvisorAndExecutorWithMixedTools(t *testing.T) {
+	if err := config.Init(t.TempDir() + "/config.json"); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.AddAccount(config.Account{
+		ID:          "advisor-account",
+		Enabled:     true,
+		AccessToken: "advisor-token",
+		ProfileArn:  "arn:aws:codewhisperer:us-east-1:1:profile/advisor",
+	}); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+	pool := accountpool.GetPool()
+	pool.Reload()
+	t.Cleanup(pool.WaitForPendingStats)
+
+	var calls int
+	h := &Handler{
+		pool:        pool,
+		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
+		kiroCaller: func(_ *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
+			calls++
+			model := payload.ConversationState.CurrentMessage.UserInputMessage.ModelID
+			raw, _ := json.Marshal(payload)
+			switch calls {
+			case 1:
+				if model != "claude-opus-4.8" {
+					t.Fatalf("advisor model = %q", model)
+				}
+				ctx := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+				if ctx != nil && len(ctx.Tools) != 0 {
+					t.Fatalf("advisor sub-call received client tools: %#v", ctx.Tools)
+				}
+				callback.OnText("Check the state transition before changing the implementation.", false)
+				callback.OnComplete(11, 7)
+			case 2:
+				if model != "claude-sonnet-4.6" {
+					t.Fatalf("executor model = %q", model)
+				}
+				if !strings.Contains(string(raw), "Check the state transition") {
+					t.Fatalf("executor payload is missing advisor guidance: %s", raw)
+				}
+				ctx := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+				if ctx == nil || len(ctx.Tools) != 1 || ctx.Tools[0].ToolSpecification.Name != "read" {
+					t.Fatalf("executor did not retain the ordinary tool: %#v", ctx)
+				}
+				callback.OnText("Implemented after checking the transition.", false)
+				callback.OnComplete(17, 9)
+			default:
+				t.Fatalf("unexpected upstream call %d", calls)
+			}
+			return nil
+		},
+	}
+
+	body := `{
+		"model":"claude-sonnet-4-6",
+		"max_tokens":4096,
+		"messages":[{"role":"user","content":"Implement the change"}],
+		"tools":[
+			{"name":"Read","description":"Read a file","input_schema":{"type":"object"}},
+			{"type":"advisor_20260301","name":"advisor","model":"claude-opus-4-8"}
+		]
+	}`
+	recorder := httptest.NewRecorder()
+	h.handleClaudeMessagesInternal(
+		recorder,
+		httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body)),
+	)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if calls != 2 {
+		t.Fatalf("upstream calls = %d, want advisor + executor", calls)
+	}
+	var response ClaudeResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(response.Content) < 3 {
+		t.Fatalf("content = %#v", response.Content)
+	}
+	serverUse := response.Content[0]
+	advisorResult := response.Content[1]
+	if serverUse.Type != "server_tool_use" || serverUse.Name != advisorToolName || serverUse.ID == "" {
+		t.Fatalf("server tool block = %#v", serverUse)
+	}
+	if advisorResult.Type != "advisor_tool_result" || advisorResult.ToolUseID != serverUse.ID {
+		t.Fatalf("advisor result block = %#v", advisorResult)
+	}
+	resultContent, ok := advisorResult.Content.(map[string]interface{})
+	if !ok || resultContent["type"] != "advisor_result" || !strings.Contains(fmt.Sprint(resultContent["text"]), "state transition") {
+		t.Fatalf("advisor result content = %#v", advisorResult.Content)
+	}
+	if response.Content[2].Type != "text" || !strings.Contains(response.Content[2].Text, "Implemented") {
+		t.Fatalf("executor response block = %#v", response.Content[2])
+	}
+}
+
+func TestWriteBufferedClaudeSSEPreservesAdvisorBlocks(t *testing.T) {
+	response := KiroToClaudeResponse("final", "", false, nil, 12, 8, "claude-sonnet-4.6")
+	response.Content = append([]ClaudeContentBlock{
+		{Type: "server_tool_use", ID: "srvtoolu_advisor", Name: advisorToolName, Input: map[string]interface{}{}},
+		{
+			Type:      "advisor_tool_result",
+			ToolUseID: "srvtoolu_advisor",
+			Content:   map[string]interface{}{"type": "advisor_result", "text": "review"},
+		},
+	}, response.Content...)
+	recorder := httptest.NewRecorder()
+	if err := writeBufferedClaudeSSE(recorder, response); err != nil {
+		t.Fatalf("writeBufferedClaudeSSE: %v", err)
+	}
+
+	events := decodeWebSearchSSE(t, recorder.Body.String())
+	var serverID, resultID string
+	for _, event := range events {
+		if event.Name != "content_block_start" {
+			continue
+		}
+		block, _ := event.Data["content_block"].(map[string]interface{})
+		switch block["type"] {
+		case "server_tool_use":
+			serverID, _ = block["id"].(string)
+		case "advisor_tool_result":
+			resultID, _ = block["tool_use_id"].(string)
+		}
+	}
+	if serverID != "srvtoolu_advisor" || resultID != serverID {
+		t.Fatalf("advisor stream pairing: server=%q result=%q", serverID, resultID)
 	}
 }
 

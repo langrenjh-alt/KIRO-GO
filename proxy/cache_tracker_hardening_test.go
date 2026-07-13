@@ -192,11 +192,9 @@ func TestPromptCacheLoadRejectsIncompatibleFingerprintVersion(t *testing.T) {
 	}
 }
 
-// TestBuildClaudeProfileReturnsNilWithoutCacheControl is the regression guard for
-// the has_cache_control fast path: a request with no cache_control marker yields
-// a nil profile — identical to the full flatten/hash pass, but without the
-// O(prompt) work. A request carrying cache_control still builds a profile.
-func TestBuildClaudeProfileReturnsNilWithoutCacheControl(t *testing.T) {
+// TestBuildClaudeProfileDefaultsWithoutCacheControl verifies that clients that
+// omit cache_control still receive proxy-side default prompt-cache accounting.
+func TestBuildClaudeProfileDefaultsWithoutCacheControl(t *testing.T) {
 	tr := newPromptCacheTracker(time.Hour)
 
 	// No cache_control anywhere: plain string system + string message content.
@@ -208,8 +206,14 @@ func TestBuildClaudeProfileReturnsNilWithoutCacheControl(t *testing.T) {
 	if claudeRequestHasCacheControl(plain) {
 		t.Fatal("claudeRequestHasCacheControl should be false for a request with no cache_control")
 	}
-	if prof := tr.BuildClaudeProfile(plain, 5000, "test-session"); prof != nil {
-		t.Fatalf("expected nil profile when no cache_control present, got %+v", prof)
+	prof := tr.BuildClaudeProfile(plain, 5000, "test-session")
+	if prof == nil || len(prof.Breakpoints) == 0 {
+		t.Fatalf("expected default profile when no cache_control present, got %+v", prof)
+	}
+	tr.Update("acct-1", prof)
+	repeat := tr.BuildClaudeProfile(plain, 5000, "test-session")
+	if got := tr.Compute("acct-1", repeat).CacheReadInputTokens; got == 0 {
+		t.Fatal("expected default no-marker profile to hit prompt cache")
 	}
 
 	// cache_control on the system block: profile is built (above min-token threshold).

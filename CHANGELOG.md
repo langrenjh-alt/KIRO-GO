@@ -7,6 +7,8 @@
 - Added native Claude Code WebSearch skill support through Kiro's regional MCP
   endpoint, including streaming and non-streaming Messages responses, domain
   filters, retry and rate-limit handling, and usage accounting.
+- Added mixed-tool WebSearch routing, native Responses API `web_search_call`
+  output, and two-stage Advisor execution with paired Claude server-tool blocks.
 - Embedded the complete Admin Web UI in the Go binary. Deployments now need
   only the executable and no longer require a separate `web/` directory.
 - Added reasoning-effort forwarding for Claude Messages, Chat Completions, and
@@ -20,9 +22,8 @@
 - Replaced the traffic page's token trend line chart with an adaptive stacked
   bar chart with clearer axes, time buckets, hover details, and responsive
   desktop and mobile layouts.
-- Preserved typed Claude server-tool metadata and readable server-tool history
-  without translating unsupported Advisor or server tools into Kiro client
-  tools.
+- Preserved typed Claude server-tool metadata and readable server-tool history,
+  including Advisor model settings and paired server-side result blocks.
 - Aligned Claude, Chat Completions, Responses, and WebSearch response envelopes
   and streaming event order with their native protocols, including model ID
   echoing, reasoning signatures, citations, terminal status, and token details.

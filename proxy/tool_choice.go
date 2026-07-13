@@ -68,6 +68,9 @@ func resolveToolChoice(value interface{}) (resolvedToolChoice, error) {
 		}
 		return resolvedToolChoice{Mode: "specific", Name: name}, nil
 	default:
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(choiceType)), "web_search") {
+			return resolvedToolChoice{Mode: "specific", Name: webSearchToolName}, nil
+		}
 		return resolvedToolChoice{}, fmt.Errorf("tool_choice.type must be one of: auto, none, any, required, tool, function")
 	}
 }
@@ -126,9 +129,19 @@ func filterOpenAIToolsForChoice(tools []OpenAITool, choice resolvedToolChoice) [
 		return tools
 	}
 	for _, tool := range tools {
-		if tool.Function.Name == choice.Name {
+		if openAIToolName(tool) == choice.Name {
 			return []OpenAITool{tool}
 		}
 	}
 	return nil
+}
+
+func openAIToolName(tool OpenAITool) string {
+	if name := strings.TrimSpace(tool.Function.Name); name != "" {
+		return name
+	}
+	if isResponsesWebSearchTool(tool) {
+		return webSearchToolName
+	}
+	return ""
 }

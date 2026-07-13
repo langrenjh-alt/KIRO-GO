@@ -38,15 +38,16 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 		h.sendOpenAIError(w, 400, "invalid_request_error", msg)
 		return
 	}
-	if choice, err := resolveToolChoice(req.ToolChoice); err != nil {
+	resolvedChoice, err := resolveToolChoice(req.ToolChoice)
+	if err != nil {
 		h.sendOpenAIError(w, 400, "invalid_request_error", err.Error())
 		return
 	} else {
 		names := make([]string, 0, len(req.Tools))
 		for _, tool := range req.Tools {
-			names = append(names, tool.Function.Name)
+			names = append(names, openAIToolName(tool))
 		}
-		if msg := validateResolvedToolChoice(choice, names); msg != "" {
+		if msg := validateResolvedToolChoice(resolvedChoice, names); msg != "" {
 			h.sendOpenAIError(w, 400, "invalid_request_error", msg)
 			return
 		}
@@ -135,9 +136,17 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	openaiReq.Model = actualModel
 
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(openaiReq)
-	kiroPayload := OpenAIToKiro(openaiReq, thinking)
-
 	respID := generateResponseID()
+	selectedTools := filterOpenAIToolsForChoice(req.Tools, resolvedChoice)
+	if webSearchTool, ok := findResponsesWebSearchTool(selectedTools); ok {
+		h.handleResponsesWebSearch(
+			w, r.Context(), &req, finalMessages, *webSearchTool, actualModel, requestedModel,
+			estimatedInputTokens, apiKeyID, respID, storedInputCopy, storeResponse,
+		)
+		return
+	}
+
+	kiroPayload := OpenAIToKiro(openaiReq, thinking)
 
 	if req.Stream {
 		h.handleResponsesStream(w, kiroPayload, actualModel, requestedModel, thinking, estimatedInputTokens,

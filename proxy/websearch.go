@@ -42,6 +42,20 @@ var supportedWebSearchToolTypes = map[string]struct{}{
 	"web_search_20260318": {},
 }
 
+func isResponsesWebSearchTool(tool OpenAITool) bool {
+	toolType := strings.ToLower(strings.TrimSpace(tool.Type))
+	return toolType == "web_search" || strings.HasPrefix(toolType, "web_search_")
+}
+
+func findResponsesWebSearchTool(tools []OpenAITool) (*OpenAITool, bool) {
+	for i := range tools {
+		if isResponsesWebSearchTool(tools[i]) {
+			return &tools[i], true
+		}
+	}
+	return nil, false
+}
+
 // webSearchMCPError preserves the upstream status so the HTTP handler can map
 // authentication, rate-limit, and provider failures without parsing strings.
 type webSearchMCPError struct {
@@ -145,10 +159,25 @@ func isNativeWebSearchDeclaration(tool ClaudeTool) bool {
 		strings.HasPrefix(strings.TrimSpace(tool.Type), "web_search_")
 }
 
-// hasWebSearchTool identifies the dedicated fast path. Mixed tool requests are
-// intentionally left to the normal Messages flow.
+func findNativeWebSearchTool(req *ClaudeRequest) (*ClaudeTool, bool) {
+	if req == nil {
+		return nil, false
+	}
+	for i := range req.Tools {
+		if isNativeWebSearchTool(req.Tools[i]) {
+			return &req.Tools[i], true
+		}
+	}
+	return nil, false
+}
+
+// hasWebSearchTool identifies requests that contain a supported native search
+// declaration. Claude Code may submit its built-in search alongside the rest
+// of the session tool registry, so the declaration does not need to be the
+// only tool in the request.
 func hasWebSearchTool(req *ClaudeRequest) bool {
-	return req != nil && len(req.Tools) == 1 && isNativeWebSearchTool(req.Tools[0])
+	_, ok := findNativeWebSearchTool(req)
+	return ok
 }
 
 func hasNativeWebSearchDeclaration(req *ClaudeRequest) bool {
@@ -166,6 +195,12 @@ func hasNativeWebSearchDeclaration(req *ClaudeRequest) bool {
 var errNoWebSearchAccounts = errors.New("no available accounts for web search")
 
 type webSearchMCPCaller func(context.Context, *config.Account, string) (*webSearchResultSet, error)
+
+type webSearchExecution struct {
+	Result        *webSearchResultSet
+	Account       *config.Account
+	LastAccountID string
+}
 
 func (h *Handler) handleWebSearchRequest(
 	w http.ResponseWriter,
@@ -189,18 +224,25 @@ func (h *Handler) handleWebSearchRequestWithCaller(
 	apiKeyID string,
 	call webSearchMCPCaller,
 ) {
+	tool, ok := findNativeWebSearchTool(req)
+	if !ok {
+		err := errors.New("web search request does not contain a supported native tool")
+		h.recordFailureWithDetails("claude", req.Model, "", err)
+		h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
 	query, err := extractSearchQuery(req)
 	if err != nil {
 		h.recordFailureWithDetails("claude", req.Model, "", err)
 		h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	if err := validateWebSearchToolOptions(req.Tools[0]); err != nil {
+	if err := validateWebSearchToolOptions(*tool); err != nil {
 		h.recordFailureWithDetails("claude", req.Model, "", err)
 		h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	upstreamQuery := buildWebSearchMCPQuery(query, req.Tools[0])
+	upstreamQuery := buildWebSearchMCPQuery(query, *tool)
 	if utf8.RuneCountInString(upstreamQuery) > webSearchMaxUpstreamRunes {
 		err := fmt.Errorf("web search query and domain filters exceed %d characters", webSearchMaxUpstreamRunes)
 		h.recordFailureWithDetails("claude", req.Model, "", err)
@@ -223,9 +265,52 @@ func (h *Handler) handleWebSearchRequestWithCaller(
 	}
 
 	requestStarted := time.Now()
+	execution, err := h.executeWebSearch(ctx, query, upstreamQuery, *tool, call)
+	if err != nil {
+		lastAccountID := ""
+		if execution != nil {
+			lastAccountID = execution.LastAccountID
+		}
+		h.recordFailureWithDetails("claude", req.Model, lastAccountID, err)
+		if isWebSearchContextError(ctx, err) {
+			return
+		}
+
+		status, errorType, message, retryAfter := mapWebSearchError(err)
+		if retryAfter = safeWebSearchRetryAfter(retryAfter); retryAfter != "" {
+			w.Header().Set("Retry-After", retryAfter)
+		}
+		h.sendClaudeError(w, status, errorType, message)
+		return
+	}
+
+	outputTokens, err := writeWebSearchResponse(w, req, execution.Result, estimatedInputTokens)
+	if err != nil {
+		h.pool.RecordSuccess(execution.Account.ID)
+		h.recordFailureWithDetails("claude", req.Model, execution.Account.ID, err)
+		return
+	}
+
+	h.recordWebSearchSuccess("claude", req.Model, apiKeyID, execution.Account, estimatedInputTokens, outputTokens, requestStarted)
+}
+
+func (h *Handler) executeWebSearch(
+	ctx context.Context,
+	query string,
+	upstreamQuery string,
+	tool ClaudeTool,
+	call webSearchMCPCaller,
+) (*webSearchExecution, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if call == nil {
+		call = callMCPWebSearch
+	}
+
+	execution := &webSearchExecution{}
 	excluded := make(map[string]bool)
 	var lastErr error
-	lastAccountID := ""
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
@@ -241,7 +326,7 @@ func (h *Handler) handleWebSearchRequestWithCaller(
 		if account == nil {
 			break
 		}
-		lastAccountID = account.ID
+		execution.LastAccountID = account.ID
 
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
@@ -281,35 +366,34 @@ func (h *Handler) handleWebSearchRequestWithCaller(
 			continue
 		}
 		result.Query = query
-		result.Results = filterWebSearchResults(result.Results, req.Tools[0])
-
-		outputTokens, err := writeWebSearchResponse(w, req, result, estimatedInputTokens)
-		if err != nil {
-			h.pool.RecordSuccess(account.ID)
-			h.recordFailureWithDetails("claude", req.Model, account.ID, err)
-			return
-		}
-
-		h.recordSuccessForApiKey(apiKeyID, estimatedInputTokens, outputTokens, 0)
-		h.pool.RecordSuccess(account.ID)
-		h.pool.UpdateStats(account.ID, estimatedInputTokens+outputTokens, 0)
-		h.recordSuccessLog("claude", req.Model, account.ID, estimatedInputTokens+outputTokens, 0, time.Since(requestStarted).Milliseconds())
-		return
+		result.Results = filterWebSearchResults(result.Results, tool)
+		execution.Result = result
+		execution.Account = account
+		return execution, nil
 	}
 
 	if lastErr == nil {
 		lastErr = errNoWebSearchAccounts
 	}
-	h.recordFailureWithDetails("claude", req.Model, lastAccountID, lastErr)
-	if isWebSearchContextError(ctx, lastErr) {
+	return execution, lastErr
+}
+
+func (h *Handler) recordWebSearchSuccess(
+	endpoint string,
+	model string,
+	apiKeyID string,
+	account *config.Account,
+	inputTokens int,
+	outputTokens int,
+	started time.Time,
+) {
+	if account == nil {
 		return
 	}
-
-	status, errorType, message, retryAfter := mapWebSearchError(lastErr)
-	if retryAfter = safeWebSearchRetryAfter(retryAfter); retryAfter != "" {
-		w.Header().Set("Retry-After", retryAfter)
-	}
-	h.sendClaudeError(w, status, errorType, message)
+	h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, 0)
+	h.pool.RecordSuccess(account.ID)
+	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, 0)
+	h.recordSuccessLog(endpoint, model, account.ID, inputTokens+outputTokens, 0, time.Since(started).Milliseconds())
 }
 
 func isWebSearchContextError(ctx context.Context, err error) bool {

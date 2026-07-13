@@ -48,6 +48,7 @@ const requestLogsMaxSize = 500
 type Handler struct {
 	pool               *pool.AccountPool
 	webSearchMCPCaller webSearchMCPCaller
+	kiroCaller         kiroAPICaller
 	// 运行时统计 (使用原子操作)
 	totalRequests   int64
 	successRequests int64
@@ -231,7 +232,7 @@ func validateOpenAIRequestShape(req *OpenAIRequest) string {
 	} else {
 		names := make([]string, 0, len(req.Tools))
 		for _, tool := range req.Tools {
-			names = append(names, tool.Function.Name)
+			names = append(names, openAIToolName(tool))
 		}
 		if msg := validateResolvedToolChoice(choice, names); msg != "" {
 			return msg
@@ -942,6 +943,13 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	selectedReq.Tools = filterClaudeToolsForChoice(req.Tools, toolChoice)
 	if hasWebSearchTool(&selectedReq) {
 		h.handleWebSearchRequest(w, r.Context(), &selectedReq, estimatedInputTokens, apiKeyID)
+		return
+	}
+	if _, ok := findNativeAdvisorTool(&selectedReq); ok {
+		isolationSeed := claudePromptCacheIsolationSeed(effectiveReq, apiKeyID, extractProvidedKey(r))
+		h.handleAdvisorRequest(
+			w, &selectedReq, requestedModel, thinking, thinkingResponseOpts, isolationSeed, apiKeyID,
+		)
 		return
 	}
 	if hasNativeWebSearchDeclaration(&selectedReq) {

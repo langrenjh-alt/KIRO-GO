@@ -76,15 +76,21 @@ type ResponsesObject struct {
 }
 
 type ResponseOutputItem struct {
-	ID        string                `json:"id"`
-	Type      string                `json:"type"`
-	Role      string                `json:"role,omitempty"`
-	Status    string                `json:"status,omitempty"`
-	Content   []ResponseContentPart `json:"content,omitempty"`
-	CallID    string                `json:"call_id,omitempty"`
-	Name      string                `json:"name,omitempty"`
-	Arguments string                `json:"arguments,omitempty"`
-	Summary   []ResponseSummaryPart `json:"summary,omitempty"`
+	ID        string                   `json:"id"`
+	Type      string                   `json:"type"`
+	Role      string                   `json:"role,omitempty"`
+	Status    string                   `json:"status,omitempty"`
+	Content   []ResponseContentPart    `json:"content,omitempty"`
+	CallID    string                   `json:"call_id,omitempty"`
+	Name      string                   `json:"name,omitempty"`
+	Arguments string                   `json:"arguments,omitempty"`
+	Summary   []ResponseSummaryPart    `json:"summary,omitempty"`
+	Action    *ResponseWebSearchAction `json:"action,omitempty"`
+}
+
+type ResponseWebSearchAction struct {
+	Type  string `json:"type"`
+	Query string `json:"query,omitempty"`
 }
 
 type ResponseSummaryPart struct {
@@ -93,8 +99,17 @@ type ResponseSummaryPart struct {
 }
 
 type ResponseContentPart struct {
-	Type string `json:"type"`
-	Text string `json:"text,omitempty"`
+	Type        string               `json:"type"`
+	Text        string               `json:"text,omitempty"`
+	Annotations []ResponseAnnotation `json:"annotations,omitempty"`
+}
+
+type ResponseAnnotation struct {
+	Type       string `json:"type"`
+	StartIndex int    `json:"start_index"`
+	EndIndex   int    `json:"end_index"`
+	URL        string `json:"url"`
+	Title      string `json:"title"`
 }
 
 type ResponsesUsage struct {

@@ -65,7 +65,9 @@ func TestPromptCacheStatsExplainSkippedProfiles(t *testing.T) {
 	tracker.BuildClaudeProfile(withMarker, 2000)
 
 	withoutMarker := &ClaudeRequest{Model: "claude-sonnet-4-6", System: "plain system"}
-	tracker.BuildClaudeProfile(withoutMarker, 2000, "tenant")
+	if profile := tracker.BuildClaudeProfile(withoutMarker, 2000, "tenant"); profile == nil {
+		t.Fatal("requests without cache_control should use default prompt-cache accounting")
+	}
 
 	invalidMarker := &ClaudeRequest{
 		Model: "claude-sonnet-4-6",
@@ -78,7 +80,7 @@ func TestPromptCacheStatsExplainSkippedProfiles(t *testing.T) {
 	tracker.BuildClaudeProfile(invalidMarker, 2000, "tenant")
 
 	stats := tracker.Stats()
-	if stats.SkippedNoIsolation != 1 || stats.SkippedNoCacheControl != 1 || stats.SkippedNoBreakpoints != 1 {
+	if stats.SkippedNoIsolation != 1 || stats.SkippedNoCacheControl != 0 || stats.SkippedNoBreakpoints != 1 {
 		t.Fatalf("unexpected skipped-profile counters: %+v", stats)
 	}
 }

@@ -1,0 +1,568 @@
+package proxy
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"strings"
+	"time"
+
+	"kiro-go/config"
+)
+
+const (
+	advisorToolType     = "advisor_20260301"
+	advisorToolName     = "advisor"
+	defaultAdvisorModel = "claude-opus-4.8"
+)
+
+const advisorReviewInstruction = `<advisor_role>
+You are a senior strategy advisor reviewing the full conversation for an executor model. Identify the most important gaps, risks, and next action. Return concise, concrete guidance only. Do not perform client-side tool calls and do not speak as the executor.
+</advisor_role>`
+
+type kiroAPICaller func(*config.Account, *KiroPayload, *KiroStreamCallback) error
+
+type bufferedClaudeCall struct {
+	Account               *config.Account
+	Content               string
+	Reasoning             ClaudeReasoningResult
+	ToolUses              []KiroToolUse
+	InputTokens           int
+	OutputTokens          int
+	Credits               float64
+	UpstreamStopReason    string
+	ContextWindowExceeded bool
+}
+
+var errNoAdvisorAccounts = errors.New("no available accounts for advisor request")
+
+func isNativeAdvisorTool(tool ClaudeTool) bool {
+	return strings.TrimSpace(tool.Type) == advisorToolType && strings.TrimSpace(tool.Name) == advisorToolName
+}
+
+func findNativeAdvisorTool(req *ClaudeRequest) (*ClaudeTool, bool) {
+	if req == nil {
+		return nil, false
+	}
+	for i := range req.Tools {
+		if isNativeAdvisorTool(req.Tools[i]) {
+			return &req.Tools[i], true
+		}
+	}
+	return nil, false
+}
+
+func withoutNativeAdvisorTools(tools []ClaudeTool) []ClaudeTool {
+	filtered := make([]ClaudeTool, 0, len(tools))
+	for _, tool := range tools {
+		if !isNativeAdvisorTool(tool) {
+			filtered = append(filtered, tool)
+		}
+	}
+	return filtered
+}
+
+func (h *Handler) handleAdvisorRequest(
+	w http.ResponseWriter,
+	req *ClaudeRequest,
+	responseModel string,
+	thinking bool,
+	thinkingOpts claudeThinkingResponseOptions,
+	isolationSeed string,
+	apiKeyID string,
+) {
+	if req == nil {
+		h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", "Advisor request is missing")
+		return
+	}
+	if req.Stream {
+		if _, ok := w.(http.Flusher); !ok {
+			h.sendClaudeError(w, http.StatusInternalServerError, "api_error", "Streaming not supported")
+			return
+		}
+	}
+	advisorTool, ok := findNativeAdvisorTool(req)
+	if !ok {
+		h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", "Advisor tool declaration is missing")
+		return
+	}
+
+	started := time.Now()
+	advisorModel := strings.TrimSpace(advisorTool.Model)
+	if advisorModel == "" {
+		advisorModel = defaultAdvisorModel
+	}
+	advisorModel, _ = ParseModelAndThinking(advisorModel, config.GetThinkingConfig().Suffix)
+
+	advisorReq := *req
+	advisorReq.Model = advisorModel
+	advisorReq.responseModel = ""
+	advisorReq.Tools = nil
+	advisorReq.ToolChoice = nil
+	advisorReq.Thinking = nil
+	advisorReq.OutputConfig = nil
+	advisorReq.StopSequences = nil
+	advisorReq.System = appendClaudeSystemText(req.System, advisorReviewInstruction)
+	if advisorTool.MaxTokens > 0 {
+		advisorReq.MaxTokens = advisorTool.MaxTokens
+	} else if advisorReq.MaxTokens <= 0 {
+		advisorReq.MaxTokens = 4096
+	}
+	advisorPayload := ClaudeToKiro(&advisorReq, false)
+	advisorEstimate := estimateClaudeRequestInputTokens(&advisorReq)
+	advisorResult, err := h.callClaudeBuffered(advisorModel, advisorPayload, false, advisorEstimate)
+	if err != nil {
+		h.handleAdvisorFailure(w, req.Model, err)
+		return
+	}
+	advice := strings.TrimSpace(advisorResult.Content)
+	if advice == "" {
+		advice = strings.TrimSpace(advisorResult.Reasoning.Text)
+	}
+	if advice == "" {
+		err := errors.New("advisor model returned no guidance")
+		h.recordFailureWithDetails("claude", req.Model, advisorResult.Account.ID, err)
+		h.sendClaudeError(w, http.StatusBadGateway, "api_error", err.Error())
+		return
+	}
+
+	executorReq := *req
+	executorReq.Tools = withoutNativeAdvisorTools(req.Tools)
+	if choice, _ := resolveToolChoice(req.ToolChoice); choice.Mode == "specific" && choice.Name == advisorToolName {
+		executorReq.ToolChoice = nil
+	}
+	executorReq.Messages = appendClaudeLatestUserText(
+		req.Messages,
+		"\n\n<advisor_result>\n"+advice+"\n</advisor_result>\nUse this guidance while completing the user's request.",
+	)
+	executorEffectiveReq := cloneClaudeRequestForThinking(&executorReq, thinking)
+	executorEstimate := estimateClaudeRequestInputTokens(executorEffectiveReq)
+	var cacheProfile *promptCacheProfile
+	if h.promptCache != nil {
+		cacheProfile = h.promptCache.BuildClaudeProfile(executorEffectiveReq, executorEstimate, isolationSeed)
+	}
+	executorPayload := ClaudeToKiro(&executorReq, thinking)
+	executorResult, err := h.callClaudeBuffered(req.Model, executorPayload, thinking, executorEstimate)
+	if err != nil {
+		h.handleAdvisorFailure(w, req.Model, err)
+		return
+	}
+
+	cacheUsage := promptCacheUsage{}
+	if h.promptCache != nil && executorResult.Account != nil {
+		cacheUsage = h.promptCache.Compute(executorResult.Account.ID, cacheProfile)
+		cacheUsage = reanchorClaudeCacheUsage(cacheProfile, cacheUsage, executorResult.InputTokens)
+		h.promptCache.Update(executorResult.Account.ID, cacheProfile)
+	}
+
+	finalContent, extractedReasoning := extractThinkingFromContent(executorResult.Content)
+	finalContent, matchedStopSequence := truncateAtStopSequence(finalContent, executorPayload.StopSequences)
+	reasoning := executorResult.Reasoning
+	if thinking && reasoning.Text == "" && extractedReasoning != "" {
+		reasoning.Text = extractedReasoning
+	}
+	if !thinking {
+		reasoning = ClaudeReasoningResult{}
+	}
+
+	includeEmptyThinkingBlock := thinking && thinkingOpts.OmitDisplay && reasoning.Text != ""
+	responseReasoning := reasoning
+	if includeEmptyThinkingBlock {
+		responseReasoning.Text = ""
+	}
+	if thinking && responseReasoning.Text != "" {
+		switch thinkingOpts.Format {
+		case "think":
+			finalContent = "<think>" + responseReasoning.Text + "</think>" + finalContent
+			responseReasoning = ClaudeReasoningResult{}
+		case "reasoning_content":
+			finalContent = responseReasoning.Text + finalContent
+			responseReasoning = ClaudeReasoningResult{}
+		}
+	}
+
+	totalInputTokens := advisorResult.InputTokens + executorResult.InputTokens
+	totalOutputTokens := advisorResult.OutputTokens + estimateClaudeOutputTokensWithRedacted(
+		finalContent, reasoning.Text, reasoning.Redacted, executorResult.ToolUses,
+	)
+	resp := KiroToClaudeResponseWithReasoning(
+		finalContent, responseReasoning, includeEmptyThinkingBlock, executorResult.ToolUses,
+		totalInputTokens, totalOutputTokens, responseModel,
+	)
+	toolUseID := "srvtoolu_" + strings.ReplaceAll(generateOutputItemID("advisor"), "advisor_", "")
+	serverBlocks := []ClaudeContentBlock{
+		{Type: "server_tool_use", ID: toolUseID, Name: advisorToolName, Input: map[string]interface{}{}},
+		{
+			Type:      "advisor_tool_result",
+			ToolUseID: toolUseID,
+			Content: map[string]interface{}{
+				"type": "advisor_result",
+				"text": advice,
+			},
+		},
+	}
+	resp.Content = append(serverBlocks, resp.Content...)
+	resp.StopReason = resolveClaudeStopReason(
+		len(executorResult.ToolUses), executorResult.ContextWindowExceeded, executorResult.UpstreamStopReason,
+	)
+	if matchedStopSequence != "" {
+		resp.StopReason = "stop_sequence"
+		resp.StopSequence = &matchedStopSequence
+	}
+	resp.Usage.InputTokens = billedClaudeInputTokens(totalInputTokens, cacheUsage)
+	resp.Usage.OutputTokens = totalOutputTokens
+	resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
+	resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
+	resp.Usage.CacheCreation = &ClaudeCacheCreationUsage{
+		Ephemeral5mInputTokens: cacheUsage.CacheCreation5mInputTokens,
+		Ephemeral1hInputTokens: cacheUsage.CacheCreation1hInputTokens,
+	}
+	if thinking {
+		resp.Usage.OutputTokensDetails = claudeReasoningUsageDetails(reasoning, includeEmptyThinkingBlock)
+	}
+
+	totalCredits := advisorResult.Credits + executorResult.Credits
+	h.recordSuccessForApiKeyWithCache(apiKeyID, totalInputTokens, totalOutputTokens, totalCredits, cacheUsage)
+	accountID := ""
+	if executorResult.Account != nil {
+		accountID = executorResult.Account.ID
+	}
+	h.recordSuccessLog("claude", req.Model, accountID, totalInputTokens+totalOutputTokens, totalCredits, time.Since(started).Milliseconds())
+
+	if req.Stream {
+		if err := writeBufferedClaudeSSE(w, resp); err != nil {
+			h.recordFailureWithDetails("claude", req.Model, accountID, err)
+		}
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		h.recordFailureWithDetails("claude", req.Model, accountID, err)
+	}
+}
+
+func appendClaudeSystemText(system interface{}, text string) interface{} {
+	block := map[string]interface{}{"type": "text", "text": text}
+	switch value := system.(type) {
+	case nil:
+		return []interface{}{block}
+	case string:
+		blocks := make([]interface{}, 0, 2)
+		if value != "" {
+			blocks = append(blocks, map[string]interface{}{"type": "text", "text": value})
+		}
+		return append(blocks, block)
+	case []interface{}:
+		blocks := append([]interface{}(nil), value...)
+		return append(blocks, block)
+	case []string:
+		blocks := make([]interface{}, 0, len(value)+1)
+		for _, item := range value {
+			blocks = append(blocks, map[string]interface{}{"type": "text", "text": item})
+		}
+		return append(blocks, block)
+	default:
+		return []interface{}{block}
+	}
+}
+
+func appendClaudeLatestUserText(messages []ClaudeMessage, text string) []ClaudeMessage {
+	result := append([]ClaudeMessage(nil), messages...)
+	for i := len(result) - 1; i >= 0; i-- {
+		if !strings.EqualFold(strings.TrimSpace(result[i].Role), "user") {
+			continue
+		}
+		block := map[string]interface{}{"type": "text", "text": text}
+		switch content := result[i].Content.(type) {
+		case string:
+			result[i].Content = []interface{}{
+				map[string]interface{}{"type": "text", "text": content},
+				block,
+			}
+		case []interface{}:
+			blocks := append([]interface{}(nil), content...)
+			result[i].Content = append(blocks, block)
+		default:
+			result[i].Content = []interface{}{block}
+		}
+		break
+	}
+	return result
+}
+
+func (h *Handler) callClaudeBuffered(
+	model string,
+	payload *KiroPayload,
+	thinking bool,
+	estimatedInputTokens int,
+) (*bufferedClaudeCall, error) {
+	if h.pool == nil {
+		return nil, errNoAdvisorAccounts
+	}
+	call := h.kiroCaller
+	if call == nil {
+		call = CallKiroAPI
+	}
+	excluded := make(map[string]bool)
+	var lastErr error
+
+	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
+		account := h.pool.GetNextForModelExcluding(model, excluded)
+		if account == nil {
+			break
+		}
+		if err := h.ensureValidToken(account); err != nil {
+			lastErr = err
+			excluded[account.ID] = true
+			h.handleAccountFailure(account, err)
+			continue
+		}
+
+		result := &bufferedClaudeCall{Account: account}
+		var content strings.Builder
+		var reasoning strings.Builder
+		var realInputTokens int
+		callback := &KiroStreamCallback{
+			OnText: func(text string, isThinking bool) {
+				if isThinking && thinking {
+					reasoning.WriteString(text)
+					return
+				}
+				content.WriteString(text)
+			},
+			OnReasoning: func(event KiroReasoningContentEvent) {
+				if thinking {
+					reasoning.WriteString(event.Text)
+					if event.Signature != "" {
+						result.Reasoning.Signature = event.Signature
+					}
+					if event.RedactedContent != "" {
+						result.Reasoning.Redacted = append(result.Reasoning.Redacted, event.RedactedContent)
+					}
+					return
+				}
+				content.WriteString(event.Text)
+			},
+			OnToolUse: func(toolUse KiroToolUse) {
+				result.ToolUses = append(result.ToolUses, toolUse)
+			},
+			OnComplete: func(inputTokens, outputTokens int) {
+				result.InputTokens = inputTokens
+				result.OutputTokens = outputTokens
+			},
+			OnStopReason: func(reason string) {
+				result.UpstreamStopReason = reason
+			},
+			OnCredits: func(credits float64) {
+				result.Credits = credits
+			},
+			OnContextUsage: func(percent float64) {
+				realInputTokens = int(percent * float64(getContextWindowSize(model)) / 100.0)
+				if percent >= 100 {
+					result.ContextWindowExceeded = true
+				}
+			},
+		}
+		if err := call(account, payload, callback); err != nil {
+			lastErr = err
+			if _, protocolErr := kiroStreamProtocolErrorCode(err); protocolErr {
+				return nil, err
+			}
+			excluded[account.ID] = true
+			h.handleAccountFailure(account, err)
+			continue
+		}
+
+		result.Content = content.String()
+		result.Reasoning.Text = reasoning.String()
+		if realInputTokens > 0 {
+			result.InputTokens = realInputTokens
+		} else if result.InputTokens <= 0 {
+			result.InputTokens = max(1, estimatedInputTokens)
+		}
+		result.OutputTokens = estimateClaudeOutputTokensWithRedacted(
+			result.Content, result.Reasoning.Text, result.Reasoning.Redacted, result.ToolUses,
+		)
+		h.pool.RecordSuccess(account.ID)
+		h.pool.UpdateStats(account.ID, result.InputTokens+result.OutputTokens, result.Credits)
+		return result, nil
+	}
+	if lastErr == nil {
+		lastErr = errNoAdvisorAccounts
+	}
+	return nil, lastErr
+}
+
+func (h *Handler) handleAdvisorFailure(w http.ResponseWriter, model string, err error) {
+	h.recordFailureWithDetails("claude", model, "", err)
+	if code, protocolErr := kiroStreamProtocolErrorCode(err); protocolErr {
+		h.sendClaudeError(w, http.StatusBadGateway, code, err.Error())
+		return
+	}
+	if errors.Is(err, errNoAdvisorAccounts) {
+		h.sendClaudeError(w, http.StatusServiceUnavailable, "api_error", "No available accounts")
+		return
+	}
+	h.sendClaudeError(w, http.StatusBadGateway, "api_error", err.Error())
+}
+
+func writeBufferedClaudeSSE(w http.ResponseWriter, response *ClaudeResponse) error {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		return errors.New("streaming advisor response is not supported by the response writer")
+	}
+	if response == nil {
+		return errors.New("advisor response is missing")
+	}
+
+	var body bytes.Buffer
+	startUsage := response.Usage
+	startUsage.OutputTokens = 1
+	startUsage.OutputTokensDetails = nil
+	if err := appendWebSearchSSEEvent(&body, "message_start", map[string]interface{}{
+		"type": "message_start",
+		"message": map[string]interface{}{
+			"id": response.ID, "type": "message", "role": "assistant", "content": []interface{}{},
+			"model": response.Model, "stop_reason": nil, "stop_sequence": nil, "stop_details": nil,
+			"usage": startUsage, "context_management": response.ContextManagement,
+		},
+	}); err != nil {
+		return err
+	}
+
+	pingSent := false
+	for index, block := range response.Content {
+		if err := appendBufferedClaudeBlock(&body, index, block, &pingSent); err != nil {
+			return err
+		}
+	}
+	if err := appendWebSearchSSEEvent(&body, "message_delta", map[string]interface{}{
+		"type": "message_delta",
+		"delta": map[string]interface{}{
+			"stop_reason": response.StopReason, "stop_sequence": response.StopSequence, "stop_details": nil,
+		},
+		"usage": response.Usage,
+	}); err != nil {
+		return err
+	}
+	if err := appendWebSearchSSEEvent(&body, "message_stop", map[string]interface{}{"type": "message_stop"}); err != nil {
+		return err
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	if _, err := w.Write(body.Bytes()); err != nil {
+		return err
+	}
+	flusher.Flush()
+	return nil
+}
+
+func appendBufferedClaudeBlock(body *bytes.Buffer, index int, block ClaudeContentBlock, pingSent *bool) error {
+	sendPing := func() error {
+		if *pingSent {
+			return nil
+		}
+		*pingSent = true
+		return appendWebSearchSSEEvent(body, "ping", map[string]interface{}{"type": "ping"})
+	}
+
+	switch block.Type {
+	case "server_tool_use", "tool_use":
+		startBlock := map[string]interface{}{
+			"type": block.Type, "id": block.ID, "name": block.Name, "input": map[string]interface{}{},
+		}
+		if block.Type == "tool_use" {
+			startBlock["caller"] = map[string]interface{}{"type": "direct"}
+		}
+		if err := appendWebSearchSSEEvent(body, "content_block_start", map[string]interface{}{
+			"type": "content_block_start", "index": index, "content_block": startBlock,
+		}); err != nil {
+			return err
+		}
+		if err := sendPing(); err != nil {
+			return err
+		}
+		inputJSON, err := json.Marshal(block.Input)
+		if err != nil {
+			return err
+		}
+		partialJSON := string(inputJSON)
+		if block.Type == "server_tool_use" && (block.Input == nil || partialJSON == "{}" || partialJSON == "null") {
+			partialJSON = ""
+		}
+		if err := appendWebSearchSSEEvent(body, "content_block_delta", map[string]interface{}{
+			"type": "content_block_delta", "index": index,
+			"delta": map[string]interface{}{"type": "input_json_delta", "partial_json": partialJSON},
+		}); err != nil {
+			return err
+		}
+	case "advisor_tool_result":
+		if err := appendWebSearchSSEEvent(body, "content_block_start", map[string]interface{}{
+			"type": "content_block_start", "index": index, "content_block": block,
+		}); err != nil {
+			return err
+		}
+		if err := sendPing(); err != nil {
+			return err
+		}
+	case "thinking":
+		if err := appendWebSearchSSEEvent(body, "content_block_start", map[string]interface{}{
+			"type": "content_block_start", "index": index,
+			"content_block": map[string]interface{}{"type": "thinking", "thinking": "", "signature": ""},
+		}); err != nil {
+			return err
+		}
+		if err := sendPing(); err != nil {
+			return err
+		}
+		for _, chunk := range chunkWebSearchText(block.Thinking, webSearchSummaryChunkRunes) {
+			if err := appendWebSearchSSEEvent(body, "content_block_delta", map[string]interface{}{
+				"type": "content_block_delta", "index": index,
+				"delta": map[string]interface{}{"type": "thinking_delta", "thinking": chunk},
+			}); err != nil {
+				return err
+			}
+		}
+		if err := appendWebSearchSSEEvent(body, "content_block_delta", map[string]interface{}{
+			"type": "content_block_delta", "index": index,
+			"delta": map[string]interface{}{"type": "signature_delta", "signature": claudeThinkingSignature(block.Signature)},
+		}); err != nil {
+			return err
+		}
+	case "redacted_thinking":
+		if err := appendWebSearchSSEEvent(body, "content_block_start", map[string]interface{}{
+			"type": "content_block_start", "index": index,
+			"content_block": map[string]interface{}{"type": "redacted_thinking", "data": block.Data},
+		}); err != nil {
+			return err
+		}
+		if err := sendPing(); err != nil {
+			return err
+		}
+	default:
+		if err := appendWebSearchSSEEvent(body, "content_block_start", map[string]interface{}{
+			"type": "content_block_start", "index": index,
+			"content_block": map[string]interface{}{"type": "text", "text": ""},
+		}); err != nil {
+			return err
+		}
+		if err := sendPing(); err != nil {
+			return err
+		}
+		for _, chunk := range chunkWebSearchText(block.Text, webSearchSummaryChunkRunes) {
+			if err := appendWebSearchSSEEvent(body, "content_block_delta", map[string]interface{}{
+				"type": "content_block_delta", "index": index,
+				"delta": map[string]interface{}{"type": "text_delta", "text": chunk},
+			}); err != nil {
+				return err
+			}
+		}
+	}
+
+	return appendWebSearchSSEEvent(body, "content_block_stop", map[string]interface{}{
+		"type": "content_block_stop", "index": index,
+	})
+}

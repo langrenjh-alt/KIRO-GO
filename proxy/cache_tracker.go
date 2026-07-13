@@ -108,7 +108,7 @@ type promptCacheTracker struct {
 	evictions             int64 // atomic — LRU pop-backs in evictOverflowLocked
 	expirations           int64 // atomic — TTL removals in pruneExpiredLocked
 	skippedNoIsolation    int64 // atomic — requests without a stable session or client key
-	skippedNoCacheControl int64 // atomic — requests without an explicit cache marker
+	skippedNoCacheControl int64 // atomic legacy counter; default no-marker requests now build profiles
 	skippedNoBreakpoints  int64 // atomic — markers that produced no usable breakpoint
 	dirty                 bool
 	stopChan              chan struct{}
@@ -321,8 +321,7 @@ func interfaceHasCacheControl(v interface{}) bool {
 
 // claudeRequestHasCacheControl reports whether any cache_control marker appears
 // in the request's system or message content. ClaudeTool is a typed struct with
-// no cache_control field, so only system/messages can carry one. Used as the
-// BuildClaudeProfile fast-path guard: no marker → no breakpoints possible → nil.
+// no cache_control field, so only system/messages can carry one.
 func claudeRequestHasCacheControl(req *ClaudeRequest) bool {
 	if req == nil {
 		return false
@@ -338,6 +337,22 @@ func claudeRequestHasCacheControl(req *ClaudeRequest) bool {
 	return false
 }
 
+func defaultPromptCachePrefixBreakpointIndex(blocks []cacheablePromptBlock) int {
+	last := -1
+	for i, block := range blocks {
+		if block.ExcludeFromReusablePrefix {
+			continue
+		}
+		if block.Kind == "message" {
+			break
+		}
+		if block.Kind == "system" || block.Kind == "tool" {
+			last = i
+		}
+	}
+	return last
+}
+
 func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTokens int, isolationSeeds ...string) *promptCacheProfile {
 	isolationSeed := ""
 	if len(isolationSeeds) > 0 {
@@ -348,21 +363,15 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 		return nil
 	}
 
-	// Fast path: if no block carries cache_control, no breakpoint can be
-	// produced — explicit breakpoints need TTL > 0, and implicit message-end
-	// breakpoints only fire once an explicit one has set activeTTL > 0. So a
-	// request with zero cache_control markers yields zero breakpoints and a nil
-	// profile. Skipping the flatten/canonicalize/hash work avoids O(prompt) work
-	// for non-Claude-Code clients that send large prompts without cache_control.
-	// Outcome-identical to the full pass (returns nil iff the pass produces none).
-	if !claudeRequestHasCacheControl(req) {
-		atomic.AddInt64(&t.skippedNoCacheControl, 1)
-		return nil
-	}
+	hasExplicitCacheControl := claudeRequestHasCacheControl(req)
 	blocks := flattenClaudeCacheBlocks(req, t.DefaultTTL())
 	if len(blocks) == 0 {
 		atomic.AddInt64(&t.skippedNoBreakpoints, 1)
 		return nil
+	}
+	defaultPrefixBreakpointIndex := -1
+	if !hasExplicitCacheControl {
+		defaultPrefixBreakpointIndex = defaultPromptCachePrefixBreakpointIndex(blocks)
 	}
 
 	hasher := sha256.New()
@@ -377,7 +386,7 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 	excludedPrefixTokens := 0
 	var activeTTL time.Duration
 
-	for _, block := range blocks {
+	for blockIndex, block := range blocks {
 		if block.ExcludeFromReusablePrefix {
 			excludedPrefixTokens += block.Tokens
 			continue
@@ -391,6 +400,8 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 		//   2) Once any explicit breakpoint has been seen, every message-end
 		//      boundary becomes an implicit breakpoint so that multi-turn
 		//      conversations can hit earlier stored prefixes.
+		//   3) If the request has no cache_control at all, the proxy supplies
+		//      default TTL breakpoints at the reusable prefix and message ends.
 		breakpointTTL := time.Duration(0)
 		if block.TTL > 0 {
 			if activeTTL != block.TTL {
@@ -402,6 +413,13 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 			// A malformed explicit marker must not silently inherit a previous
 			// marker's TTL at this or later message boundaries.
 			activeTTL = 0
+		} else if !hasExplicitCacheControl && (blockIndex == defaultPrefixBreakpointIndex || block.IsMessageEnd) {
+			defaultTTL := t.DefaultTTL()
+			if activeTTL != defaultTTL {
+				writePromptCachePolicyChange(policyHasher, hasher, defaultTTL)
+			}
+			breakpointTTL = defaultTTL
+			activeTTL = defaultTTL
 		} else if block.IsMessageEnd && activeTTL > 0 {
 			breakpointTTL = activeTTL
 		}

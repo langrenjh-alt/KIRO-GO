@@ -17,7 +17,7 @@ import (
 	"time"
 )
 
-func TestHasWebSearchToolAcceptsOnlySupportedSingleNativeTool(t *testing.T) {
+func TestHasWebSearchToolFindsSupportedNativeToolInMixedList(t *testing.T) {
 	for _, toolType := range []string{"web_search_20250305", "web_search_20260209", "web_search_20260318"} {
 		req := &ClaudeRequest{Tools: []ClaudeTool{{Name: "web_search", Type: toolType}}}
 		if !hasWebSearchTool(req) {
@@ -31,15 +31,20 @@ func TestHasWebSearchToolAcceptsOnlySupportedSingleNativeTool(t *testing.T) {
 		{Tools: []ClaudeTool{{Name: "web_search"}}},
 		{Tools: []ClaudeTool{{Name: "web_search", Type: "web_search_20990101"}}},
 		{Tools: []ClaudeTool{{Name: "other", Type: "web_search_20250305"}}},
-		{Tools: []ClaudeTool{
-			{Name: "web_search", Type: "web_search_20250305"},
-			{Name: "Read"},
-		}},
 	}
 	for i, req := range invalid {
 		if hasWebSearchTool(req) {
 			t.Fatalf("case %d unexpectedly used the web search fast path", i)
 		}
+	}
+
+	mixed := &ClaudeRequest{Tools: []ClaudeTool{
+		{Name: "Read"},
+		{Name: "web_search", Type: "web_search_20250305"},
+		{Name: "Write"},
+	}}
+	if !hasWebSearchTool(mixed) {
+		t.Fatal("supported web_search in a mixed tool list must use the fast path")
 	}
 }
 
@@ -75,14 +80,6 @@ func TestHandleClaudeMessagesRejectsUnsupportedWebSearchBeforeMCP(t *testing.T) 
 		content string
 		tools   []ClaudeTool
 	}{
-		{
-			name:    "mixed tools",
-			content: webSearchQueryPrefix + "release notes",
-			tools: []ClaudeTool{
-				{Name: "web_search", Type: "web_search_20250305"},
-				{Name: "Read", InputSchema: map[string]interface{}{"type": "object"}},
-			},
-		},
 		{
 			name:    "unknown version",
 			content: webSearchQueryPrefix + "release notes",
@@ -623,7 +620,10 @@ func TestHandleClaudeMessagesRoutesWebSearchAndRecordsUsage(t *testing.T) {
 		"model":"claude-sonnet-4-6",
 		"max_tokens":1024,
 		"messages":[{"role":"user","content":"Perform a web search for the query: solid state drive news"}],
-		"tools":[{"type":"web_search_20250305","name":"web_search","max_uses":8}]
+		"tools":[
+			{"name":"Read","description":"Read a file","input_schema":{"type":"object"}},
+			{"type":"web_search_20250305","name":"web_search","max_uses":8}
+		]
 	}`
 	request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
 	request = withApiKeyContext(request, &apiKey)

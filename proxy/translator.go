@@ -192,7 +192,10 @@ type ClaudeTool struct {
 	Name           string      `json:"name"`
 	Description    string      `json:"description"`
 	InputSchema    interface{} `json:"input_schema"`
+	Model          string      `json:"model,omitempty"`
 	MaxUses        int         `json:"max_uses,omitempty"`
+	MaxTokens      int         `json:"max_tokens,omitempty"`
+	Caching        interface{} `json:"caching,omitempty"`
 	AllowedDomains []string    `json:"allowed_domains,omitempty"`
 	BlockedDomains []string    `json:"blocked_domains,omitempty"`
 }
@@ -1278,6 +1281,21 @@ type OpenAITool struct {
 		Description string      `json:"description"`
 		Parameters  interface{} `json:"parameters"`
 	} `json:"function"`
+	SearchContextSize string                 `json:"search_context_size,omitempty"`
+	Filters           OpenAIWebSearchFilters `json:"filters,omitempty"`
+	UserLocation      *OpenAIUserLocation    `json:"user_location,omitempty"`
+}
+
+type OpenAIWebSearchFilters struct {
+	AllowedDomains []string `json:"allowed_domains,omitempty"`
+}
+
+type OpenAIUserLocation struct {
+	Type     string `json:"type,omitempty"`
+	Country  string `json:"country,omitempty"`
+	Region   string `json:"region,omitempty"`
+	City     string `json:"city,omitempty"`
+	Timezone string `json:"timezone,omitempty"`
 }
 
 // UnmarshalJSON accepts both the Chat Completions tool shape, where the tool
@@ -1294,11 +1312,14 @@ type OpenAITool struct {
 // which Kiro rejects with HTTP 400 "Improperly formed request".
 func (t *OpenAITool) UnmarshalJSON(data []byte) error {
 	var raw struct {
-		Type        string      `json:"type"`
-		Name        string      `json:"name"`
-		Description string      `json:"description"`
-		Parameters  interface{} `json:"parameters"`
-		Function    *struct {
+		Type              string                 `json:"type"`
+		Name              string                 `json:"name"`
+		Description       string                 `json:"description"`
+		Parameters        interface{}            `json:"parameters"`
+		SearchContextSize string                 `json:"search_context_size"`
+		Filters           OpenAIWebSearchFilters `json:"filters"`
+		UserLocation      *OpenAIUserLocation    `json:"user_location"`
+		Function          *struct {
 			Name        string      `json:"name"`
 			Description string      `json:"description"`
 			Parameters  interface{} `json:"parameters"`
@@ -1309,6 +1330,9 @@ func (t *OpenAITool) UnmarshalJSON(data []byte) error {
 	}
 
 	t.Type = raw.Type
+	t.SearchContextSize = raw.SearchContextSize
+	t.Filters = raw.Filters
+	t.UserLocation = raw.UserLocation
 	if raw.Function != nil {
 		t.Function.Name = raw.Function.Name
 		t.Function.Description = raw.Function.Description
