@@ -38,6 +38,16 @@ func kiroRegion(account *config.Account) string {
 }
 
 func kiroRegionForProfile(account *config.Account, profileArn string) string {
+	// api_key accounts have no profile ARN, so the profile-derived region is
+	// meaningless. Resolve from the EffectiveApiRegion fallback chain
+	// (ApiRegion > Region > global > us-east-1) — the same chain the chat path
+	// (CallKiroAPI) uses — so REST calls (getUsageLimits, ListAvailableModels,
+	// overage) target the same region as chat. Previously the REST path saw only
+	// account.Region, so ApiRegion and the global region were silently ignored,
+	// diverging from the chat path and triggering spurious 403s.
+	if account != nil && account.IsApiKeyCredential() {
+		return account.EffectiveApiRegion()
+	}
 	if r := regionFromProfileArn(profileArn); r != "" {
 		return r
 	}
@@ -260,6 +270,11 @@ func ListAvailableModels(account *config.Account) ([]ModelInfo, error) {
 func ResolveProfileArn(account *config.Account) (string, error) {
 	if account == nil {
 		return "", fmt.Errorf("account is nil")
+	}
+	// api_key accounts authenticate directly (tokentype: API_KEY) and have no
+	// profile ARN. Skip the ListAvailableProfiles probe entirely.
+	if account.IsApiKeyCredential() {
+		return "", nil
 	}
 	if profileArn := strings.TrimSpace(account.ProfileArn); profileArn != "" {
 		return profileArn, nil
@@ -536,7 +551,7 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 		errMsg := err.Error()
 		if strings.Contains(errMsg, "TEMPORARILY_SUSPENDED") {
 			// 账户被暂时封禁，自动禁用并标记封禁状态
-			logger.Warnf("[RefreshAccountInfo] Account %s is temporarily suspended: %v", account.Email, err)
+			logger.Warnf("[RefreshAccountInfo] Account %s is temporarily suspended: %v", accountEmailForLog(account), err)
 
 			// 更新账户封禁状态并自动禁用
 			updatedAccount := *account
@@ -551,9 +566,12 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 			}
 
 			return nil, fmt.Errorf("Account suspended: %w", err)
-		} else if isAuthErrorMessage(errMsg) {
-			// Token 相关错误，可能需要重新认证
-			logger.Warnf("[RefreshAccountInfo] Authentication error for %s: %v", account.Email, err)
+		} else if isAuthErrorMessage(errMsg) && !account.IsApiKeyCredential() {
+			// Token 相关错误，可能需要重新认证。api_key 账户不在 refresh 路径封禁：
+			// usage-limit 403 并非权威信号（可能是 region/配置问题），且 api_key 没有
+			// profile-ARN 跨区探测来交叉验证。chat 路径 (handleAccountFailure) 才是
+			// api_key 有效性的权威来源——真实请求的 403 会在那里封禁。
+			logger.Warnf("[RefreshAccountInfo] Authentication error for %s: %v", accountEmailForLog(account), err)
 
 			// 更新账户封禁状态为认证失败并自动禁用
 			updatedAccount := *account
@@ -573,7 +591,7 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 
 	// 如果成功获取信息，清除封禁状态（如果之前被标记）
 	if account.BanStatus != "" && account.BanStatus != "ACTIVE" {
-		logger.Infof("[RefreshAccountInfo] Account %s is now active, clearing ban status", account.Email)
+		logger.Infof("[RefreshAccountInfo] Account %s is now active, clearing ban status", accountEmailForLog(account))
 
 		updatedAccount := *account
 		updatedAccount.BanStatus = "ACTIVE"

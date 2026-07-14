@@ -15,7 +15,7 @@
 - Anthropic `/v1/messages` 与 OpenAI `/v1/chat/completions`
 - 多账号池轮询负载均衡
 - 自动 Token 刷新、SSE 流式输出、Web 管理面板
-- 多种认证方式：AWS Builder ID、IAM Identity Center (企业 SSO)、SSO Token、本地缓存、凭证 JSON
+- 多种认证方式：AWS Builder ID、IAM Identity Center (企业 SSO)、SSO Token、Kiro API 密钥（单个或批量导入）、本地缓存、凭证 JSON
 - 用量追踪、账号导入导出、中英双语
 - 支持设置出站代理（SOCKS5 / HTTP）
 
