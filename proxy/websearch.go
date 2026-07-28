@@ -953,9 +953,7 @@ func writeWebSearchResponse(
 		return 0, err
 	}
 
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
+	configureSSEHeaders(w)
 	if _, err := w.Write(streamBody); err != nil {
 		return 0, err
 	}

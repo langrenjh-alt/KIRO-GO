@@ -410,9 +410,7 @@ func (h *Handler) handleResponsesStream(
 	estimatedInputTokens int, apiKeyID, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 ) {
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
+	configureSSEHeaders(w)
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {

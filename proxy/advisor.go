@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -144,6 +143,30 @@ func (h *Handler) handleAdvisorRequest(
 		cacheProfile = h.promptCache.BuildClaudeProfile(executorEffectiveReq, executorEstimate, isolationSeed)
 	}
 	executorPayload := ClaudeToKiro(&executorReq, thinking)
+	toolUseID := "srvtoolu_" + strings.ReplaceAll(generateOutputItemID("advisor"), "advisor_", "")
+	serverBlocks := []ClaudeContentBlock{
+		{Type: "server_tool_use", ID: toolUseID, Name: advisorToolName, Input: map[string]interface{}{}},
+		{
+			Type:      "advisor_tool_result",
+			ToolUseID: toolUseID,
+			Content: map[string]interface{}{
+				"type": "advisor_result",
+				"text": advice,
+			},
+		},
+	}
+	if req.Stream {
+		h.handleClaudeStreamWithPrelude(
+			w, executorPayload, req.Model, responseModel, thinking, thinkingOpts, executorEstimate, cacheProfile, apiKeyID,
+			&claudeStreamPrelude{
+				Blocks:       serverBlocks,
+				InputTokens:  advisorResult.InputTokens,
+				OutputTokens: advisorResult.OutputTokens,
+				Credits:      advisorResult.Credits,
+			},
+		)
+		return
+	}
 	executorResult, err := h.callClaudeBuffered(req.Model, executorPayload, thinking, executorEstimate)
 	if err != nil {
 		h.handleAdvisorFailure(w, req.Model, err)
@@ -191,18 +214,6 @@ func (h *Handler) handleAdvisorRequest(
 		finalContent, responseReasoning, includeEmptyThinkingBlock, executorResult.ToolUses,
 		totalInputTokens, totalOutputTokens, responseModel,
 	)
-	toolUseID := "srvtoolu_" + strings.ReplaceAll(generateOutputItemID("advisor"), "advisor_", "")
-	serverBlocks := []ClaudeContentBlock{
-		{Type: "server_tool_use", ID: toolUseID, Name: advisorToolName, Input: map[string]interface{}{}},
-		{
-			Type:      "advisor_tool_result",
-			ToolUseID: toolUseID,
-			Content: map[string]interface{}{
-				"type": "advisor_result",
-				"text": advice,
-			},
-		},
-	}
 	resp.Content = append(serverBlocks, resp.Content...)
 	resp.StopReason = resolveClaudeStopReason(
 		len(executorResult.ToolUses), executorResult.ContextWindowExceeded, executorResult.UpstreamStopReason,
@@ -231,12 +242,6 @@ func (h *Handler) handleAdvisorRequest(
 	}
 	h.recordSuccessLog("claude", req.Model, accountID, totalInputTokens+totalOutputTokens, totalCredits, time.Since(started).Milliseconds())
 
-	if req.Stream {
-		if err := writeBufferedClaudeSSE(w, resp); err != nil {
-			h.recordFailureWithDetails("claude", req.Model, accountID, err)
-		}
-		return
-	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		h.recordFailureWithDetails("claude", req.Model, accountID, err)
@@ -439,164 +444,4 @@ func (h *Handler) handleAdvisorFailure(w http.ResponseWriter, model string, err 
 		return
 	}
 	h.sendClaudeError(w, http.StatusBadGateway, "api_error", err.Error())
-}
-
-func writeBufferedClaudeSSE(w http.ResponseWriter, response *ClaudeResponse) error {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		return errors.New("streaming advisor response is not supported by the response writer")
-	}
-	if response == nil {
-		return errors.New("advisor response is missing")
-	}
-
-	var body bytes.Buffer
-	startUsage := response.Usage
-	startUsage.OutputTokens = 1
-	startUsage.OutputTokensDetails = nil
-	if err := appendWebSearchSSEEvent(&body, "message_start", map[string]interface{}{
-		"type": "message_start",
-		"message": map[string]interface{}{
-			"id": response.ID, "type": "message", "role": "assistant", "content": []interface{}{},
-			"model": response.Model, "stop_reason": nil, "stop_sequence": nil, "stop_details": nil,
-			"usage": startUsage, "context_management": response.ContextManagement,
-		},
-	}); err != nil {
-		return err
-	}
-
-	pingSent := false
-	for index, block := range response.Content {
-		if err := appendBufferedClaudeBlock(&body, index, block, &pingSent); err != nil {
-			return err
-		}
-	}
-	if err := appendWebSearchSSEEvent(&body, "message_delta", map[string]interface{}{
-		"type": "message_delta",
-		"delta": map[string]interface{}{
-			"stop_reason": response.StopReason, "stop_sequence": response.StopSequence, "stop_details": nil,
-		},
-		"usage": response.Usage,
-	}); err != nil {
-		return err
-	}
-	if err := appendWebSearchSSEEvent(&body, "message_stop", map[string]interface{}{"type": "message_stop"}); err != nil {
-		return err
-	}
-
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	if _, err := w.Write(body.Bytes()); err != nil {
-		return err
-	}
-	flusher.Flush()
-	return nil
-}
-
-func appendBufferedClaudeBlock(body *bytes.Buffer, index int, block ClaudeContentBlock, pingSent *bool) error {
-	sendPing := func() error {
-		if *pingSent {
-			return nil
-		}
-		*pingSent = true
-		return appendWebSearchSSEEvent(body, "ping", map[string]interface{}{"type": "ping"})
-	}
-
-	switch block.Type {
-	case "server_tool_use", "tool_use":
-		startBlock := map[string]interface{}{
-			"type": block.Type, "id": block.ID, "name": block.Name, "input": map[string]interface{}{},
-		}
-		if block.Type == "tool_use" {
-			startBlock["caller"] = map[string]interface{}{"type": "direct"}
-		}
-		if err := appendWebSearchSSEEvent(body, "content_block_start", map[string]interface{}{
-			"type": "content_block_start", "index": index, "content_block": startBlock,
-		}); err != nil {
-			return err
-		}
-		if err := sendPing(); err != nil {
-			return err
-		}
-		inputJSON, err := json.Marshal(block.Input)
-		if err != nil {
-			return err
-		}
-		partialJSON := string(inputJSON)
-		if block.Type == "server_tool_use" && (block.Input == nil || partialJSON == "{}" || partialJSON == "null") {
-			partialJSON = ""
-		}
-		if err := appendWebSearchSSEEvent(body, "content_block_delta", map[string]interface{}{
-			"type": "content_block_delta", "index": index,
-			"delta": map[string]interface{}{"type": "input_json_delta", "partial_json": partialJSON},
-		}); err != nil {
-			return err
-		}
-	case "advisor_tool_result":
-		if err := appendWebSearchSSEEvent(body, "content_block_start", map[string]interface{}{
-			"type": "content_block_start", "index": index, "content_block": block,
-		}); err != nil {
-			return err
-		}
-		if err := sendPing(); err != nil {
-			return err
-		}
-	case "thinking":
-		if err := appendWebSearchSSEEvent(body, "content_block_start", map[string]interface{}{
-			"type": "content_block_start", "index": index,
-			"content_block": map[string]interface{}{"type": "thinking", "thinking": "", "signature": ""},
-		}); err != nil {
-			return err
-		}
-		if err := sendPing(); err != nil {
-			return err
-		}
-		for _, chunk := range chunkWebSearchText(block.Thinking, webSearchSummaryChunkRunes) {
-			if err := appendWebSearchSSEEvent(body, "content_block_delta", map[string]interface{}{
-				"type": "content_block_delta", "index": index,
-				"delta": map[string]interface{}{"type": "thinking_delta", "thinking": chunk},
-			}); err != nil {
-				return err
-			}
-		}
-		if err := appendWebSearchSSEEvent(body, "content_block_delta", map[string]interface{}{
-			"type": "content_block_delta", "index": index,
-			"delta": map[string]interface{}{"type": "signature_delta", "signature": claudeThinkingSignature(block.Signature)},
-		}); err != nil {
-			return err
-		}
-	case "redacted_thinking":
-		if err := appendWebSearchSSEEvent(body, "content_block_start", map[string]interface{}{
-			"type": "content_block_start", "index": index,
-			"content_block": map[string]interface{}{"type": "redacted_thinking", "data": block.Data},
-		}); err != nil {
-			return err
-		}
-		if err := sendPing(); err != nil {
-			return err
-		}
-	default:
-		if err := appendWebSearchSSEEvent(body, "content_block_start", map[string]interface{}{
-			"type": "content_block_start", "index": index,
-			"content_block": map[string]interface{}{"type": "text", "text": ""},
-		}); err != nil {
-			return err
-		}
-		if err := sendPing(); err != nil {
-			return err
-		}
-		for _, chunk := range chunkWebSearchText(block.Text, webSearchSummaryChunkRunes) {
-			if err := appendWebSearchSSEEvent(body, "content_block_delta", map[string]interface{}{
-				"type": "content_block_delta", "index": index,
-				"delta": map[string]interface{}{"type": "text_delta", "text": chunk},
-			}); err != nil {
-				return err
-			}
-		}
-	}
-
-	return appendWebSearchSSEEvent(body, "content_block_stop", map[string]interface{}{
-		"type": "content_block_stop", "index": index,
-	})
 }

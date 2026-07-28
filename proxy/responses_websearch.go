@@ -212,9 +212,7 @@ func writeResponsesWebSearchSSE(w http.ResponseWriter, response *ResponsesObject
 	if !ok {
 		return errors.New("streaming web search response is not supported by the response writer")
 	}
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
+	configureSSEHeaders(w)
 
 	sequenceNumber := 0
 	send := func(eventName string, payload map[string]interface{}) error {

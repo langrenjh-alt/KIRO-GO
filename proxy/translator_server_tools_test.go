@@ -1,12 +1,15 @@
 package proxy
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"kiro-go/config"
 	accountpool "kiro-go/pool"
@@ -142,24 +145,118 @@ func TestHandleAdvisorRequestExecutesAdvisorAndExecutorWithMixedTools(t *testing
 	}
 }
 
-func TestWriteBufferedClaudeSSEPreservesAdvisorBlocks(t *testing.T) {
-	response := KiroToClaudeResponse("final", "", false, nil, 12, 8, "claude-sonnet-4.6")
-	response.Content = append([]ClaudeContentBlock{
-		{Type: "server_tool_use", ID: "srvtoolu_advisor", Name: advisorToolName, Input: map[string]interface{}{}},
-		{
-			Type:      "advisor_tool_result",
-			ToolUseID: "srvtoolu_advisor",
-			Content:   map[string]interface{}{"type": "advisor_result", "text": "review"},
+func TestHandleAdvisorRequestStreamsExecutorBeforeCompletion(t *testing.T) {
+	if err := config.Init(t.TempDir() + "/config.json"); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.AddAccount(config.Account{
+		ID:          "advisor-stream-account",
+		Enabled:     true,
+		AccessToken: "advisor-stream-token",
+		ProfileArn:  "arn:aws:codewhisperer:us-east-1:1:profile/advisor-stream",
+	}); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+	pool := accountpool.GetPool()
+	pool.Reload()
+	t.Cleanup(pool.WaitForPendingStats)
+
+	firstExecutorDelta := make(chan struct{})
+	releaseExecutor := make(chan struct{})
+	released := false
+	release := func() {
+		if !released {
+			close(releaseExecutor)
+			released = true
+		}
+	}
+	var calls int
+	h := &Handler{
+		pool:        pool,
+		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
+		kiroCaller: func(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
+			calls++
+			switch calls {
+			case 1:
+				callback.OnText("Review the state transition.", false)
+				callback.OnComplete(11, 5)
+			case 2:
+				callback.OnText("first", false)
+				close(firstExecutorDelta)
+				<-releaseExecutor
+				callback.OnText(" second", false)
+				callback.OnComplete(17, 2)
+			default:
+				t.Fatalf("unexpected upstream call %d", calls)
+			}
+			return nil
 		},
-	}, response.Content...)
-	recorder := httptest.NewRecorder()
-	if err := writeBufferedClaudeSSE(recorder, response); err != nil {
-		t.Fatalf("writeBufferedClaudeSSE: %v", err)
 	}
 
-	events := decodeWebSearchSSE(t, recorder.Body.String())
+	server := httptest.NewServer(http.HandlerFunc(h.handleClaudeMessagesInternal))
+	defer server.Close()
+	defer release()
+	body := `{
+		"model":"claude-sonnet-4-6",
+		"max_tokens":4096,
+		"stream":true,
+		"messages":[{"role":"user","content":"Implement the change"}],
+		"tools":[{"type":"advisor_20260301","name":"advisor","model":"claude-opus-4-8"}]
+	}`
+	type responseResult struct {
+		response *http.Response
+		err      error
+	}
+	responseCh := make(chan responseResult, 1)
+	go func() {
+		resp, err := http.Post(server.URL+"/v1/messages", "application/json", strings.NewReader(body))
+		responseCh <- responseResult{response: resp, err: err}
+	}()
+
+	select {
+	case <-firstExecutorDelta:
+	case <-time.After(time.Second):
+		t.Fatal("executor did not emit its first delta")
+	}
+
+	var result responseResult
+	select {
+	case result = <-responseCh:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("client received no advisor stream before executor completion")
+	}
+	if result.err != nil {
+		t.Fatalf("advisor stream request failed: %v", result.err)
+	}
+	defer result.response.Body.Close()
+	reader := bufio.NewReader(result.response.Body)
+	firstEvent, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read first advisor SSE event: %v", err)
+	}
+	if strings.TrimSpace(firstEvent) != "event: message_start" {
+		t.Fatalf("first advisor SSE event = %q, want message_start", firstEvent)
+	}
+
+	release()
+	rest, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read remaining advisor stream: %v", err)
+	}
+	stream := firstEvent + string(rest)
+	for _, want := range []string{
+		`"type":"server_tool_use"`,
+		`"type":"advisor_tool_result"`,
+		`"text":"first"`,
+		`"text":" second"`,
+		`"type":"message_stop"`,
+	} {
+		if !strings.Contains(stream, want) {
+			t.Fatalf("advisor stream is missing %s: %s", want, stream)
+		}
+	}
 	var serverID, resultID string
-	for _, event := range events {
+	for _, event := range decodeWebSearchSSE(t, stream) {
 		if event.Name != "content_block_start" {
 			continue
 		}
@@ -171,7 +268,7 @@ func TestWriteBufferedClaudeSSEPreservesAdvisorBlocks(t *testing.T) {
 			resultID, _ = block["tool_use_id"].(string)
 		}
 	}
-	if serverID != "srvtoolu_advisor" || resultID != serverID {
+	if serverID == "" || resultID != serverID {
 		t.Fatalf("advisor stream pairing: server=%q result=%q", serverID, resultID)
 	}
 }

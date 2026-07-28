@@ -1,12 +1,15 @@
 package proxy
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func newOpenAIChatContractHandler(t *testing.T, frames ...[]byte) *Handler {
@@ -109,6 +112,98 @@ func TestOpenAIChatStreamContract(t *testing.T) {
 				t.Fatalf("usage = %#v, want internally consistent token counts", usage)
 			}
 		})
+	}
+}
+
+func TestOpenAIChatStreamFlushesShortDeltaBeforeUpstreamCompletes(t *testing.T) {
+	h, cleanup := setupResponsesTestHandler(t)
+	t.Cleanup(cleanup)
+
+	firstFrameSent := make(chan struct{})
+	releaseUpstream := make(chan struct{})
+	released := false
+	release := func() {
+		if !released {
+			close(releaseUpstream)
+			released = true
+		}
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+			"content": "first",
+		}))
+		w.(http.Flusher).Flush()
+		close(firstFrameSent)
+		<-releaseUpstream
+		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+			"content":      " second",
+			"inputTokens":  5,
+			"outputTokens": 2,
+		}))
+	}))
+	defer upstream.Close()
+	defer release()
+	defer swapKiroEndpointsForTest(t, upstream)()
+
+	downstream := httptest.NewServer(http.HandlerFunc(h.handleOpenAIChat))
+	defer downstream.Close()
+
+	type responseResult struct {
+		response *http.Response
+		err      error
+	}
+	responseCh := make(chan responseResult, 1)
+	go func() {
+		req, err := http.NewRequest(http.MethodPost, downstream.URL+"/v1/chat/completions", strings.NewReader(
+			`{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"test"}],"stream":true}`,
+		))
+		if err != nil {
+			responseCh <- responseResult{err: err}
+			return
+		}
+		resp, err := http.DefaultClient.Do(req)
+		responseCh <- responseResult{response: resp, err: err}
+	}()
+
+	select {
+	case <-firstFrameSent:
+	case <-time.After(time.Second):
+		t.Fatal("upstream did not send its first frame")
+	}
+
+	var result responseResult
+	select {
+	case result = <-responseCh:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("client received no response before the upstream stream completed")
+	}
+	if result.err != nil {
+		t.Fatalf("stream request failed: %v", result.err)
+	}
+	defer result.response.Body.Close()
+	if got := result.response.Header.Get("X-Accel-Buffering"); got != "no" {
+		t.Fatalf("X-Accel-Buffering = %q, want no", got)
+	}
+	if got := result.response.Header.Get("Cache-Control"); !strings.Contains(got, "no-transform") {
+		t.Fatalf("Cache-Control = %q, want no-transform", got)
+	}
+
+	reader := bufio.NewReader(result.response.Body)
+	firstEvent, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read first SSE event: %v", err)
+	}
+	if !strings.Contains(firstEvent, `"role":"assistant"`) {
+		t.Fatalf("first SSE event = %q, want assistant role", firstEvent)
+	}
+
+	release()
+	rest, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read remaining stream: %v", err)
+	}
+	if body := firstEvent + string(rest); !strings.Contains(body, `"content":"first"`) || !strings.Contains(body, `"content":" second"`) {
+		t.Fatalf("stream did not preserve both deltas: %s", body)
 	}
 }
 

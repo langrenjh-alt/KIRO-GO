@@ -1027,9 +1027,13 @@ func claudePromptCacheIsolationSeed(req *ClaudeRequest, apiKeyID string, provide
 
 // handleClaudeStream Claude 流式响应
 func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model, responseModel string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
+	h.handleClaudeStreamWithPrelude(
+		w, payload, model, responseModel, thinking, thinkingOpts, estimatedInputTokens, cacheProfile, apiKeyID, nil,
+	)
+}
+
+func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *KiroPayload, model, responseModel string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, prelude *claudeStreamPrelude) {
+	configureSSEHeaders(w)
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -1043,12 +1047,16 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	reqStart := time.Now()
 	msgID := "msg_" + uuid.New().String()
 	startInputTokens := estimatedInputTokens
+	if prelude != nil {
+		startInputTokens += prelude.InputTokens
+	}
 	excluded := make(map[string]bool)
 	retryCounts := make(map[string]int)
 	retrySameID := ""
 	var lastErr error
 	messageStarted := false
 	pingSent := false
+	preludeEmitted := false
 	var messageStartUsage promptCacheUsage
 
 	ensureMessageStart := func() {
@@ -1147,12 +1155,56 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			activeBlockIndex = -1
 			activeBlockType = ""
 		}
+		emitPrelude := func() {
+			if preludeEmitted || prelude == nil || len(prelude.Blocks) == 0 {
+				return
+			}
+			ensureMessageStart()
+			closeActiveBlock()
+			for _, block := range prelude.Blocks {
+				idx := nextContentIndex
+				nextContentIndex++
+
+				switch block.Type {
+				case "server_tool_use", "tool_use":
+					contentBlock := map[string]interface{}{
+						"type": block.Type, "id": block.ID, "name": block.Name, "input": map[string]interface{}{},
+					}
+					if block.Type == "tool_use" {
+						contentBlock["caller"] = map[string]interface{}{"type": "direct"}
+					}
+					h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+						"type": "content_block_start", "index": idx, "content_block": contentBlock,
+					})
+					sendInitialPing()
+					inputJSON, _ := json.Marshal(block.Input)
+					partialJSON := string(inputJSON)
+					if block.Type == "server_tool_use" && (block.Input == nil || partialJSON == "{}" || partialJSON == "null") {
+						partialJSON = ""
+					}
+					h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+						"type": "content_block_delta", "index": idx,
+						"delta": map[string]interface{}{"type": "input_json_delta", "partial_json": partialJSON},
+					})
+				default:
+					h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+						"type": "content_block_start", "index": idx, "content_block": block,
+					})
+					sendInitialPing()
+				}
+				h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
+					"type": "content_block_stop", "index": idx,
+				})
+			}
+			preludeEmitted = true
+		}
 
 		startContentBlock := func(blockType string) {
 			if activeBlockType == blockType {
 				return
 			}
 			ensureMessageStart()
+			emitPrelude()
 			closeActiveBlock()
 
 			idx := nextContentIndex
@@ -1204,6 +1256,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				return
 			}
 			ensureMessageStart()
+			emitPrelude()
 			flushPendingSignatureBlock()
 			closeActiveBlock()
 			eventThinkingOpen = false
@@ -1344,31 +1397,27 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 
 			for {
 				if !inThinkingBlock {
-					thinkingStart := strings.Index(textBuffer, "<thinking>")
+					thinkingStart := strings.Index(textBuffer, thinkingOpenTag)
 					if thinkingStart != -1 {
 						if thinkingStart > 0 {
 							sendText(textBuffer[:thinkingStart], 0)
 						}
-						textBuffer = textBuffer[thinkingStart+10:]
+						textBuffer = textBuffer[thinkingStart+len(thinkingOpenTag):]
 						inThinkingBlock = true
 						dropTagThinking = !allowTagSource(&thinkingSource)
 						thinkingStarted = false
-					} else if forceFlush || len([]rune(textBuffer)) > 50 {
-						runes := []rune(textBuffer)
-						safeLen := len(runes)
-						if !forceFlush {
-							safeLen = max(0, len(runes)-15)
-						}
-						if safeLen > 0 {
-							sendText(string(runes[:safeLen]), 0)
-							textBuffer = string(runes[safeLen:])
-						}
+					} else if forceFlush {
+						sendText(textBuffer, 0)
+						textBuffer = ""
 						break
 					} else {
+						ready, pending := splitBeforePartialTag(textBuffer, thinkingOpenTag)
+						sendText(ready, 0)
+						textBuffer = pending
 						break
 					}
 				} else {
-					thinkingEnd := strings.Index(textBuffer, "</thinking>")
+					thinkingEnd := strings.Index(textBuffer, thinkingCloseTag)
 					if thinkingEnd != -1 {
 						content := textBuffer[:thinkingEnd]
 						if !dropTagThinking {
@@ -1379,7 +1428,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 								sendText(content, 3)
 							}
 						}
-						textBuffer = textBuffer[thinkingEnd+11:]
+						textBuffer = textBuffer[thinkingEnd+len(thinkingCloseTag):]
 						inThinkingBlock = false
 						dropTagThinking = false
 						thinkingStarted = false
@@ -1400,21 +1449,16 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 						thinkingStarted = false
 						break
 					} else {
-						runes := []rune(textBuffer)
-						if len(runes) > 20 {
-							safeLen := len(runes) - 15
-							if safeLen > 0 {
-								if !dropTagThinking {
-									if !thinkingStarted {
-										sendText(string(runes[:safeLen]), 1)
-										thinkingStarted = true
-									} else {
-										sendText(string(runes[:safeLen]), 2)
-									}
-								}
-								textBuffer = string(runes[safeLen:])
+						ready, pending := splitBeforePartialTag(textBuffer, thinkingCloseTag)
+						if ready != "" && !dropTagThinking {
+							if !thinkingStarted {
+								sendText(ready, 1)
+								thinkingStarted = true
+							} else {
+								sendText(ready, 2)
 							}
 						}
+						textBuffer = pending
 						break
 					}
 				}
@@ -1464,6 +1508,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 
 				toolUses = append(toolUses, tu)
 				ensureMessageStart()
+				emitPrelude()
 				closeActiveBlock()
 
 				idx := nextContentIndex
@@ -1515,7 +1560,11 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		call := h.kiroCaller
+		if call == nil {
+			call = CallKiroAPI
+		}
+		err := call(account, payload, callback)
 		h.releaseAccount(account)
 		if err != nil {
 			lastErr = err
@@ -1604,7 +1653,15 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				upstreamStopReason = "max_tokens"
 			}
 		}
-		outputTokens = estimateClaudeOutputTokensWithRedacted(outputContent, thinkingOutput, redactedThinking, toolUses)
+		executorInputTokens := inputTokens
+		executorOutputTokens := estimateClaudeOutputTokensWithRedacted(outputContent, thinkingOutput, redactedThinking, toolUses)
+		executorCredits := credits
+		outputTokens = executorOutputTokens
+		if prelude != nil {
+			inputTokens += prelude.InputTokens
+			outputTokens += prelude.OutputTokens
+			credits += prelude.Credits
+		}
 
 		h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, credits, cacheUsage)
 		h.pool.RecordSuccess(account.ID)
@@ -1612,7 +1669,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		// ↑ dispatch-only latency EWMA (commit fbc99b1), absent on this cache-only
 		//   branch off main. No-op here; stripped so handler compiles against main's
 		//   pool. Re-added verbatim when dispatch lands.
-		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		h.pool.UpdateStats(account.ID, executorInputTokens+executorOutputTokens, executorCredits)
 		h.promptCache.Update(account.ID, cacheProfile)
 		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
@@ -1624,6 +1681,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		}
 
 		ensureMessageStart()
+		emitPrelude()
 		sendInitialPing()
 		finalUsage := buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, true)
 		if thinking {
@@ -2159,9 +2217,7 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 // handleOpenAIStream OpenAI 流式响应
 func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model, responseModel string, thinking, includeUsage bool, estimatedInputTokens int, apiKeyID string) {
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
+	configureSSEHeaders(w)
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -2394,31 +2450,27 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 
 			for {
 				if !inThinkingBlock {
-					thinkingStart := strings.Index(textBuffer, "<thinking>")
+					thinkingStart := strings.Index(textBuffer, thinkingOpenTag)
 					if thinkingStart != -1 {
 						if thinkingStart > 0 {
 							sendChunk(textBuffer[:thinkingStart], 0)
 						}
-						textBuffer = textBuffer[thinkingStart+10:]
+						textBuffer = textBuffer[thinkingStart+len(thinkingOpenTag):]
 						inThinkingBlock = true
 						dropTagThinking = !allowTagSource(&thinkingSource)
 						thinkingStarted = false
-					} else if forceFlush || len([]rune(textBuffer)) > 50 {
-						runes := []rune(textBuffer)
-						safeLen := len(runes)
-						if !forceFlush {
-							safeLen = max(0, len(runes)-15)
-						}
-						if safeLen > 0 {
-							sendChunk(string(runes[:safeLen]), 0)
-							textBuffer = string(runes[safeLen:])
-						}
+					} else if forceFlush {
+						sendChunk(textBuffer, 0)
+						textBuffer = ""
 						break
 					} else {
+						ready, pending := splitBeforePartialTag(textBuffer, thinkingOpenTag)
+						sendChunk(ready, 0)
+						textBuffer = pending
 						break
 					}
 				} else {
-					thinkingEnd := strings.Index(textBuffer, "</thinking>")
+					thinkingEnd := strings.Index(textBuffer, thinkingCloseTag)
 					if thinkingEnd != -1 {
 						content := textBuffer[:thinkingEnd]
 						if !dropTagThinking {
@@ -2429,7 +2481,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 								sendChunk(content, 3)
 							}
 						}
-						textBuffer = textBuffer[thinkingEnd+11:]
+						textBuffer = textBuffer[thinkingEnd+len(thinkingCloseTag):]
 						inThinkingBlock = false
 						dropTagThinking = false
 						thinkingStarted = false
@@ -2450,21 +2502,16 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 						thinkingStarted = false
 						break
 					} else {
-						runes := []rune(textBuffer)
-						if len(runes) > 20 {
-							safeLen := len(runes) - 15
-							if safeLen > 0 {
-								if !dropTagThinking {
-									if !thinkingStarted {
-										sendChunk(string(runes[:safeLen]), 1)
-										thinkingStarted = true
-									} else {
-										sendChunk(string(runes[:safeLen]), 2)
-									}
-								}
-								textBuffer = string(runes[safeLen:])
+						ready, pending := splitBeforePartialTag(textBuffer, thinkingCloseTag)
+						if ready != "" && !dropTagThinking {
+							if !thinkingStarted {
+								sendChunk(ready, 1)
+								thinkingStarted = true
+							} else {
+								sendChunk(ready, 2)
 							}
 						}
+						textBuffer = pending
 						break
 					}
 				}
