@@ -1,0 +1,369 @@
+package config
+
+import (
+	"fmt"
+	"strings"
+)
+
+const (
+	RateLimitModeSwitchAccount  = "switch_account"
+	RateLimitModeRetrySame      = "retry_same"
+	RateLimitModeReturn429      = "return_429"
+	RateLimitModeDisableAccount = "disable_account"
+
+	SchedulingModeLoadBalance   = "load_balance"
+	SchedulingModeLeastRequests = "least_requests"
+	SchedulingModeLeastCredits  = "least_credits"
+	SchedulingModeRoundRobin    = "round_robin"
+
+	AccountLevelAuto    = "auto"
+	AccountLevelFree    = "free"
+	AccountLevelPro     = "pro"
+	AccountLevelProPlus = "pro_plus"
+	AccountLevelPower   = "power"
+	AccountLevelUnknown = "unknown"
+
+	CacheModeNative             = "native"
+	CacheModeFunctionSimulation = "function_simulation"
+
+	FunctionCacheScopeBodyFingerprint = "body_fingerprint"
+)
+
+type RateLimitConfig struct {
+	Mode                   string  `json:"mode,omitempty"`
+	RetrySameAccount       int     `json:"retrySameAccount,omitempty"`
+	DisableSeconds         int     `json:"disableSeconds,omitempty"`
+	SwitchAccountRounds    int     `json:"switchAccountRounds,omitempty"`
+	RetryDelayMs           int     `json:"retryDelayMs,omitempty"`
+	RetryBackoffMultiplier float64 `json:"retryBackoffMultiplier,omitempty"`
+	RetryMaxDelayMs        int     `json:"retryMaxDelayMs,omitempty"`
+}
+
+type SchedulingConfig struct {
+	Mode string `json:"mode,omitempty"`
+}
+
+type AccountPriorityConfig struct {
+	Enabled bool                       `json:"enabled,omitempty"`
+	Rules   []AccountPriorityRouteRule `json:"rules,omitempty"`
+}
+
+type AccountPriorityRouteRule struct {
+	ID            string   `json:"id,omitempty"`
+	Models        []string `json:"models,omitempty"`
+	AccountLevels []string `json:"accountLevels,omitempty"`
+	Enabled       bool     `json:"enabled"`
+}
+
+// FunctionCacheConfig controls the reference-compatible usage simulator. It
+// never injects data into the Kiro payload and only changes returned cache usage.
+type FunctionCacheConfig struct {
+	Enabled               bool   `json:"enabled,omitempty"`
+	SimulatedData         string `json:"simulatedData,omitempty"`
+	SimulatedTokens       int    `json:"simulatedTokens,omitempty"`
+	ScopeMode             string `json:"scopeMode,omitempty"`
+	TTLSeconds            int    `json:"ttlSeconds,omitempty"`
+	TTLJitterPercent      int    `json:"ttlJitterPercent,omitempty"`
+	TokenJitterPercent    int    `json:"tokenJitterPercent,omitempty"`
+	HitRatePercent        *int   `json:"hitRatePercent,omitempty"`
+	MaxCacheReadPercent   *int   `json:"maxCacheReadPercent,omitempty"`
+	MinTokens             int    `json:"minTokens,omitempty"`
+	InputFingerprintChars int    `json:"inputFingerprintChars,omitempty"`
+}
+
+func normalizeRateLimitConfig(c RateLimitConfig) RateLimitConfig {
+	switch strings.TrimSpace(c.Mode) {
+	case RateLimitModeRetrySame, RateLimitModeReturn429, RateLimitModeDisableAccount, RateLimitModeSwitchAccount:
+	default:
+		c.Mode = RateLimitModeSwitchAccount
+	}
+	c.RetrySameAccount = clampPolicyInt(c.RetrySameAccount, 0, 20)
+	if c.DisableSeconds <= 0 {
+		c.DisableSeconds = 60
+	}
+	c.DisableSeconds = clampPolicyInt(c.DisableSeconds, 1, 86400)
+	if c.SwitchAccountRounds <= 0 {
+		c.SwitchAccountRounds = 1
+	}
+	c.SwitchAccountRounds = clampPolicyInt(c.SwitchAccountRounds, 1, 100)
+	if c.RetryDelayMs <= 0 {
+		c.RetryDelayMs = 1000
+	}
+	c.RetryDelayMs = clampPolicyInt(c.RetryDelayMs, 1, 60000)
+	if c.RetryBackoffMultiplier < 1 {
+		c.RetryBackoffMultiplier = 1
+	}
+	if c.RetryBackoffMultiplier > 5 {
+		c.RetryBackoffMultiplier = 5
+	}
+	if c.RetryMaxDelayMs < c.RetryDelayMs {
+		c.RetryMaxDelayMs = c.RetryDelayMs
+	}
+	c.RetryMaxDelayMs = clampPolicyInt(c.RetryMaxDelayMs, c.RetryDelayMs, 300000)
+	return c
+}
+
+func normalizeSchedulingConfig(c SchedulingConfig) SchedulingConfig {
+	switch strings.TrimSpace(c.Mode) {
+	case SchedulingModeLoadBalance, SchedulingModeLeastRequests, SchedulingModeLeastCredits, SchedulingModeRoundRobin:
+	default:
+		// Preserve the current project's historical weighted round-robin behavior
+		// until an operator explicitly selects another scheduling strategy.
+		c.Mode = SchedulingModeRoundRobin
+	}
+	return c
+}
+
+func NormalizeAccountLevel(level string) string {
+	level = strings.ToLower(strings.TrimSpace(level))
+	level = strings.NewReplacer("-", "_", " ", "_").Replace(level)
+	switch level {
+	case "", AccountLevelAuto:
+		return AccountLevelAuto
+	case "free", "trial", "starter":
+		return AccountLevelFree
+	case "pro", "professional":
+		return AccountLevelPro
+	case "pro_plus", "proplus", "plus", "pro+":
+		return AccountLevelProPlus
+	case "power", "ultra", "max":
+		return AccountLevelPower
+	case AccountLevelUnknown:
+		return AccountLevelUnknown
+	default:
+		return level
+	}
+}
+
+func EffectiveAccountLevel(a Account) string {
+	if manual := NormalizeAccountLevel(a.AccountLevel); manual != AccountLevelAuto {
+		return manual
+	}
+	combined := strings.ToLower(a.SubscriptionType + " " + a.SubscriptionTitle)
+	combined = strings.NewReplacer("-", "_", " ", "_").Replace(combined)
+	switch {
+	case strings.Contains(combined, "pro_plus"), strings.Contains(combined, "proplus"), strings.Contains(combined, "pro+"):
+		return AccountLevelProPlus
+	case strings.Contains(combined, "power"):
+		return AccountLevelPower
+	case strings.Contains(combined, "pro"):
+		return AccountLevelPro
+	case strings.Contains(combined, "free"), strings.Contains(combined, "trial"):
+		return AccountLevelFree
+	default:
+		return AccountLevelUnknown
+	}
+}
+
+func normalizeAccountPriorityConfig(c AccountPriorityConfig) AccountPriorityConfig {
+	if len(c.Rules) > 100 {
+		c.Rules = c.Rules[:100]
+	}
+	rules := make([]AccountPriorityRouteRule, 0, len(c.Rules))
+	for _, rule := range c.Rules {
+		models := uniqueNormalized(rule.Models, func(v string) string { return strings.ToLower(strings.TrimSpace(v)) })
+		levels := uniqueNormalized(rule.AccountLevels, func(v string) string {
+			v = NormalizeAccountLevel(v)
+			if v == AccountLevelAuto {
+				return ""
+			}
+			return v
+		})
+		if len(models) == 0 || len(levels) == 0 {
+			continue
+		}
+		rule.ID = strings.TrimSpace(rule.ID)
+		if len(rule.ID) > 64 {
+			rule.ID = rule.ID[:64]
+		}
+		rule.Models = models
+		rule.AccountLevels = levels
+		rules = append(rules, rule)
+	}
+	c.Rules = rules
+	return c
+}
+
+func uniqueNormalized(values []string, normalize func(string) string) []string {
+	seen := make(map[string]bool, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		value = normalize(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		result = append(result, value)
+	}
+	return result
+}
+
+func AccountAllowedForModel(model string, account Account, policy AccountPriorityConfig) bool {
+	policy = normalizeAccountPriorityConfig(policy)
+	if !policy.Enabled || strings.TrimSpace(model) == "" {
+		return true
+	}
+	model = strings.ToLower(strings.TrimSpace(model))
+	level := EffectiveAccountLevel(account)
+	for _, rule := range policy.Rules {
+		if !rule.Enabled {
+			continue
+		}
+		matched := false
+		for _, candidate := range rule.Models {
+			if candidate == "*" || candidate == model {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		for _, allowed := range rule.AccountLevels {
+			if allowed == level {
+				return true
+			}
+		}
+		return false
+	}
+	return true
+}
+
+func normalizeCacheMode(mode string) string {
+	switch strings.TrimSpace(mode) {
+	case CacheModeFunctionSimulation:
+		return CacheModeFunctionSimulation
+	default:
+		return CacheModeNative
+	}
+}
+
+func normalizeFunctionCacheConfig(c FunctionCacheConfig) FunctionCacheConfig {
+	c.ScopeMode = FunctionCacheScopeBodyFingerprint
+	if c.TTLSeconds <= 0 {
+		c.TTLSeconds = 300
+	}
+	c.TTLSeconds = clampPolicyInt(c.TTLSeconds, 1, 86400)
+	c.SimulatedTokens = clampPolicyInt(c.SimulatedTokens, 0, 1000000)
+	c.TTLJitterPercent = clampPolicyInt(c.TTLJitterPercent, 0, 100)
+	c.TokenJitterPercent = clampPolicyInt(c.TokenJitterPercent, 0, 100)
+	if c.HitRatePercent == nil {
+		v := 100
+		c.HitRatePercent = &v
+	} else {
+		v := clampPolicyInt(*c.HitRatePercent, 0, 100)
+		c.HitRatePercent = &v
+	}
+	if c.MaxCacheReadPercent == nil {
+		v := 85
+		c.MaxCacheReadPercent = &v
+	} else {
+		v := clampPolicyInt(*c.MaxCacheReadPercent, 1, 100)
+		c.MaxCacheReadPercent = &v
+	}
+	c.MinTokens = clampPolicyInt(c.MinTokens, 0, 100000)
+	c.InputFingerprintChars = clampPolicyInt(c.InputFingerprintChars, 0, 12000)
+	return c
+}
+
+func clampPolicyInt(value, min, max int) int {
+	if value < min {
+		return min
+	}
+	if value > max {
+		return max
+	}
+	return value
+}
+
+func GetRateLimitConfig() RateLimitConfig {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return normalizeRateLimitConfig(RateLimitConfig{})
+	}
+	return normalizeRateLimitConfig(cfg.RateLimit)
+}
+
+func GetSchedulingConfig() SchedulingConfig {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return normalizeSchedulingConfig(SchedulingConfig{})
+	}
+	return normalizeSchedulingConfig(cfg.Scheduling)
+}
+
+func GetAccountPriorityConfig() AccountPriorityConfig {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return AccountPriorityConfig{}
+	}
+	return normalizeAccountPriorityConfig(cfg.AccountPriority)
+}
+
+func GetCacheMode() string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return CacheModeNative
+	}
+	return normalizeCacheMode(cfg.CacheMode)
+}
+
+func GetFunctionCacheConfig() FunctionCacheConfig {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return normalizeFunctionCacheConfig(FunctionCacheConfig{})
+	}
+	return normalizeFunctionCacheConfig(cfg.FunctionCache)
+}
+
+// UpdateDispatchPolicies validates and persists all low-coupling policy fields
+// as one atomic config update, rolling memory back if persistence fails.
+func UpdateDispatchPolicies(rate *RateLimitConfig, scheduling *SchedulingConfig, priority *AccountPriorityConfig) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg == nil {
+		return fmt.Errorf("config is not initialized")
+	}
+	previousRate, previousScheduling, previousPriority := cfg.RateLimit, cfg.Scheduling, cfg.AccountPriority
+	if rate != nil {
+		cfg.RateLimit = normalizeRateLimitConfig(*rate)
+	}
+	if scheduling != nil {
+		cfg.Scheduling = normalizeSchedulingConfig(*scheduling)
+	}
+	if priority != nil {
+		cfg.AccountPriority = normalizeAccountPriorityConfig(*priority)
+	}
+	if err := Save(); err != nil {
+		cfg.RateLimit, cfg.Scheduling, cfg.AccountPriority = previousRate, previousScheduling, previousPriority
+		return err
+	}
+	return nil
+}
+
+// UpdateCachePolicy switches cache modes and updates simulation settings in one
+// atomic operation. Nil fields preserve existing values.
+func UpdateCachePolicy(mode *string, functionCache *FunctionCacheConfig) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg == nil {
+		return fmt.Errorf("config is not initialized")
+	}
+	previousMode, previousFunctionCache := cfg.CacheMode, cfg.FunctionCache
+	if mode != nil {
+		cfg.CacheMode = normalizeCacheMode(*mode)
+	}
+	if functionCache != nil {
+		cfg.FunctionCache = normalizeFunctionCacheConfig(*functionCache)
+	}
+	if err := Save(); err != nil {
+		cfg.CacheMode, cfg.FunctionCache = previousMode, previousFunctionCache
+		return err
+	}
+	return nil
+}

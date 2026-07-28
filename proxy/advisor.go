@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -305,14 +306,23 @@ func (h *Handler) callClaudeBuffered(
 		call = CallKiroAPI
 	}
 	excluded := make(map[string]bool)
+	retryCounts := make(map[string]int)
+	retrySameID := ""
 	var lastErr error
 
-	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
+	for attempt := 0; attempt < h.maxAccountAttempts(); attempt++ {
+		account, allFull := h.acquireAccountForModel(model, excluded, retrySameID)
+		retrySameID = ""
 		if account == nil {
+			if h.startExpiredAccountRefreshes(model, excluded) {
+				lastErr = errAccountRefreshInProgress
+			} else if allFull {
+				lastErr = fmt.Errorf(allAccountsConcurrencyFullMessage)
+			}
 			break
 		}
 		if err := h.ensureValidToken(account); err != nil {
+			h.releaseAccount(account)
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
@@ -365,14 +375,25 @@ func (h *Handler) callClaudeBuffered(
 			},
 		}
 		if err := call(account, payload, callback); err != nil {
+			h.releaseAccount(account)
 			lastErr = err
 			if _, protocolErr := kiroStreamProtocolErrorCode(err); protocolErr {
 				return nil, err
+			}
+			if isRateLimitError(err) {
+				decision := h.applyRateLimitPolicy(account, retryCounts, excluded)
+				if decision.Return429 {
+					return nil, err
+				}
+				retrySameID = decision.RetrySameID
+				h.sleepBeforeRateLimitRetry(decision)
+				continue
 			}
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			continue
 		}
+		h.releaseAccount(account)
 
 		result.Content = content.String()
 		result.Reasoning.Text = reasoning.String()
@@ -402,6 +423,19 @@ func (h *Handler) handleAdvisorFailure(w http.ResponseWriter, model string, err 
 	}
 	if errors.Is(err, errNoAdvisorAccounts) {
 		h.sendClaudeError(w, http.StatusServiceUnavailable, "api_error", "No available accounts")
+		return
+	}
+	if isAccountRefreshInProgressError(err) {
+		w.Header().Set("Retry-After", fmt.Sprintf("%d", int(expiredAccountRefreshWait.Seconds())))
+		h.sendClaudeError(w, accountRefreshInProgressStatus, "account_refreshing", accountRefreshInProgressMessage)
+		return
+	}
+	if isAllAccountsConcurrencyFullError(err) {
+		h.sendClaudeError(w, http.StatusServiceUnavailable, "overloaded_error", allAccountsConcurrencyFullMessage)
+		return
+	}
+	if isRateLimitError(err) {
+		h.sendClaudeError(w, http.StatusTooManyRequests, "rate_limit_error", err.Error())
 		return
 	}
 	h.sendClaudeError(w, http.StatusBadGateway, "api_error", err.Error())

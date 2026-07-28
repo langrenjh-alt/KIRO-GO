@@ -69,8 +69,16 @@ type Account struct {
 	// Per-account outbound proxy (falls back to global ProxyURL if empty)
 	ProxyURL string `json:"proxyURL,omitempty"`
 
+	// AccountLevel optionally overrides the subscription tier inferred for
+	// model-routing rules. Empty and "auto" both use the upstream tier.
+	AccountLevel string `json:"accountLevel,omitempty"`
+
 	// Priority weight for load balancing (higher = more requests)
 	Weight int `json:"weight,omitempty"` // 0 or 1 = normal, 2+ = higher priority
+
+	// MaxConcurrency limits concurrent leased requests for this account.
+	// Zero means unlimited.
+	MaxConcurrency int `json:"maxConcurrency,omitempty"`
 
 	// Upstream Overages state (mirrored from AWS Q `setUserPreference` / `getUsageLimits`).
 	// OverageStatus is the only switch that decides whether to keep dispatching once UsageLimit is reached.
@@ -242,6 +250,16 @@ type Config struct {
 	// usage quota has been exhausted. When enabled, the pool will not skip accounts
 	// solely because usageCurrent >= usageLimit.
 	AllowOverUsage bool `json:"allowOverUsage,omitempty"`
+
+	// Dispatch and failure policies.
+	RateLimit       RateLimitConfig       `json:"rateLimit,omitempty"`
+	Scheduling      SchedulingConfig      `json:"scheduling,omitempty"`
+	AccountPriority AccountPriorityConfig `json:"accountPriority,omitempty"`
+
+	// CacheMode switches between the native persistent prompt-cache accounting
+	// and the reference project's usage-only function-cache simulation.
+	CacheMode     string              `json:"cacheMode,omitempty"`
+	FunctionCache FunctionCacheConfig `json:"functionCache,omitempty"`
 
 	// Region defaults for accounts that omit per-account region/authRegion/apiRegion.
 	// Defaults to "us-east-1" when empty (see GetGlobalRegion* / Account.Effective*Region).
@@ -917,24 +935,108 @@ func UpdateSettingsPatch(apiKey *string, requireApiKey *bool, password string) e
 }
 
 func UpdateStats(totalReq, successReq, failedReq, totalTokens int, totalCredits float64) error {
+	return UpdateRuntimeStats(totalReq, successReq, failedReq, totalTokens, totalCredits, nil)
+}
+
+// AccountStatsSnapshot is the non-sensitive subset of an account persisted by
+// the periodic runtime statistics flush.
+type AccountStatsSnapshot struct {
+	RequestCount int
+	ErrorCount   int
+	TotalTokens  int
+	TotalCredits float64
+	LastUsed     int64
+}
+
+// UpdateRuntimeStats persists global and per-account counters with one atomic
+// config write. Request handlers only mutate the in-memory pool between flushes.
+func UpdateRuntimeStats(totalReq, successReq, failedReq, totalTokens int, totalCredits float64, accountStats map[string]AccountStatsSnapshot) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	previousTotalReq := cfg.TotalRequests
-	previousSuccessReq := cfg.SuccessRequests
-	previousFailedReq := cfg.FailedRequests
-	previousTotalTokens := cfg.TotalTokens
+	previousTotalReq, previousSuccessReq := cfg.TotalRequests, cfg.SuccessRequests
+	previousFailedReq, previousTotalTokens := cfg.FailedRequests, cfg.TotalTokens
 	previousTotalCredits := cfg.TotalCredits
+	previousAccountStats := make(map[string]AccountStatsSnapshot, len(accountStats))
 	cfg.TotalRequests = totalReq
 	cfg.SuccessRequests = successReq
 	cfg.FailedRequests = failedReq
 	cfg.TotalTokens = totalTokens
 	cfg.TotalCredits = totalCredits
+	for i := range cfg.Accounts {
+		stats, ok := accountStats[cfg.Accounts[i].ID]
+		if !ok {
+			continue
+		}
+		previousAccountStats[cfg.Accounts[i].ID] = AccountStatsSnapshot{
+			RequestCount: cfg.Accounts[i].RequestCount,
+			ErrorCount:   cfg.Accounts[i].ErrorCount,
+			TotalTokens:  cfg.Accounts[i].TotalTokens,
+			TotalCredits: cfg.Accounts[i].TotalCredits,
+			LastUsed:     cfg.Accounts[i].LastUsed,
+		}
+		cfg.Accounts[i].RequestCount = stats.RequestCount
+		cfg.Accounts[i].ErrorCount = stats.ErrorCount
+		cfg.Accounts[i].TotalTokens = stats.TotalTokens
+		cfg.Accounts[i].TotalCredits = stats.TotalCredits
+		cfg.Accounts[i].LastUsed = stats.LastUsed
+	}
 	if err := Save(); err != nil {
 		cfg.TotalRequests = previousTotalReq
 		cfg.SuccessRequests = previousSuccessReq
 		cfg.FailedRequests = previousFailedReq
 		cfg.TotalTokens = previousTotalTokens
 		cfg.TotalCredits = previousTotalCredits
+		for i := range cfg.Accounts {
+			if stats, ok := previousAccountStats[cfg.Accounts[i].ID]; ok {
+				cfg.Accounts[i].RequestCount = stats.RequestCount
+				cfg.Accounts[i].ErrorCount = stats.ErrorCount
+				cfg.Accounts[i].TotalTokens = stats.TotalTokens
+				cfg.Accounts[i].TotalCredits = stats.TotalCredits
+				cfg.Accounts[i].LastUsed = stats.LastUsed
+			}
+		}
+		return err
+	}
+	return nil
+}
+
+// UpdateAccountStatsSnapshots persists account counters in one config write.
+// It is used by explicit pool flushes without touching global runtime totals.
+func UpdateAccountStatsSnapshots(accountStats map[string]AccountStatsSnapshot) error {
+	if len(accountStats) == 0 {
+		return nil
+	}
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	previous := make(map[string]AccountStatsSnapshot, len(accountStats))
+	for i := range cfg.Accounts {
+		stats, ok := accountStats[cfg.Accounts[i].ID]
+		if !ok {
+			continue
+		}
+		previous[cfg.Accounts[i].ID] = AccountStatsSnapshot{
+			RequestCount: cfg.Accounts[i].RequestCount,
+			ErrorCount:   cfg.Accounts[i].ErrorCount,
+			TotalTokens:  cfg.Accounts[i].TotalTokens,
+			TotalCredits: cfg.Accounts[i].TotalCredits,
+			LastUsed:     cfg.Accounts[i].LastUsed,
+		}
+		cfg.Accounts[i].RequestCount = stats.RequestCount
+		cfg.Accounts[i].ErrorCount = stats.ErrorCount
+		cfg.Accounts[i].TotalTokens = stats.TotalTokens
+		cfg.Accounts[i].TotalCredits = stats.TotalCredits
+		cfg.Accounts[i].LastUsed = stats.LastUsed
+	}
+	if err := Save(); err != nil {
+		for i := range cfg.Accounts {
+			if stats, ok := previous[cfg.Accounts[i].ID]; ok {
+				cfg.Accounts[i].RequestCount = stats.RequestCount
+				cfg.Accounts[i].ErrorCount = stats.ErrorCount
+				cfg.Accounts[i].TotalTokens = stats.TotalTokens
+				cfg.Accounts[i].TotalCredits = stats.TotalCredits
+				cfg.Accounts[i].LastUsed = stats.LastUsed
+			}
+		}
 		return err
 	}
 	return nil

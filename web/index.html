@@ -619,9 +619,57 @@
           <button class="btn btn-primary" id="saveOverUsageBtn" data-i18n="settings.saveUsage"></button>
         </div>
 
+        <!-- Dispatch policies -->
+        <div class="card">
+          <div class="card-header"><span class="card-title" data-i18n="settings.dispatchPolicies"></span></div>
+          <div class="form-grid">
+            <div class="form-group">
+              <label for="schedulingMode" data-i18n="settings.schedulingMode"></label>
+              <select id="schedulingMode">
+                <option value="load_balance" data-i18n="settings.scheduleLoadBalance"></option>
+                <option value="least_requests" data-i18n="settings.scheduleLeastRequests"></option>
+                <option value="least_credits" data-i18n="settings.scheduleLeastCredits"></option>
+                <option value="round_robin" data-i18n="settings.scheduleRoundRobin"></option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="rateLimitMode" data-i18n="settings.rateLimitMode"></label>
+              <select id="rateLimitMode">
+                <option value="switch_account" data-i18n="settings.rateSwitchAccount"></option>
+                <option value="retry_same" data-i18n="settings.rateRetrySame"></option>
+                <option value="return_429" data-i18n="settings.rateReturn429"></option>
+                <option value="disable_account" data-i18n="settings.rateDisableAccount"></option>
+              </select>
+            </div>
+            <div class="form-group"><label for="retrySameAccount" data-i18n="settings.retrySameAccount"></label><input type="number" id="retrySameAccount" min="0" max="20" value="0" /></div>
+            <div class="form-group"><label for="switchAccountRounds" data-i18n="settings.switchAccountRounds"></label><input type="number" id="switchAccountRounds" min="1" max="100" value="1" /></div>
+            <div class="form-group"><label for="disableSeconds" data-i18n="settings.disableSeconds"></label><input type="number" id="disableSeconds" min="1" max="86400" value="60" /></div>
+            <div class="form-group"><label for="retryDelayMs" data-i18n="settings.retryDelayMs"></label><input type="number" id="retryDelayMs" min="1" max="60000" value="1000" /></div>
+            <div class="form-group"><label for="retryBackoffMultiplier" data-i18n="settings.retryBackoffMultiplier"></label><input type="number" id="retryBackoffMultiplier" min="1" max="5" step="0.1" value="1" /></div>
+            <div class="form-group"><label for="retryMaxDelayMs" data-i18n="settings.retryMaxDelayMs"></label><input type="number" id="retryMaxDelayMs" min="1" max="300000" value="1000" /></div>
+          </div>
+          <div class="form-group">
+            <label class="flex items-center gap-2"><span class="switch"><input type="checkbox" id="accountPriorityEnabled" /><span class="slider"></span></span><span data-i18n="settings.accountPriorityEnabled"></span></label>
+          </div>
+          <div class="form-group">
+            <label for="accountPriorityRules" data-i18n="settings.accountPriorityRules"></label>
+            <textarea id="accountPriorityRules" rows="6" spellcheck="false" placeholder='[{"id":"opus","models":["claude-opus-4.8"],"accountLevels":["power"],"enabled":true}]'></textarea>
+            <small data-i18n="settings.accountPriorityRulesHint"></small>
+          </div>
+          <button class="btn btn-primary" id="saveDispatchPoliciesBtn" data-i18n="settings.saveDispatchPolicies"></button>
+        </div>
+
         <!-- Prompt cache settings -->
         <div class="card">
           <div class="card-header"><span class="card-title" data-i18n="settings.promptCacheSettings"></span></div>
+          <div class="form-group">
+            <label for="cacheMode" data-i18n="settings.cacheMode"></label>
+            <select id="cacheMode">
+              <option value="native" data-i18n="settings.cacheModeNative"></option>
+              <option value="function_simulation" data-i18n="settings.cacheModeFunction"></option>
+            </select>
+          </div>
+          <div id="nativeCacheFields">
           <div class="form-group">
             <label for="promptCacheMaxRatio" data-i18n="settings.promptCacheMaxRatio"></label>
             <input type="number" id="promptCacheMaxRatio" min="0.01" max="1" step="0.01" value="0.85" />
@@ -639,6 +687,22 @@
               <option value="3600" data-i18n="settings.promptCacheTTL1h"></option>
             </select>
             <small data-i18n="settings.promptCacheTTLHint"></small>
+          </div>
+          </div>
+          <div id="functionCacheFields" class="hidden">
+            <div class="form-group"><label class="flex items-center gap-2"><span class="switch"><input type="checkbox" id="functionCacheEnabled" /><span class="slider"></span></span><span data-i18n="settings.functionCacheEnabled"></span></label></div>
+            <div class="form-group"><label for="functionSimulatedData" data-i18n="settings.functionSimulatedData"></label><textarea id="functionSimulatedData" rows="4" spellcheck="false"></textarea></div>
+            <div class="form-grid">
+              <div class="form-group"><label for="functionSimulatedTokens" data-i18n="settings.functionSimulatedTokens"></label><input type="number" id="functionSimulatedTokens" min="0" max="1000000" value="0" /></div>
+              <div class="form-group"><label for="functionTTLSeconds" data-i18n="settings.functionTTLSeconds"></label><input type="number" id="functionTTLSeconds" min="1" max="86400" value="300" /></div>
+              <div class="form-group"><label for="functionTTLJitter" data-i18n="settings.functionTTLJitter"></label><input type="number" id="functionTTLJitter" min="0" max="100" value="0" /></div>
+              <div class="form-group"><label for="functionTokenJitter" data-i18n="settings.functionTokenJitter"></label><input type="number" id="functionTokenJitter" min="0" max="100" value="0" /></div>
+              <div class="form-group"><label for="functionHitRate" data-i18n="settings.functionHitRate"></label><input type="number" id="functionHitRate" min="0" max="100" value="100" /></div>
+              <div class="form-group"><label for="functionMaxRead" data-i18n="settings.functionMaxRead"></label><input type="number" id="functionMaxRead" min="1" max="100" value="85" /></div>
+              <div class="form-group"><label for="functionMinTokens" data-i18n="settings.functionMinTokens"></label><input type="number" id="functionMinTokens" min="0" max="100000" value="0" /></div>
+              <div class="form-group"><label for="functionFingerprintChars" data-i18n="settings.functionFingerprintChars"></label><input type="number" id="functionFingerprintChars" min="0" max="12000" value="0" /></div>
+            </div>
+            <small data-i18n="settings.functionCacheHint"></small>
           </div>
           <button class="btn btn-primary" id="savePromptCacheBtn" data-i18n="settings.savePromptCache"></button>
         </div>

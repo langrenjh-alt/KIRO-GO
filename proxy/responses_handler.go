@@ -164,15 +164,24 @@ func (h *Handler) handleResponsesNonStream(
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 ) {
 	excluded := make(map[string]bool)
+	retryCounts := make(map[string]int)
+	retrySameID := ""
 	var lastErr error
 	reqStart := time.Now()
 
-	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
+	for attempt := 0; attempt < h.maxAccountAttempts(); attempt++ {
+		account, allFull := h.acquireAccountForModel(model, excluded, retrySameID)
+		retrySameID = ""
 		if account == nil {
+			if h.startExpiredAccountRefreshes(model, excluded) {
+				lastErr = errAccountRefreshInProgress
+			} else if allFull {
+				lastErr = fmt.Errorf(allAccountsConcurrencyFullMessage)
+			}
 			break
 		}
 		if err := h.ensureValidToken(account); err != nil {
+			h.releaseAccount(account)
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
@@ -212,12 +221,24 @@ func (h *Handler) handleResponsesNonStream(
 		}
 
 		err := CallKiroAPI(account, payload, callback)
+		h.releaseAccount(account)
 		if err != nil {
 			lastErr = err
 			if code, protocolErr := kiroStreamProtocolErrorCode(err); protocolErr {
 				h.recordFailureWithDetails("responses", model, account.ID, err)
 				h.sendOpenAIError(w, http.StatusBadGateway, code, err.Error())
 				return
+			}
+			if isRateLimitError(err) {
+				decision := h.applyRateLimitPolicy(account, retryCounts, excluded)
+				if decision.Return429 {
+					h.recordFailureWithDetails("responses", model, account.ID, err)
+					h.sendOpenAIError(w, http.StatusTooManyRequests, "rate_limit_error", err.Error())
+					return
+				}
+				retrySameID = decision.RetrySameID
+				h.sleepBeforeRateLimitRetry(decision)
+				continue
 			}
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
@@ -260,11 +281,24 @@ func (h *Handler) handleResponsesNonStream(
 
 	if lastErr == nil {
 		h.recordFailureWithDetails("responses", model, "", fmt.Errorf("No available accounts"))
-		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
+		h.sendOpenAIError(w, http.StatusServiceUnavailable, "server_error", "No available accounts")
 		return
 	}
 	h.recordFailureWithDetails("responses", model, "", lastErr)
-	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
+	if isAccountRefreshInProgressError(lastErr) {
+		w.Header().Set("Retry-After", fmt.Sprintf("%d", int(expiredAccountRefreshWait.Seconds())))
+		h.sendOpenAIError(w, accountRefreshInProgressStatus, "account_refreshing", accountRefreshInProgressMessage)
+		return
+	}
+	if isAllAccountsConcurrencyFullError(lastErr) {
+		h.sendOpenAIError(w, http.StatusServiceUnavailable, "server_error", allAccountsConcurrencyFullMessage)
+		return
+	}
+	if isRateLimitError(lastErr) {
+		h.sendOpenAIError(w, http.StatusTooManyRequests, "rate_limit_error", lastErr.Error())
+		return
+	}
+	h.sendOpenAIError(w, http.StatusInternalServerError, "server_error", lastErr.Error())
 }
 
 func buildResponsesObject(
@@ -420,16 +454,25 @@ func (h *Handler) handleResponsesStream(
 	})
 
 	excluded := make(map[string]bool)
+	retryCounts := make(map[string]int)
+	retrySameID := ""
 	var lastErr error
 	responseStarted := false
 	reqStart := time.Now()
 
-	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
+	for attempt := 0; attempt < h.maxAccountAttempts(); attempt++ {
+		account, allFull := h.acquireAccountForModel(model, excluded, retrySameID)
+		retrySameID = ""
 		if account == nil {
+			if h.startExpiredAccountRefreshes(model, excluded) {
+				lastErr = errAccountRefreshInProgress
+			} else if allFull {
+				lastErr = fmt.Errorf(allAccountsConcurrencyFullMessage)
+			}
 			break
 		}
 		if err := h.ensureValidToken(account); err != nil {
+			h.releaseAccount(account)
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
@@ -698,6 +741,7 @@ func (h *Handler) handleResponsesStream(
 		}
 
 		err := CallKiroAPI(account, payload, callback)
+		h.releaseAccount(account)
 		if err != nil {
 			if code, protocolErr := kiroStreamProtocolErrorCode(err); protocolErr {
 				send("response.failed", map[string]interface{}{
@@ -706,6 +750,37 @@ func (h *Handler) handleResponsesStream(
 						"id":     respID,
 						"status": "failed",
 						"error":  map[string]string{"type": code, "message": err.Error()},
+					},
+				})
+				h.recordFailureWithDetails("responses", model, account.ID, err)
+				return
+			}
+			if isRateLimitError(err) {
+				lastErr = err
+				decision := h.applyRateLimitPolicy(account, retryCounts, excluded)
+				if decision.Return429 {
+					send("response.failed", map[string]interface{}{
+						"type": "response.failed",
+						"response": map[string]interface{}{
+							"id":     respID,
+							"status": "failed",
+							"error":  map[string]string{"type": "rate_limit_error", "message": err.Error()},
+						},
+					})
+					h.recordFailureWithDetails("responses", model, account.ID, err)
+					return
+				}
+				retrySameID = decision.RetrySameID
+				if !responseStarted {
+					h.sleepBeforeRateLimitRetry(decision)
+					continue
+				}
+				send("response.failed", map[string]interface{}{
+					"type": "response.failed",
+					"response": map[string]interface{}{
+						"id":     respID,
+						"status": "failed",
+						"error":  map[string]string{"type": "rate_limit_error", "message": err.Error()},
 					},
 				})
 				h.recordFailureWithDetails("responses", model, account.ID, err)
@@ -801,14 +876,24 @@ func (h *Handler) handleResponsesStream(
 		return
 	}
 	h.recordFailureWithDetails("responses", model, "", lastErr)
+	errType := "server_error"
+	errMessage := lastErr.Error()
+	if isAccountRefreshInProgressError(lastErr) {
+		errType = "account_refreshing"
+		errMessage = accountRefreshInProgressMessage
+	} else if isAllAccountsConcurrencyFullError(lastErr) {
+		errMessage = allAccountsConcurrencyFullMessage
+	} else if isRateLimitError(lastErr) {
+		errType = "rate_limit_error"
+	}
 	send("response.failed", map[string]interface{}{
 		"type": "response.failed",
 		"response": map[string]interface{}{
 			"id":     respID,
 			"status": "failed",
 			"error": map[string]string{
-				"type":    "server_error",
-				"message": lastErr.Error(),
+				"type":    errType,
+				"message": errMessage,
 			},
 		},
 	})

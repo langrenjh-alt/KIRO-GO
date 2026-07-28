@@ -1,37 +1,21 @@
 // Package pool 账号池管理
-// 实现轮询负载均衡、错误冷却、Token 刷新
+// 实现轮询负载均衡、错误冷却、Token 刷新、账号级并发控制
 package pool
 
 import (
-	"kiro-go/config"
-	"kiro-go/logger"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"kiro-go/config"
 )
 
 const (
 	tokenRefreshSkewSeconds int64 = 120
 	statsPersistAttempts          = 3
 )
-
-// AccountPool 账号池
-type AccountPool struct {
-	mu              sync.RWMutex
-	statsWriterOnce sync.Once
-	statsWriterMu   sync.Mutex
-	statsWriterCond *sync.Cond
-	statsWrites     sync.WaitGroup
-	statsQueue      []string
-	statsPending    map[string]accountStatsUpdate
-	accounts        []config.Account
-	totalAccounts   int
-	currentIndex    uint64
-	cooldowns       map[string]time.Time       // 账号冷却时间
-	errorCounts     map[string]int             // 连续错误计数
-	modelLists      map[string]map[string]bool // accountID → set of modelIDs (from ListAvailableModels)
-}
 
 type accountStatsUpdate struct {
 	id           string
@@ -40,6 +24,18 @@ type accountStatsUpdate struct {
 	totalTokens  int
 	totalCredits float64
 	lastUsed     int64
+}
+
+// AccountPool 账号池
+type AccountPool struct {
+	mu            sync.RWMutex
+	accounts      []config.Account
+	totalAccounts int
+	currentIndex  uint64
+	cooldowns     map[string]time.Time       // 账号冷却时间
+	errorCounts   map[string]int             // 连续错误计数
+	modelLists    map[string]map[string]bool // accountID → set of modelIDs (from ListAvailableModels)
+	inFlight      map[string]int             // accountID → 当前并发占用数
 }
 
 var (
@@ -54,6 +50,7 @@ func GetPool() *AccountPool {
 			cooldowns:   make(map[string]time.Time),
 			errorCounts: make(map[string]int),
 			modelLists:  make(map[string]map[string]bool),
+			inFlight:    make(map[string]int),
 		}
 		pool.Reload()
 	})
@@ -68,14 +65,33 @@ func GetPool() *AccountPool {
 func (p *AccountPool) Reload() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	// An older persisted snapshot must not replace newer in-memory counters.
-	// UpdateStats also holds p.mu while enqueueing, so no new write can be added
-	// until this barrier has completed.
-	p.statsWrites.Wait()
 	enabled := config.GetEnabledAccounts()
 	allowOverUsage := config.GetAllowOverUsage()
+	// Config may not yet contain counters accumulated since the last 30-second
+	// flush. Preserve the newer in-memory values across policy/account reloads.
+	liveStats := make(map[string]config.AccountStatsSnapshot)
+	for i := range p.accounts {
+		account := p.accounts[i]
+		if _, exists := liveStats[account.ID]; exists {
+			continue
+		}
+		liveStats[account.ID] = config.AccountStatsSnapshot{
+			RequestCount: account.RequestCount,
+			ErrorCount:   account.ErrorCount,
+			TotalTokens:  account.TotalTokens,
+			TotalCredits: account.TotalCredits,
+			LastUsed:     account.LastUsed,
+		}
+	}
 	var weighted []config.Account
 	for _, a := range enabled {
+		if stats, ok := liveStats[a.ID]; ok {
+			a.RequestCount = stats.RequestCount
+			a.ErrorCount = stats.ErrorCount
+			a.TotalTokens = stats.TotalTokens
+			a.TotalCredits = stats.TotalCredits
+			a.LastUsed = stats.LastUsed
+		}
 		if isQuotaBlocked(a, allowOverUsage) {
 			continue
 		}
@@ -86,85 +102,338 @@ func (p *AccountPool) Reload() {
 	}
 	p.accounts = weighted
 	p.totalAccounts = len(enabled)
+	if p.inFlight == nil {
+		p.inFlight = make(map[string]int)
+	}
+	active := make(map[string]bool)
+	for _, a := range enabled {
+		active[a.ID] = true
+	}
+	for id := range p.inFlight {
+		if !active[id] {
+			delete(p.inFlight, id)
+		}
+	}
 }
 
-// GetNext 获取下一个可用账号（加权轮询）
+// GetNext 获取下一个可用账号（不占用并发，仅用于兼容测试/旧调用）
 func (p *AccountPool) GetNext() *config.Account {
 	return p.GetNextExcluding(nil)
 }
 
-// GetNextExcluding 获取下一个可用账号（加权轮询），并跳过指定账号。
+// GetNextExcluding 获取下一个可用账号（不占用并发），并跳过指定账号。
 func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+	acc, _ := p.selectNextLocked("", excluded, false, config.GetSchedulingConfig().Mode)
+	return copyAccount(acc)
+}
 
-	if len(p.accounts) == 0 {
-		return nil
+// AcquireNextForModelExcluding selects a usable account for the model and increments
+// its in-flight counter atomically. The bool is true when there are otherwise usable
+// accounts, but every one of them has reached its configured concurrency limit.
+func (p *AccountPool) AcquireNextForModelExcluding(model string, excluded map[string]bool) (*config.Account, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	acc, allFull := p.selectNextLocked(model, excluded, true, config.GetSchedulingConfig().Mode)
+	if acc != nil {
+		p.inFlight[acc.ID]++
 	}
+	return copyAccount(acc), allFull
+}
 
-	allowOverUsage := config.GetAllowOverUsage()
+// AcquireByIDForModel tries to acquire a specific account, respecting model support,
+// cooldown, quota, token freshness, exclusion, and per-account concurrency.
+func (p *AccountPool) AcquireByIDForModel(id, model string, excluded map[string]bool) (*config.Account, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	now := time.Now()
-	n := len(p.accounts)
-	seen := make(map[string]bool)
-
-	// 加权轮询查找可用账号
-	for i := 0; i < n; i++ {
-		idx := atomic.AddUint64(&p.currentIndex, 1) % uint64(n)
-		acc := &p.accounts[idx]
-
-		if excluded != nil && excluded[acc.ID] {
-			seen[acc.ID] = true
+	allowOverUsage := config.GetAllowOverUsage()
+	for i := range p.accounts {
+		acc := &p.accounts[i]
+		if acc.ID != id {
 			continue
 		}
+		if !p.isSelectableLocked(acc, model, excluded, now, allowOverUsage) {
+			return nil, false
+		}
+		if p.isConcurrencyFullLocked(acc) {
+			return nil, true
+		}
+		p.inFlight[acc.ID]++
+		return copyAccount(acc), false
+	}
+	return nil, false
+}
+
+// Release decrements the in-flight counter for an account acquired by Acquire*.
+func (p *AccountPool) Release(id string) {
+	if id == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.inFlight[id] <= 1 {
+		delete(p.inFlight, id)
+		return
+	}
+	p.inFlight[id]--
+}
+
+// InFlight returns the current in-flight request count for an account.
+func (p *AccountPool) InFlight(id string) int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.inFlight[id]
+}
+
+// AvailabilitySnapshot describes why the scheduler can or cannot select accounts
+// for a request. It is intentionally read-only and used by handlers to distinguish
+// "no accounts configured" from "accounts are temporarily refreshing tokens".
+type AvailabilitySnapshot struct {
+	Selectable      int
+	Full            int
+	Expired         int
+	ExpiredAccounts []config.Account
+}
+
+func tokenNeedsRefresh(acc *config.Account, now time.Time) bool {
+	return acc != nil && acc.ExpiresAt > 0 && now.Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds
+}
+
+// InspectAvailability reports accounts that are otherwise usable for model but
+// skipped because their access token is expired/near expiry. The checks mirror
+// isSelectableLocked, except token freshness is returned separately.
+func (p *AccountPool) InspectAvailability(model string, excluded map[string]bool) AvailabilitySnapshot {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	allowOverUsage := config.GetAllowOverUsage()
+	seen := make(map[string]bool)
+	snap := AvailabilitySnapshot{}
+
+	for i := range p.accounts {
+		acc := &p.accounts[i]
 		if seen[acc.ID] {
 			continue
 		}
-
-		// 跳过冷却中的账号
-		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
-			seen[acc.ID] = true
-			continue
-		}
-
-		// 跳过即将过期的 Token
-		if acc.ExpiresAt > 0 && time.Now().Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
-			seen[acc.ID] = true
-			continue
-		}
-
-		// Skip accounts whose quota is exhausted, unless overrides apply.
-		if isQuotaBlocked(*acc, allowOverUsage) {
-			seen[acc.ID] = true
-			continue
-		}
-
-		return copyAccount(acc)
-	}
-
-	// 无可用账号，返回冷却时间最短的（排除额度用尽的，除非允许超额）
-	var best *config.Account
-	var earliest time.Time
-	for i := range p.accounts {
-		acc := &p.accounts[i]
+		seen[acc.ID] = true
 		if excluded != nil && excluded[acc.ID] {
 			continue
 		}
+		if model != "" && !p.accountHasModel(acc.ID, model) {
+			continue
+		}
+		if model != "" && !config.AccountAllowedForModel(model, *acc, config.GetAccountPriorityConfig()) {
+			continue
+		}
+		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
+			continue
+		}
 		if isQuotaBlocked(*acc, allowOverUsage) {
 			continue
 		}
-		if cooldown, ok := p.cooldowns[acc.ID]; ok {
-			if best == nil || cooldown.Before(earliest) {
-				best = acc
-				earliest = cooldown
-			}
-		} else {
-			return copyAccount(acc)
+		if tokenNeedsRefresh(acc, now) {
+			snap.Expired++
+			snap.ExpiredAccounts = append(snap.ExpiredAccounts, *acc)
+			continue
 		}
+		if p.isConcurrencyFullLocked(acc) {
+			snap.Full++
+			continue
+		}
+		snap.Selectable++
 	}
-	if best != nil {
-		return copyAccount(best)
+	return snap
+}
+
+func (p *AccountPool) selectNextLocked(model string, excluded map[string]bool, respectConcurrency bool, mode string) (*config.Account, bool) {
+	if len(p.accounts) == 0 {
+		return nil, false
 	}
-	return nil
+	switch mode {
+	case config.SchedulingModeRoundRobin:
+		return p.selectRoundRobinLocked(model, excluded, respectConcurrency)
+	case config.SchedulingModeLeastRequests:
+		return p.selectLeastRequestsLocked(model, excluded, respectConcurrency)
+	case config.SchedulingModeLeastCredits:
+		return p.selectLeastCreditsLocked(model, excluded, respectConcurrency)
+	case config.SchedulingModeLoadBalance:
+		return p.selectCreditBalanceLocked(model, excluded, respectConcurrency)
+	default:
+		return p.selectCreditBalanceLocked(model, excluded, respectConcurrency)
+	}
+}
+
+func (p *AccountPool) selectRoundRobinLocked(model string, excluded map[string]bool, respectConcurrency bool) (*config.Account, bool) {
+	allowOverUsage := config.GetAllowOverUsage()
+	now := time.Now()
+	n := len(p.accounts)
+	eligible := 0
+	full := 0
+
+	// Do not de-duplicate IDs here: p.accounts is already a weighted list, so
+	// duplicate entries are the intended way weight influences round-robin order.
+	for i := 0; i < n; i++ {
+		idx := (atomic.AddUint64(&p.currentIndex, 1) - 1) % uint64(n)
+		acc := &p.accounts[idx]
+		if !p.isSelectableLocked(acc, model, excluded, now, allowOverUsage) {
+			continue
+		}
+		eligible++
+		if respectConcurrency && p.isConcurrencyFullLocked(acc) {
+			full++
+			continue
+		}
+		return acc, false
+	}
+	return nil, eligible > 0 && full == eligible
+}
+
+func (p *AccountPool) collectUniqueCandidatesLocked(model string, excluded map[string]bool, respectConcurrency bool) ([]*config.Account, int, int) {
+	allowOverUsage := config.GetAllowOverUsage()
+	now := time.Now()
+	seen := make(map[string]bool)
+	candidates := make([]*config.Account, 0)
+	eligible := 0
+	full := 0
+
+	for i := range p.accounts {
+		acc := &p.accounts[i]
+		if seen[acc.ID] {
+			continue
+		}
+		seen[acc.ID] = true
+		if !p.isSelectableLocked(acc, model, excluded, now, allowOverUsage) {
+			continue
+		}
+		eligible++
+		if respectConcurrency && p.isConcurrencyFullLocked(acc) {
+			full++
+			continue
+		}
+		candidates = append(candidates, acc)
+	}
+
+	return candidates, eligible, full
+}
+
+func (p *AccountPool) selectLeastRequestsLocked(model string, excluded map[string]bool, respectConcurrency bool) (*config.Account, bool) {
+	candidates, eligible, full := p.collectUniqueCandidatesLocked(model, excluded, respectConcurrency)
+	if len(candidates) == 0 {
+		return nil, eligible > 0 && full == eligible
+	}
+
+	// “最少请求优先”按当前账号并发数选择；历史请求数只作为平局兜底，
+	// 避免低并发账号在持续并发场景中被饿死。
+	sort.SliceStable(candidates, func(i, j int) bool {
+		ci := p.inFlight[candidates[i].ID]
+		cj := p.inFlight[candidates[j].ID]
+		if ci != cj {
+			return ci < cj
+		}
+		if candidates[i].LastUsed != candidates[j].LastUsed {
+			return candidates[i].LastUsed < candidates[j].LastUsed
+		}
+		if candidates[i].RequestCount != candidates[j].RequestCount {
+			return candidates[i].RequestCount < candidates[j].RequestCount
+		}
+		return effectiveWeight(candidates[i].Weight) > effectiveWeight(candidates[j].Weight)
+	})
+
+	return candidates[0], false
+}
+
+func (p *AccountPool) selectLeastCreditsLocked(model string, excluded map[string]bool, respectConcurrency bool) (*config.Account, bool) {
+	candidates, eligible, full := p.collectUniqueCandidatesLocked(model, excluded, respectConcurrency)
+	if len(candidates) == 0 {
+		return nil, eligible > 0 && full == eligible
+	}
+
+	// “最少积分优先”按当前账号已消耗积分的绝对值选择。
+	sort.SliceStable(candidates, func(i, j int) bool {
+		ci := accountCreditUsage(*candidates[i])
+		cj := accountCreditUsage(*candidates[j])
+		if ci != cj {
+			return ci < cj
+		}
+		if p.inFlight[candidates[i].ID] != p.inFlight[candidates[j].ID] {
+			return p.inFlight[candidates[i].ID] < p.inFlight[candidates[j].ID]
+		}
+		return candidates[i].LastUsed < candidates[j].LastUsed
+	})
+
+	return candidates[0], false
+}
+
+func (p *AccountPool) selectCreditBalanceLocked(model string, excluded map[string]bool, respectConcurrency bool) (*config.Account, bool) {
+	candidates, eligible, full := p.collectUniqueCandidatesLocked(model, excluded, respectConcurrency)
+	if len(candidates) == 0 {
+		return nil, eligible > 0 && full == eligible
+	}
+
+	// “负载均衡”按积分消耗分配：选择 normalized consumed credits 最低的账号。
+	// 权重大于 1 的账号可承担更多消耗，因此分数按 weight 折算。
+	sort.SliceStable(candidates, func(i, j int) bool {
+		si := accountCreditBalanceScore(*candidates[i])
+		sj := accountCreditBalanceScore(*candidates[j])
+		if si != sj {
+			return si < sj
+		}
+		if p.inFlight[candidates[i].ID] != p.inFlight[candidates[j].ID] {
+			return p.inFlight[candidates[i].ID] < p.inFlight[candidates[j].ID]
+		}
+		if candidates[i].LastUsed != candidates[j].LastUsed {
+			return candidates[i].LastUsed < candidates[j].LastUsed
+		}
+		return candidates[i].RequestCount < candidates[j].RequestCount
+	})
+
+	return candidates[0], false
+}
+
+func accountCreditUsage(acc config.Account) float64 {
+	if acc.UsageCurrent > 0 {
+		return acc.UsageCurrent
+	}
+	return acc.TotalCredits
+}
+
+func accountCreditBalanceScore(acc config.Account) float64 {
+	weight := effectiveWeight(acc.Weight)
+	return accountCreditUsage(acc) / float64(weight)
+}
+
+func (p *AccountPool) isSelectableLocked(acc *config.Account, model string, excluded map[string]bool, now time.Time, allowOverUsage bool) bool {
+	if acc == nil {
+		return false
+	}
+	if excluded != nil && excluded[acc.ID] {
+		return false
+	}
+	if model != "" && !p.accountHasModel(acc.ID, model) {
+		return false
+	}
+	if model != "" && !config.AccountAllowedForModel(model, *acc, config.GetAccountPriorityConfig()) {
+		return false
+	}
+	if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
+		return false
+	}
+	if tokenNeedsRefresh(acc, now) {
+		return false
+	}
+	if isQuotaBlocked(*acc, allowOverUsage) {
+		return false
+	}
+	return true
+}
+
+func (p *AccountPool) isConcurrencyFullLocked(acc *config.Account) bool {
+	if acc == nil || acc.MaxConcurrency <= 0 {
+		return false
+	}
+	return p.inFlight[acc.ID] >= acc.MaxConcurrency
 }
 
 // SetModelList 缓存账号支持的模型集合（由 handler 在刷新后调用）
@@ -191,6 +460,28 @@ func (p *AccountPool) GetModelList(accountID string) []string {
 	for id := range set {
 		ids = append(ids, id)
 	}
+	sort.Strings(ids)
+	return ids
+}
+
+// GetAllCachedModelIDs returns a sorted union of every cached account model ID.
+func (p *AccountPool) GetAllCachedModelIDs() []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	set := make(map[string]bool)
+	for _, models := range p.modelLists {
+		for id := range models {
+			trimmed := strings.TrimSpace(id)
+			if trimmed != "" {
+				set[trimmed] = true
+			}
+		}
+	}
+	ids := make([]string, 0, len(set))
+	for id := range set {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
 	return ids
 }
 
@@ -204,84 +495,18 @@ func (p *AccountPool) accountHasModel(accountID, model string) bool {
 	return list[strings.ToLower(strings.TrimSpace(model))]
 }
 
-// GetNextForModel 获取下一个支持指定模型的可用账号。
+// GetNextForModel 获取下一个支持指定模型的可用账号（不占用并发）。
 // model 应为去掉 thinking 后缀的实际模型名。
-// 若无账号有该模型列表数据，行为与 GetNext 相同（乐观路由）。
 func (p *AccountPool) GetNextForModel(model string) *config.Account {
 	return p.GetNextForModelExcluding(model, nil)
 }
 
-// GetNextForModelExcluding 获取下一个支持指定模型的可用账号，并跳过指定账号。
+// GetNextForModelExcluding 获取下一个支持指定模型的可用账号（不占用并发），并跳过指定账号。
 func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string]bool) *config.Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-
-	if len(p.accounts) == 0 {
-		return nil
-	}
-
-	allowOverUsage := config.GetAllowOverUsage()
-	now := time.Now()
-	n := len(p.accounts)
-	seen := make(map[string]bool)
-
-	for i := 0; i < n; i++ {
-		idx := atomic.AddUint64(&p.currentIndex, 1) % uint64(n)
-		acc := &p.accounts[idx]
-
-		if excluded != nil && excluded[acc.ID] {
-			seen[acc.ID] = true
-			continue
-		}
-		if seen[acc.ID] {
-			continue
-		}
-		if !p.accountHasModel(acc.ID, model) {
-			seen[acc.ID] = true
-			continue
-		}
-		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
-			seen[acc.ID] = true
-			continue
-		}
-		if acc.ExpiresAt > 0 && time.Now().Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
-			seen[acc.ID] = true
-			continue
-		}
-		if isQuotaBlocked(*acc, allowOverUsage) {
-			seen[acc.ID] = true
-			continue
-		}
-		return copyAccount(acc)
-	}
-
-	// fallback：找冷却时间最短且支持该模型的账号
-	var best *config.Account
-	var earliest time.Time
-	for i := range p.accounts {
-		acc := &p.accounts[i]
-		if excluded != nil && excluded[acc.ID] {
-			continue
-		}
-		if !p.accountHasModel(acc.ID, model) {
-			continue
-		}
-		if isQuotaBlocked(*acc, allowOverUsage) {
-			continue
-		}
-		if cooldown, ok := p.cooldowns[acc.ID]; ok {
-			if best == nil || cooldown.Before(earliest) {
-				best = acc
-				earliest = cooldown
-			}
-		} else {
-			return copyAccount(acc)
-		}
-	}
-	if best != nil {
-		return copyAccount(best)
-	}
-	return nil
+	acc, _ := p.selectNextLocked(model, excluded, false, config.GetSchedulingConfig().Mode)
+	return copyAccount(acc)
 }
 
 // GetByID 根据 ID 获取账号
@@ -318,6 +543,24 @@ func (p *AccountPool) RecordError(id string, isQuotaError bool) {
 		// 连续 3 次错误，冷却 1 分钟
 		p.cooldowns[id] = time.Now().Add(time.Minute)
 	}
+}
+
+// CooldownAccount temporarily removes an account from scheduling for duration.
+func (p *AccountPool) CooldownAccount(id string, duration time.Duration) {
+	if id == "" || duration <= 0 {
+		return
+	}
+	p.mu.Lock()
+	p.cooldowns[id] = time.Now().Add(duration)
+	p.errorCounts[id]++
+	p.mu.Unlock()
+}
+
+// RecordRateLimit records a 429 without applying the legacy one-hour quota cooldown.
+func (p *AccountPool) RecordRateLimit(id string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.errorCounts[id]++
 }
 
 // IsAuthFailure reports whether an error indicates the refresh token / credentials
@@ -455,6 +698,9 @@ func (p *AccountPool) AvailableCount() int {
 		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
 			continue
 		}
+		if p.isConcurrencyFullLocked(&acc) {
+			continue
+		}
 		count++
 	}
 	return count
@@ -491,69 +737,49 @@ func (p *AccountPool) UpdateStats(id string, tokens int, credits float64) {
 			p.accounts[i].LastUsed = lastUsed
 		}
 	}
-	if updated {
-		p.enqueueStatsWrite(accountStatsUpdate{
-			id:           id,
-			requestCount: requestCount,
-			errorCount:   errorCount,
-			totalTokens:  totalTokens,
-			totalCredits: totalCredits,
-			lastUsed:     lastUsed,
-		})
-	}
+	_ = updated
 }
 
-func (p *AccountPool) enqueueStatsWrite(update accountStatsUpdate) {
-	p.statsWriterOnce.Do(func() {
-		p.statsPending = make(map[string]accountStatsUpdate)
-		p.statsWriterCond = sync.NewCond(&p.statsWriterMu)
-		go p.runStatsWriter()
-	})
-
-	p.statsWriterMu.Lock()
-	if _, queued := p.statsPending[update.id]; !queued {
-		p.statsWrites.Add(1)
-		p.statsQueue = append(p.statsQueue, update.id)
+// SnapshotAccountStats returns one stats snapshot per unique account. The
+// handler periodically flushes these snapshots to config.json in a single
+// batched write instead of writing the config once per successful request.
+func (p *AccountPool) SnapshotAccountStats() map[string]config.AccountStatsSnapshot {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	stats := make(map[string]config.AccountStatsSnapshot)
+	for i := range p.accounts {
+		acc := p.accounts[i]
+		if acc.ID == "" {
+			continue
+		}
+		if _, seen := stats[acc.ID]; seen {
+			continue
+		}
+		stats[acc.ID] = config.AccountStatsSnapshot{
+			RequestCount: acc.RequestCount,
+			ErrorCount:   acc.ErrorCount,
+			TotalTokens:  acc.TotalTokens,
+			TotalCredits: acc.TotalCredits,
+			LastUsed:     acc.LastUsed,
+		}
 	}
-	p.statsPending[update.id] = update
-	p.statsWriterCond.Signal()
-	p.statsWriterMu.Unlock()
+	return stats
 }
 
-func (p *AccountPool) runStatsWriter() {
-	for {
-		p.statsWriterMu.Lock()
-		for len(p.statsQueue) == 0 {
-			p.statsWriterCond.Wait()
-		}
-		id := p.statsQueue[0]
-		p.statsQueue[0] = ""
-		p.statsQueue = p.statsQueue[1:]
-		if len(p.statsQueue) == 0 {
-			p.statsQueue = nil
-		}
-		pending := p.statsPending[id]
-		delete(p.statsPending, id)
-		p.statsWriterMu.Unlock()
-
-		if err := persistAccountStats(pending); err != nil {
-			logger.Warnf("[AccountPool] failed to persist stats for %s: %v", pending.id, err)
-		}
-		p.statsWrites.Done()
+// WaitForPendingStats performs an explicit batched flush. Statistics normally
+// stay in memory until Handler's 30-second/final flush, so this method no longer
+// waits for or creates a per-request writer goroutine.
+func (p *AccountPool) WaitForPendingStats() {
+	if p == nil {
+		return
 	}
+	_ = persistAccountStatsSnapshots(p.SnapshotAccountStats())
 }
 
-func persistAccountStats(update accountStatsUpdate) error {
+func persistAccountStatsSnapshots(stats map[string]config.AccountStatsSnapshot) error {
 	var err error
 	for attempt := 0; attempt < statsPersistAttempts; attempt++ {
-		err = config.UpdateAccountStats(
-			update.id,
-			update.requestCount,
-			update.errorCount,
-			update.totalTokens,
-			update.totalCredits,
-			update.lastUsed,
-		)
+		err = config.UpdateAccountStatsSnapshots(stats)
 		if err == nil {
 			return nil
 		}
@@ -564,15 +790,18 @@ func persistAccountStats(update accountStatsUpdate) error {
 	return err
 }
 
-// WaitForPendingStats waits until queued per-account persistence attempts have
-// finished. Updates that start after this method returns belong to a later flush.
-func (p *AccountPool) WaitForPendingStats() {
-	if p == nil {
-		return
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.statsWrites.Wait()
+// persistAccountStats is kept for package compatibility and tests. Runtime
+// request paths use the batch function above.
+func persistAccountStats(update accountStatsUpdate) error {
+	return persistAccountStatsSnapshots(map[string]config.AccountStatsSnapshot{
+		update.id: {
+			RequestCount: update.requestCount,
+			ErrorCount:   update.errorCount,
+			TotalTokens:  update.totalTokens,
+			TotalCredits: update.totalCredits,
+			LastUsed:     update.lastUsed,
+		},
+	})
 }
 
 // GetAllAccounts 获取所有账号副本
@@ -608,9 +837,10 @@ func effectiveWeight(weight int) int {
 	return weight
 }
 
-// copyAccount returns a shallow copy of the account, safe to use after
-// the pool lock is released.
 func copyAccount(acc *config.Account) *config.Account {
-	c := *acc
-	return &c
+	if acc == nil {
+		return nil
+	}
+	copy := *acc
+	return &copy
 }

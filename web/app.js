@@ -1728,6 +1728,7 @@
     const a = accountsData.find(x => x.id === id);
     if (!a) return;
     const idAttr = escapeAttr(id);
+	const accountLevel = a.accountLevel || 'auto';
     $('detailBody').innerHTML =
       '<div class="detail-section"><h4>' + escapeHtml(t('detail.basicInfo')) + '</h4><div class="detail-grid">' +
       detailItem(t('detail.email'), getDisplayEmail(a.email, null)) +
@@ -1749,6 +1750,21 @@
       '</div>' +
       '<button class="btn btn-sm btn-primary" data-detail-action="saveWeight" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
       '</div>' +
+
+	  '<div class="detail-section"><h4>' + escapeHtml(t('detail.dispatchLimits')) + '</h4>' +
+	  '<div class="form-grid">' +
+	  '<div class="form-group"><label for="accountLevelInput">' + escapeHtml(t('detail.accountLevel')) + '</label><select id="accountLevelInput">' +
+	  '<option value="auto"' + (accountLevel === 'auto' ? ' selected' : '') + '>' + escapeHtml(t('detail.levelAuto')) + '</option>' +
+	  '<option value="free"' + (accountLevel === 'free' ? ' selected' : '') + '>' + escapeHtml(t('detail.levelFree')) + '</option>' +
+	  '<option value="pro"' + (accountLevel === 'pro' ? ' selected' : '') + '>' + escapeHtml(t('detail.levelPro')) + '</option>' +
+	  '<option value="pro_plus"' + (accountLevel === 'pro_plus' ? ' selected' : '') + '>' + escapeHtml(t('detail.levelProPlus')) + '</option>' +
+	  '<option value="power"' + (accountLevel === 'power' ? ' selected' : '') + '>' + escapeHtml(t('detail.levelPower')) + '</option></select></div>' +
+	  '<div class="form-group"><label for="maxConcurrencyInput">' + escapeHtml(t('detail.maxConcurrency')) + '</label><input type="number" id="maxConcurrencyInput" min="0" max="10000" value="' + Number(a.maxConcurrency || 0) + '" /><small>' + escapeHtml(t('detail.maxConcurrencyHint')) + '</small></div>' +
+	  '</div>' +
+	  detailItem(t('detail.effectiveAccountLevel'), a.effectiveAccountLevel || '-') +
+	  detailItem(t('detail.inFlight'), Number(a.inFlight || 0)) +
+	  '<button class="btn btn-sm btn-primary" data-detail-action="saveDispatchLimits" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
+	  '</div>' +
 
       '<div class="detail-section">' +
       '<h4>' + escapeHtml(t('detail.overage')) +
@@ -2090,6 +2106,34 @@
       : '131072';
     const promptCacheTTLSeconds = Number(d.promptCacheTTLSeconds);
     $('promptCacheTTLSeconds').value = promptCacheTTLSeconds === 3600 ? '3600' : '300';
+
+    const rate = d.rateLimit || {};
+    const scheduling = d.scheduling || {};
+    const priority = d.accountPriority || {};
+    $('schedulingMode').value = scheduling.mode || 'round_robin';
+    $('rateLimitMode').value = rate.mode || 'switch_account';
+    $('retrySameAccount').value = String(rate.retrySameAccount ?? 0);
+    $('switchAccountRounds').value = String(rate.switchAccountRounds ?? 1);
+    $('disableSeconds').value = String(rate.disableSeconds ?? 60);
+    $('retryDelayMs').value = String(rate.retryDelayMs ?? 1000);
+    $('retryBackoffMultiplier').value = String(rate.retryBackoffMultiplier ?? 1);
+    $('retryMaxDelayMs').value = String(rate.retryMaxDelayMs ?? 1000);
+    $('accountPriorityEnabled').checked = priority.enabled === true;
+    $('accountPriorityRules').value = JSON.stringify(Array.isArray(priority.rules) ? priority.rules : [], null, 2);
+
+    const functionCache = d.functionCache || {};
+    $('cacheMode').value = d.cacheMode === 'function_simulation' ? 'function_simulation' : 'native';
+    $('functionCacheEnabled').checked = functionCache.enabled === true;
+    $('functionSimulatedData').value = functionCache.simulatedData || '';
+    $('functionSimulatedTokens').value = String(functionCache.simulatedTokens ?? 0);
+    $('functionTTLSeconds').value = String(functionCache.ttlSeconds ?? 300);
+    $('functionTTLJitter').value = String(functionCache.ttlJitterPercent ?? 0);
+    $('functionTokenJitter').value = String(functionCache.tokenJitterPercent ?? 0);
+    $('functionHitRate').value = String(functionCache.hitRatePercent ?? 100);
+    $('functionMaxRead').value = String(functionCache.maxCacheReadPercent ?? 85);
+    $('functionMinTokens').value = String(functionCache.minTokens ?? 0);
+    $('functionFingerprintChars').value = String(functionCache.inputFingerprintChars ?? 0);
+    onCacheModeChange();
     await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys()]);
     refreshCustomSelects();
   }
@@ -2198,6 +2242,58 @@
     await api('/settings', { method: 'POST', body: JSON.stringify({ allowOverUsage }) });
     toast(t('settings.overUsageSaved'), 'success');
   }
+  async function saveDispatchLimits(id) {
+    const maxConcurrency = Number($('maxConcurrencyInput').value);
+    if (!Number.isInteger(maxConcurrency) || maxConcurrency < 0 || maxConcurrency > 10000) {
+      toast(t('detail.maxConcurrencyInvalid'), 'warning');
+      return;
+    }
+    await putAccount(id, { accountLevel: $('accountLevelInput').value, maxConcurrency }, t('detail.saved'));
+  }
+  function onCacheModeChange() {
+    const simulated = $('cacheMode').value === 'function_simulation';
+    $('nativeCacheFields').classList.toggle('hidden', simulated);
+    $('functionCacheFields').classList.toggle('hidden', !simulated);
+  }
+  function policyNumber(id, min, max, integer = true) {
+    const input = $(id);
+    const value = Number(input.value);
+    const valid = Number.isFinite(value) && (!integer || Number.isInteger(value)) && value >= min && value <= max;
+    if (!valid) {
+      input.focus();
+      throw new Error(t('settings.policyValueInvalid'));
+    }
+    return value;
+  }
+  async function saveDispatchPolicies() {
+    let rules;
+    try {
+      rules = JSON.parse($('accountPriorityRules').value || '[]');
+      if (!Array.isArray(rules)) throw new Error(t('settings.priorityRulesInvalid'));
+      const rateLimit = {
+        mode: $('rateLimitMode').value,
+        retrySameAccount: policyNumber('retrySameAccount', 0, 20),
+        disableSeconds: policyNumber('disableSeconds', 1, 86400),
+        switchAccountRounds: policyNumber('switchAccountRounds', 1, 100),
+        retryDelayMs: policyNumber('retryDelayMs', 1, 60000),
+        retryBackoffMultiplier: policyNumber('retryBackoffMultiplier', 1, 5, false),
+        retryMaxDelayMs: policyNumber('retryMaxDelayMs', 1, 300000)
+      };
+      const res = await api('/settings', {
+        method: 'POST', body: JSON.stringify({
+          rateLimit,
+          scheduling: { mode: $('schedulingMode').value },
+          accountPriority: { enabled: $('accountPriorityEnabled').checked, rules }
+        })
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.success === false) throw new Error(d.error || t('common.saveFailed'));
+      toast(t('settings.dispatchPoliciesSaved'), 'success');
+      await loadSettings();
+    } catch (e) {
+      toast((e && e.message) || t('common.saveFailed'), 'error');
+    }
+  }
   async function savePromptCacheConfig() {
     const ratioInput = $('promptCacheMaxRatio');
     const entriesInput = $('promptCacheMaxEntries');
@@ -2221,8 +2317,22 @@
       return;
     }
     try {
+      const cacheMode = $('cacheMode').value;
+      const functionCache = {
+        enabled: $('functionCacheEnabled').checked,
+        simulatedData: $('functionSimulatedData').value,
+        simulatedTokens: policyNumber('functionSimulatedTokens', 0, 1000000),
+        scopeMode: 'body_fingerprint',
+        ttlSeconds: policyNumber('functionTTLSeconds', 1, 86400),
+        ttlJitterPercent: policyNumber('functionTTLJitter', 0, 100),
+        tokenJitterPercent: policyNumber('functionTokenJitter', 0, 100),
+        hitRatePercent: policyNumber('functionHitRate', 0, 100),
+        maxCacheReadPercent: policyNumber('functionMaxRead', 1, 100),
+        minTokens: policyNumber('functionMinTokens', 0, 100000),
+        inputFingerprintChars: policyNumber('functionFingerprintChars', 0, 12000)
+      };
       const res = await api('/settings', {
-        method: 'POST', body: JSON.stringify({ promptCacheMaxRatio, promptCacheMaxEntries, promptCacheTTLSeconds })
+        method: 'POST', body: JSON.stringify({ promptCacheMaxRatio, promptCacheMaxEntries, promptCacheTTLSeconds, cacheMode, functionCache })
       });
       const d = await res.json().catch(() => ({}));
       if (!res.ok || d.success === false) throw new Error(d.error || t('common.saveFailed'));
@@ -3666,7 +3776,9 @@
   function bindSettingsEvents() {
     $('saveRequireApiKeyBtn').addEventListener('click', saveRequireApiKey);
     $('saveOverUsageBtn').addEventListener('click', saveOverUsageConfig);
+	$('saveDispatchPoliciesBtn').addEventListener('click', saveDispatchPolicies);
     $('savePromptCacheBtn').addEventListener('click', savePromptCacheConfig);
+	$('cacheMode').addEventListener('change', onCacheModeChange);
     $('saveThinkingBtn').addEventListener('click', saveThinkingConfig);
     $('saveEndpointBtn').addEventListener('click', saveEndpointConfig);
     $('changePasswordBtn').addEventListener('click', changePassword);
@@ -3754,6 +3866,7 @@
       const a = b.dataset.detailAction;
       if (a === 'saveMachineId') saveMachineId(id);
       else if (a === 'saveWeight') saveWeight(id);
+	  else if (a === 'saveDispatchLimits') saveDispatchLimits(id);
       else if (a === 'toggleOverage') toggleOverageSwitch(id, b);
       else if (a === 'refreshOverage') refreshAccountOverage(id);
       else if (a === 'saveProxyURL') saveProxyURL(id);

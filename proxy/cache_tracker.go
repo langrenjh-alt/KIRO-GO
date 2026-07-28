@@ -5,6 +5,7 @@ import (
 	"container/heap"
 	"container/list"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"kiro-go/config"
 	"kiro-go/logger"
@@ -42,10 +43,14 @@ type promptCacheBreakpoint struct {
 }
 
 type promptCacheProfile struct {
-	Breakpoints      []promptCacheBreakpoint
-	TotalInputTokens int
-	Model            string
-	IsolationSeed    string
+	Breakpoints                []promptCacheBreakpoint
+	TotalInputTokens           int
+	Model                      string
+	IsolationSeed              string
+	SimulatedFunctionCache     bool
+	SimulatedHitRatePercent    int
+	SimulatedMaxReadPercent    int
+	SimulatedMinCacheableToken int
 }
 
 func minCacheableTokensForModel(model string) int {
@@ -61,6 +66,11 @@ type promptCacheEntry struct {
 	TTL        time.Duration
 	lruElem    *list.Element // back-ref into t.order; Value = fingerprint [32]byte
 	expiryItem *promptCacheExpiryItem
+}
+
+type simulatedFunctionCacheEntry struct {
+	ExpiresAt time.Time
+	TTL       time.Duration
 }
 
 type promptCacheExpiryItem struct {
@@ -98,6 +108,7 @@ func (h *promptCacheExpiryHeap) Pop() interface{} {
 type promptCacheTracker struct {
 	mu                    sync.Mutex
 	entries               map[[32]byte]*promptCacheEntry
+	functionEntries       map[[32]byte]simulatedFunctionCacheEntry
 	order                 *list.List // front = most-recently-used; Element.Value = [32]byte fingerprint
 	expiryQueue           promptCacheExpiryHeap
 	maxEntries            int
@@ -126,6 +137,7 @@ func newPromptCacheTrackerWithCapacity(maxTTL time.Duration, maxEntries int) *pr
 	}
 	return &promptCacheTracker{
 		entries:         make(map[[32]byte]*promptCacheEntry),
+		functionEntries: make(map[[32]byte]simulatedFunctionCacheEntry),
 		order:           list.New(),
 		maxEntries:      maxEntries,
 		maxSupportedTTL: maxTTL,
@@ -354,6 +366,9 @@ func defaultPromptCachePrefixBreakpointIndex(blocks []cacheablePromptBlock) int 
 }
 
 func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTokens int, isolationSeeds ...string) *promptCacheProfile {
+	if config.GetCacheMode() == config.CacheModeFunctionSimulation {
+		return buildSimulatedFunctionCacheProfile(req, totalInputTokens, config.GetFunctionCacheConfig())
+	}
 	isolationSeed := ""
 	if len(isolationSeeds) > 0 {
 		isolationSeed = isolationSeeds[0]
@@ -454,9 +469,145 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 	}
 }
 
+// BuildClaudeProfileForRequest preserves the native cache's tenant isolation
+// while allowing function simulation to fingerprint the original request body.
+func (t *promptCacheTracker) BuildClaudeProfileForRequest(req *ClaudeRequest, totalInputTokens int, isolationSeed, requestBodyFingerprint string) *promptCacheProfile {
+	if config.GetCacheMode() == config.CacheModeFunctionSimulation {
+		return buildSimulatedFunctionCacheProfile(req, totalInputTokens, config.GetFunctionCacheConfig(), requestBodyFingerprint)
+	}
+	return t.BuildClaudeProfile(req, totalInputTokens, isolationSeed)
+}
+
+// buildSimulatedFunctionCacheProfile creates usage-only cache metadata. It does
+// not change tools, messages, the Kiro payload, or account selection.
+func buildSimulatedFunctionCacheProfile(req *ClaudeRequest, totalInputTokens int, cfg config.FunctionCacheConfig, requestBodyFingerprints ...string) *promptCacheProfile {
+	if req == nil || !cfg.Enabled {
+		return nil
+	}
+	seedData := strings.TrimSpace(cfg.SimulatedData)
+	if seedData == "" && len(req.Tools) > 0 {
+		if encoded, err := json.Marshal(req.Tools); err == nil {
+			seedData = string(encoded)
+		}
+	}
+	bodyFingerprint := ""
+	if len(requestBodyFingerprints) > 0 {
+		bodyFingerprint = strings.TrimSpace(requestBodyFingerprints[0])
+	}
+	if bodyFingerprint == "" {
+		bodyFingerprint = canonicalizeCacheValue(req)
+	}
+	if cfg.InputFingerprintChars > 0 {
+		runes := []rune(bodyFingerprint)
+		if len(runes) > cfg.InputFingerprintChars {
+			bodyFingerprint = string(runes[len(runes)-cfg.InputFingerprintChars:])
+		}
+	}
+	if bodyFingerprint == "" && seedData == "" && cfg.SimulatedTokens <= 0 {
+		return nil
+	}
+	canonical := canonicalizeCacheValue(map[string]interface{}{
+		"kind":                     "function_cache_simulation_body_fingerprint_v1",
+		"request_body_fingerprint": bodyFingerprint,
+		"simulated_data":           seedData,
+		"simulated_tokens":         cfg.SimulatedTokens,
+	})
+	fingerprint := sha256.Sum256([]byte(canonical))
+	tokens := cfg.SimulatedTokens
+	if tokens <= 0 {
+		tokens = estimateApproxTokens(seedData)
+	}
+	if tokens <= 0 {
+		tokens = estimateApproxTokens(canonical)
+	}
+	if tokens <= 0 {
+		return nil
+	}
+	tokens = jitterFunctionCacheValue(tokens, cfg.TokenJitterPercent, fingerprint, "tokens")
+	ttlSeconds := cfg.TTLSeconds
+	if ttlSeconds <= 0 {
+		ttlSeconds = int(defaultPromptCacheTTL / time.Second)
+	}
+	ttlSeconds = jitterFunctionCacheValue(ttlSeconds, cfg.TTLJitterPercent, fingerprint, "ttl")
+	if ttlSeconds < 1 {
+		ttlSeconds = 1
+	}
+	if totalInputTokens < tokens {
+		totalInputTokens = tokens
+	}
+	hitRate, maxRead := 100, 85
+	if cfg.HitRatePercent != nil {
+		hitRate = *cfg.HitRatePercent
+	}
+	if cfg.MaxCacheReadPercent != nil {
+		maxRead = *cfg.MaxCacheReadPercent
+	}
+	return &promptCacheProfile{
+		Breakpoints: []promptCacheBreakpoint{{
+			Fingerprint:      fingerprint,
+			CumulativeTokens: tokens,
+			TTL:              time.Duration(ttlSeconds) * time.Second,
+		}},
+		TotalInputTokens:           totalInputTokens,
+		Model:                      req.Model,
+		SimulatedFunctionCache:     true,
+		SimulatedHitRatePercent:    hitRate,
+		SimulatedMaxReadPercent:    maxRead,
+		SimulatedMinCacheableToken: cfg.MinTokens,
+	}
+}
+
+func functionCacheRequestBodyFingerprint(rawBody []byte) string {
+	trimmed := bytes.TrimSpace(rawBody)
+	if len(trimmed) == 0 {
+		return ""
+	}
+	var decoded interface{}
+	decoder := json.NewDecoder(bytes.NewReader(trimmed))
+	decoder.UseNumber()
+	if err := decoder.Decode(&decoded); err == nil {
+		return canonicalizeCacheValue(decoded)
+	}
+	return string(trimmed)
+}
+
+func jitterFunctionCacheValue(base, percent int, fingerprint [32]byte, salt string) int {
+	if base <= 0 || percent <= 0 {
+		return base
+	}
+	if percent > 100 {
+		percent = 100
+	}
+	seed := append([]byte(salt), fingerprint[:]...)
+	sum := sha256.Sum256(seed)
+	delta := int(binary.BigEndian.Uint32(sum[:4])%uint32(percent*2+1)) - percent
+	value := base * (100 + delta) / 100
+	if value < 1 {
+		return 1
+	}
+	return value
+}
+
+func simulatedFunctionCacheHitAllowed(profile *promptCacheProfile, now time.Time) bool {
+	if profile == nil || profile.SimulatedHitRatePercent <= 0 || len(profile.Breakpoints) == 0 {
+		return false
+	}
+	if profile.SimulatedHitRatePercent >= 100 {
+		return true
+	}
+	seed := make([]byte, 0, 64)
+	seed = strconv.AppendInt(seed, now.UnixNano(), 10)
+	seed = append(seed, profile.Breakpoints[0].Fingerprint[:]...)
+	sum := sha256.Sum256(seed)
+	return int(binary.BigEndian.Uint32(sum[:4])%100) < profile.SimulatedHitRatePercent
+}
+
 func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfile) (u promptCacheUsage) {
 	if t == nil || profile == nil || len(profile.Breakpoints) == 0 || accountID == "" {
 		return promptCacheUsage{}
+	}
+	if profile.SimulatedFunctionCache {
+		return t.computeSimulatedFunctionCache(profile)
 	}
 	defer func() {
 		if u.CacheReadInputTokens > 0 {
@@ -515,8 +666,83 @@ func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfi
 	}
 }
 
+func (t *promptCacheTracker) computeSimulatedFunctionCache(profile *promptCacheProfile) (usage promptCacheUsage) {
+	defer func() {
+		if usage.CacheReadInputTokens > 0 {
+			atomic.AddInt64(&t.hits, 1)
+		} else {
+			atomic.AddInt64(&t.misses, 1)
+		}
+	}()
+	last := profile.Breakpoints[len(profile.Breakpoints)-1]
+	cacheTokens := minInt(last.CumulativeTokens, profile.TotalInputTokens)
+	if cacheTokens < profile.SimulatedMinCacheableToken {
+		return promptCacheUsage{}
+	}
+	now := time.Now()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for fingerprint, entry := range t.functionEntries {
+		if !entry.ExpiresAt.After(now) {
+			delete(t.functionEntries, fingerprint)
+		}
+	}
+	entry, hit := t.functionEntries[last.Fingerprint]
+	hit = hit && entry.ExpiresAt.After(now) && simulatedFunctionCacheHitAllowed(profile, now)
+	if !hit {
+		cache5m, cache1h := computePromptCacheTTLBreakdown(profile, 0)
+		return promptCacheUsage{
+			CacheCreationInputTokens:   cacheTokens,
+			CacheCreation5mInputTokens: cache5m,
+			CacheCreation1hInputTokens: cache1h,
+		}
+	}
+	entry.ExpiresAt = now.Add(entry.TTL)
+	t.functionEntries[last.Fingerprint] = entry
+	maxRead := int(float64(profile.TotalInputTokens) * float64(profile.SimulatedMaxReadPercent) / 100)
+	if maxRead < 0 {
+		maxRead = 0
+	}
+	if cacheTokens > maxRead {
+		cacheTokens = maxRead
+	}
+	return promptCacheUsage{CacheReadInputTokens: cacheTokens}
+}
+
+func (t *promptCacheTracker) updateSimulatedFunctionCache(profile *promptCacheProfile) {
+	now := time.Now()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for fingerprint, entry := range t.functionEntries {
+		if !entry.ExpiresAt.After(now) {
+			delete(t.functionEntries, fingerprint)
+		}
+	}
+	for _, breakpoint := range profile.Breakpoints {
+		if breakpoint.CumulativeTokens < profile.SimulatedMinCacheableToken {
+			continue
+		}
+		t.functionEntries[breakpoint.Fingerprint] = simulatedFunctionCacheEntry{
+			ExpiresAt: now.Add(breakpoint.TTL),
+			TTL:       breakpoint.TTL,
+		}
+	}
+	// Keep simulation state bounded by the current tracker capacity without
+	// persisting it or mixing it into the native LRU namespace.
+	for len(t.functionEntries) > t.maxEntries {
+		for fingerprint := range t.functionEntries {
+			delete(t.functionEntries, fingerprint)
+			break
+		}
+	}
+}
+
 func (t *promptCacheTracker) Update(accountID string, profile *promptCacheProfile) {
 	if t == nil || profile == nil || len(profile.Breakpoints) == 0 || accountID == "" {
+		return
+	}
+	if profile.SimulatedFunctionCache {
+		t.updateSimulatedFunctionCache(profile)
 		return
 	}
 
@@ -664,6 +890,7 @@ type PromptCacheStats struct {
 	SkippedNoIsolation    int64 `json:"skippedNoIsolation"`
 	SkippedNoCacheControl int64 `json:"skippedNoCacheControl"`
 	SkippedNoBreakpoints  int64 `json:"skippedNoBreakpoints"`
+	FunctionEntries       int   `json:"functionEntries"`
 }
 
 func (t *promptCacheTracker) Stats() PromptCacheStats {
@@ -672,6 +899,7 @@ func (t *promptCacheTracker) Stats() PromptCacheStats {
 	}
 	t.mu.Lock()
 	entries := len(t.entries)
+	functionEntries := len(t.functionEntries)
 	capacity := t.maxEntries
 	t.mu.Unlock()
 	return PromptCacheStats{
@@ -684,6 +912,7 @@ func (t *promptCacheTracker) Stats() PromptCacheStats {
 		SkippedNoIsolation:    atomic.LoadInt64(&t.skippedNoIsolation),
 		SkippedNoCacheControl: atomic.LoadInt64(&t.skippedNoCacheControl),
 		SkippedNoBreakpoints:  atomic.LoadInt64(&t.skippedNoBreakpoints),
+		FunctionEntries:       functionEntries,
 	}
 }
 

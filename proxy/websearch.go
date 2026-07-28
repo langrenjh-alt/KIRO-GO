@@ -310,9 +310,11 @@ func (h *Handler) executeWebSearch(
 
 	execution := &webSearchExecution{}
 	excluded := make(map[string]bool)
+	retryCounts := make(map[string]int)
+	retrySameID := ""
 	var lastErr error
 
-	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
+	for attempt := 0; attempt < h.maxAccountAttempts(); attempt++ {
 		if err := ctx.Err(); err != nil {
 			lastErr = err
 			break
@@ -322,36 +324,59 @@ func (h *Handler) executeWebSearch(
 			break
 		}
 
-		account := h.pool.GetNextExcluding(excluded)
+		account, allFull := h.acquireAccountForModel("", excluded, retrySameID)
+		retrySameID = ""
 		if account == nil {
+			if h.startExpiredAccountRefreshes("", excluded) {
+				lastErr = errAccountRefreshInProgress
+			} else if allFull {
+				lastErr = fmt.Errorf(allAccountsConcurrencyFullMessage)
+			}
 			break
 		}
 		execution.LastAccountID = account.ID
 
 		if err := h.ensureValidToken(account); err != nil {
+			h.releaseAccount(account)
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			continue
 		}
 		if err := ctx.Err(); err != nil {
+			h.releaseAccount(account)
 			lastErr = err
 			break
 		}
 		if err := ensureRestProfileArn(account); err != nil {
+			h.releaseAccount(account)
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			continue
 		}
 		if err := ctx.Err(); err != nil {
+			h.releaseAccount(account)
 			lastErr = err
 			break
 		}
 
 		result, err := call(ctx, account, upstreamQuery)
+		h.releaseAccount(account)
 		if err != nil {
 			lastErr = err
+			if isRateLimitError(err) {
+				decision := h.applyRateLimitPolicy(account, retryCounts, excluded)
+				if decision.Return429 {
+					break
+				}
+				retrySameID = decision.RetrySameID
+				if !waitForRateLimitRetry(ctx, decision) {
+					lastErr = ctx.Err()
+					break
+				}
+				continue
+			}
 			if isWebSearchContextError(ctx, err) || !shouldRetryWebSearchFailure(err) {
 				break
 			}
@@ -446,6 +471,12 @@ func (h *Handler) handleWebSearchAccountFailure(account *config.Account, err err
 }
 
 func mapWebSearchError(err error) (int, string, string, string) {
+	if isAccountRefreshInProgressError(err) {
+		return accountRefreshInProgressStatus, "account_refreshing", accountRefreshInProgressMessage, fmt.Sprintf("%d", int(expiredAccountRefreshWait.Seconds()))
+	}
+	if isAllAccountsConcurrencyFullError(err) {
+		return http.StatusServiceUnavailable, "overloaded_error", allAccountsConcurrencyFullMessage, ""
+	}
 	if errors.Is(err, errNoWebSearchAccounts) {
 		return http.StatusServiceUnavailable, "api_error", "No available accounts", ""
 	}

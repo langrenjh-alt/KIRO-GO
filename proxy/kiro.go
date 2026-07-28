@@ -151,6 +151,27 @@ func InitKiroHttpClient(proxyURL string) {
 	kiroRestHttpStore.Store(restClient)
 }
 
+// CloseKiroIdleConnections closes only idle upstream connections. Active
+// requests continue; subsequent calls establish fresh direct/proxy tunnels.
+func CloseKiroIdleConnections() {
+	closeIdle := func(client *http.Client) {
+		if client == nil || client.Transport == nil {
+			return
+		}
+		if transport, ok := client.Transport.(interface{ CloseIdleConnections() }); ok {
+			transport.CloseIdleConnections()
+		}
+	}
+	closeIdle(kiroHttpStore.Load())
+	closeIdle(kiroRestHttpStore.Load())
+	proxyClientCache.Range(func(_, value interface{}) bool {
+		if client, ok := value.(*http.Client); ok {
+			closeIdle(client)
+		}
+		return true
+	})
+}
+
 // ==================== Request Structs ====================
 
 // KiroPayload is the top-level request body sent to the Kiro API.
@@ -437,10 +458,9 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		}
 
 		if resp.StatusCode == 429 {
+			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), trying next...", ep.Name)
-			lastErr = fmt.Errorf("quota exhausted on %s", ep.Name)
-			continue
+			return &UpstreamRateLimitError{Endpoint: ep.Name, Body: string(errBody)}
 		}
 
 		if resp.StatusCode != 200 {
