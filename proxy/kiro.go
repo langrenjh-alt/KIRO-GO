@@ -12,8 +12,10 @@ import (
 	"io"
 	"kiro-go/config"
 	"kiro-go/logger"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -120,9 +122,61 @@ func buildKiroTransport(proxyURL string) *http.Transport {
 			t.ForceAttemptHTTP2 = false
 		}
 	} else {
-		t.Proxy = http.ProxyFromEnvironment
+		// ProxyFromEnvironment caches the first process-wide environment it
+		// observes. Capture the effective proxy when the transport is built so
+		// runtime proxy reconfiguration and tests using t.Setenv are reliable.
+		t.Proxy = proxyFromCurrentEnvironment()
 	}
 	return t
+}
+
+func proxyFromCurrentEnvironment() func(*http.Request) (*url.URL, error) {
+	httpsProxy := firstNonEmptyEnv("HTTPS_PROXY", "https_proxy")
+	httpProxy := firstNonEmptyEnv("HTTP_PROXY", "http_proxy")
+	noProxy := firstNonEmptyEnv("NO_PROXY", "no_proxy")
+	return func(req *http.Request) (*url.URL, error) {
+		if req == nil || req.URL == nil || proxyBypassed(req.URL.Hostname(), noProxy) {
+			return nil, nil
+		}
+		raw := httpProxy
+		if strings.EqualFold(req.URL.Scheme, "https") {
+			raw = httpsProxy
+		}
+		if strings.TrimSpace(raw) == "" {
+			return nil, nil
+		}
+		return url.Parse(raw)
+	}
+}
+
+func firstNonEmptyEnv(keys ...string) string {
+	for _, key := range keys {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func proxyBypassed(host, noProxy string) bool {
+	host = strings.ToLower(strings.Trim(strings.TrimSpace(host), "[]"))
+	for _, raw := range strings.Split(noProxy, ",") {
+		entry := strings.ToLower(strings.TrimSpace(raw))
+		if entry == "" {
+			continue
+		}
+		if entry == "*" {
+			return true
+		}
+		if splitHost, _, err := net.SplitHostPort(entry); err == nil {
+			entry = splitHost
+		}
+		entry = strings.TrimPrefix(entry, ".")
+		if host == entry || strings.HasSuffix(host, "."+entry) {
+			return true
+		}
+	}
+	return false
 }
 
 // InitKiroHttpClient initializes (or reinitializes) the HTTP clients used for Kiro API requests.

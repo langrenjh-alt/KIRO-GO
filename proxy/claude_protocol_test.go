@@ -1,7 +1,12 @@
 package proxy
 
 import (
+	"bytes"
+	"compress/zlib"
+	"encoding/ascii85"
+	"encoding/base64"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -11,6 +16,86 @@ func TestClaudeThinkingSignature(t *testing.T) {
 	}
 	if got := claudeThinkingSignature(""); got != claudeThinkingSignaturePlaceholder {
 		t.Fatalf("placeholder signature = %q", got)
+	}
+	if _, err := base64.StdEncoding.DecodeString(claudeThinkingSignaturePlaceholder); err == nil {
+		t.Fatal("placeholder must not masquerade as a replayable Anthropic signature")
+	}
+}
+
+func TestResolveClaudeThinkingSignaturePrefersNative(t *testing.T) {
+	native := ClaudeReasoningResult{Text: "reasoning", Signature: " native-signature "}
+	if got := resolveClaudeThinkingSignature(native, false); got != "native-signature" {
+		t.Fatalf("native signature = %q", got)
+	}
+	fallback := resolveClaudeThinkingSignature(ClaudeReasoningResult{Text: "reasoning"}, false)
+	if !strings.HasPrefix(fallback, "kiro-go-unverified.") || len(fallback) < 50 {
+		t.Fatalf("fallback signature = %q", fallback)
+	}
+}
+
+func TestNormalizeClaudeToolUseID(t *testing.T) {
+	for input, want := range map[string]string{
+		"toolu_native": "toolu_native",
+		"srvtoolu_1":   "srvtoolu_1",
+		"call_legacy":  "toolu_call_legacy",
+	} {
+		if got := normalizeClaudeToolUseID(input); got != want {
+			t.Fatalf("normalizeClaudeToolUseID(%q) = %q, want %q", input, got, want)
+		}
+	}
+	if got := normalizeClaudeToolUseID(""); !strings.HasPrefix(got, "toolu_") || len(got) <= len("toolu_") {
+		t.Fatalf("generated id = %q", got)
+	}
+}
+
+func TestKiroToClaudeResponseNormalizesToolUseID(t *testing.T) {
+	resp := KiroToClaudeResponse("", "", false, []KiroToolUse{{
+		ToolUseID: "call_legacy",
+		Name:      "get_weather",
+		Input:     map[string]interface{}{"city": "Tokyo", "unit": "celsius"},
+	}}, 10, 10, "claude-sonnet-4-6")
+	if len(resp.Content) != 1 || resp.Content[0].ID != "toolu_call_legacy" || resp.StopReason != "tool_use" {
+		t.Fatalf("response tool contract = %#v, stop_reason=%q", resp.Content, resp.StopReason)
+	}
+}
+
+func TestExtractClaudeDocumentText(t *testing.T) {
+	raw := []byte("%PDF-1.7\nBT (MAGIC-7F3K-VERIFY-CLAUDE) Tj ET\n%%EOF")
+	encoded := base64.StdEncoding.EncodeToString(raw)
+	text := extractClaudeDocumentText(map[string]interface{}{
+		"type": "document",
+		"source": map[string]interface{}{
+			"type":       "base64",
+			"media_type": "application/pdf",
+			"data":       encoded,
+		},
+	})
+	if !strings.Contains(text, "MAGIC-7F3K-VERIFY-CLAUDE") {
+		t.Fatalf("document magic string missing: %q", text)
+	}
+}
+
+func TestExtractClaudeDocumentTextFromReportLabStyleStream(t *testing.T) {
+	const magic = "MAGIC-7F3K-VERIFY-CLAUDE-RELAY-DETECTOR"
+	var compressed bytes.Buffer
+	zw := zlib.NewWriter(&compressed)
+	_, _ = zw.Write([]byte("BT /F1 14 Tf (Magic identifier: " + magic + ") Tj ET"))
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	encoded85 := make([]byte, ascii85.MaxEncodedLen(compressed.Len()))
+	n := ascii85.Encode(encoded85, compressed.Bytes())
+	pdf := append([]byte("%PDF-1.4\n<< /Filter [ /ASCII85Decode /FlateDecode ] >>\nstream\n"), encoded85[:n]...)
+	pdf = append(pdf, []byte("~>\nendstream\n%%EOF")...)
+
+	text := extractClaudeDocumentText(map[string]interface{}{
+		"source": map[string]interface{}{
+			"media_type": "application/pdf",
+			"data":       base64.StdEncoding.EncodeToString(pdf),
+		},
+	})
+	if !strings.Contains(text, magic) {
+		t.Fatalf("compressed document magic string missing: %q", text)
 	}
 }
 

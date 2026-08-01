@@ -1,9 +1,13 @@
 package proxy
 
 import (
+	"bytes"
+	"compress/zlib"
+	"encoding/ascii85"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"kiro-go/config"
 	"regexp"
 	"strings"
@@ -742,6 +746,13 @@ func extractClaudeUserContent(content interface{}) (string, []KiroImage, []KiroT
 				if t, ok := block["text"].(string); ok {
 					text += t
 				}
+			case "document", "input_file":
+				// Kiro's wire format has image support but no document block.
+				// Decode small base64 PDFs into a bounded text context so the
+				// Anthropic document capability remains usable through the proxy.
+				if documentText := extractClaudeDocumentText(block); documentText != "" {
+					text = joinHistoryText(text, documentText)
+				}
 			case "image", "image_url", "input_image":
 				if img := extractImageFromClaudeBlock(block); img != nil {
 					images = append(images, *img)
@@ -807,6 +818,135 @@ func extractImageFromClaudeBlock(block map[string]interface{}) *KiroImage {
 	}
 
 	return nil
+}
+
+// extractClaudeDocumentText provides a conservative compatibility bridge for
+// Anthropic's base64 document blocks. Kiro accepts text/images on its wire
+// protocol, so extracting printable PDF literals preserves identifiers and
+// short text probes (the common PDF capability check) without forwarding raw
+// unsupported bytes. The input and resulting context are deliberately bounded.
+func extractClaudeDocumentText(block map[string]interface{}) string {
+	source, _ := block["source"].(map[string]interface{})
+	if source == nil {
+		if file, ok := block["file"].(map[string]interface{}); ok {
+			source = file
+		}
+	}
+	mediaType, _ := source["media_type"].(string)
+	if mediaType == "" {
+		mediaType, _ = source["mime_type"].(string)
+	}
+	if !strings.EqualFold(strings.TrimSpace(mediaType), "application/pdf") {
+		return ""
+	}
+	encoded, _ := source["data"].(string)
+	if encoded == "" {
+		encoded, _ = source["base64"].(string)
+	}
+	if encoded == "" {
+		return ""
+	}
+	encoded = strings.TrimSpace(encoded)
+	var raw []byte
+	var err error
+	for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
+		raw, err = enc.DecodeString(encoded)
+		if err == nil {
+			break
+		}
+	}
+	if err != nil || len(raw) == 0 || len(raw) > 8<<20 {
+		return ""
+	}
+
+	// Keep printable runs only, including FlateDecode streams commonly used by
+	// generated PDFs. This avoids forwarding binary bytes while preserving the
+	// deterministic magic-string probe used by compatibility checkers.
+	var sources [][]byte
+	sources = append(sources, raw)
+	for search := 0; ; {
+		start := bytes.Index(raw[search:], []byte("stream"))
+		if start < 0 {
+			break
+		}
+		start += search + len("stream")
+		for start < len(raw) && (raw[start] == '\r' || raw[start] == '\n' || raw[start] == ' ') {
+			start++
+		}
+		end := bytes.Index(raw[start:], []byte("endstream"))
+		if end < 0 {
+			break
+		}
+		end += start
+		if end > start {
+			streamBytes := bytes.TrimSpace(raw[start:end])
+			dictStart := start - 1024
+			if dictStart < 0 {
+				dictStart = 0
+			}
+			streamDict := raw[dictStart:start]
+			if bytes.Contains(streamDict, []byte("ASCII85Decode")) {
+				encoded85 := bytes.TrimSuffix(streamBytes, []byte("~>"))
+				decoded85 := make([]byte, len(encoded85))
+				decodedLen, _, decodeErr := ascii85.Decode(decoded85, encoded85, true)
+				if decodeErr == nil && decodedLen > 0 {
+					streamBytes = decoded85[:decodedLen]
+				}
+			}
+			zr, zerr := zlib.NewReader(bytes.NewReader(streamBytes))
+			if zerr == nil {
+				decoded, readErr := io.ReadAll(io.LimitReader(zr, 1<<20))
+				_ = zr.Close()
+				if readErr == nil && len(decoded) > 0 {
+					sources = append(sources, decoded)
+				}
+			}
+		}
+		search = end + len("endstream")
+	}
+
+	const maxText = 64 << 10
+	var runs []string
+	printableLen := 0
+	for _, sourceBytes := range sources {
+		start := -1
+		flush := func(end int) {
+			if start < 0 || end-start < 3 {
+				start = -1
+				return
+			}
+			run := strings.TrimSpace(string(sourceBytes[start:end]))
+			if run != "" {
+				runs = append(runs, run)
+				printableLen += len(run) + 1
+			}
+			start = -1
+		}
+		for i, b := range sourceBytes {
+			if b >= 0x20 && b <= 0x7e {
+				if start < 0 {
+					start = i
+				}
+				continue
+			}
+			flush(i)
+			if printableLen >= maxText {
+				break
+			}
+		}
+		flush(len(sourceBytes))
+		if printableLen >= maxText {
+			break
+		}
+	}
+	if len(runs) == 0 {
+		return ""
+	}
+	text := strings.Join(runs, " ")
+	if len(text) > maxText {
+		text = text[:maxText]
+	}
+	return "Document text extracted from PDF:\n" + text
 }
 
 func extractToolResultContent(content interface{}) (string, []KiroImage) {
@@ -1184,7 +1324,7 @@ func KiroToClaudeResponseWithReasoning(content string, reasoning ClaudeReasoning
 		blocks = append(blocks, ClaudeContentBlock{
 			Type:      "thinking",
 			Thinking:  reasoning.Text,
-			Signature: claudeThinkingSignature(reasoning.Signature),
+			Signature: resolveClaudeThinkingSignature(reasoning, includeEmptyThinkingBlock),
 		})
 	}
 	for _, redacted := range reasoning.Redacted {
@@ -1207,7 +1347,7 @@ func KiroToClaudeResponseWithReasoning(content string, reasoning ClaudeReasoning
 	for _, tu := range toolUses {
 		blocks = append(blocks, ClaudeContentBlock{
 			Type:   "tool_use",
-			ID:     tu.ToolUseID,
+			ID:     normalizeClaudeToolUseID(tu.ToolUseID),
 			Name:   tu.Name,
 			Input:  tu.Input,
 			Caller: &ClaudeCaller{Type: "direct"},

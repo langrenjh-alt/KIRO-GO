@@ -1133,6 +1133,13 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 				return
 			}
 			if activeBlockType == "thinking" {
+				signature := pendingThinkingSignature
+				if strings.TrimSpace(signature) == "" {
+					signature = resolveClaudeThinkingSignature(ClaudeReasoningResult{
+						Text:     rawThinkingBuilder.String(),
+						Redacted: redactedThinking,
+					}, true)
+				}
 				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
 					"type":  "content_block_delta",
 					"index": activeBlockIndex,
@@ -1143,7 +1150,7 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 					"index": activeBlockIndex,
 					"delta": map[string]string{
 						"type":      "signature_delta",
-						"signature": claudeThinkingSignature(pendingThinkingSignature),
+						"signature": signature,
 					},
 				})
 				pendingThinkingSignature = ""
@@ -1499,6 +1506,7 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 				emitRedactedThinking(event.RedactedContent)
 			},
 			OnToolUse: func(tu KiroToolUse) {
+				tu.ToolUseID = normalizeClaudeToolUseID(tu.ToolUseID)
 				flushPendingSignatureBlock()
 				processClaudeText("", false, true)
 				emitTextDelta(stopFilter.Flush())
@@ -2002,6 +2010,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 				}
 			},
 			OnToolUse: func(tu KiroToolUse) {
+				tu.ToolUseID = normalizeClaudeToolUseID(tu.ToolUseID)
 				if matchedStopSequence == "" {
 					toolUses = append(toolUses, tu)
 				}
