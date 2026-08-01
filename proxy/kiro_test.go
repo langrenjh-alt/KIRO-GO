@@ -604,6 +604,26 @@ func TestCallKiroAPIRebuildsRegionForApiKeyAccount(t *testing.T) {
 	}
 }
 
+func TestKiroStreamingUsesOnlyRegionalQEndpoint(t *testing.T) {
+	if len(kiroEndpoints) != 1 {
+		t.Fatalf("streaming endpoint count: want 1, got %d", len(kiroEndpoints))
+	}
+
+	ep := kiroEndpoints[0]
+	if ep.URL != "https://q.us-east-1.amazonaws.com/generateAssistantResponse" {
+		t.Fatalf("unexpected streaming endpoint: %q", ep.URL)
+	}
+	if ep.AmzTarget != "" {
+		t.Fatalf("regional Q endpoint must not use a fallback X-Amz-Target: %q", ep.AmzTarget)
+	}
+
+	got := regionalizeURLForRegion(ep.URL, "eu-central-1")
+	want := "https://q.eu-central-1.amazonaws.com/generateAssistantResponse"
+	if got != want {
+		t.Fatalf("regional endpoint: want %q, got %q", want, got)
+	}
+}
+
 // TestAccountEmailForLogMasksApiKey ensures api_key accounts (which have no email
 // until their first successful refresh) are not blind in logs: fall back to the masked
 // key. When an email is present it wins.

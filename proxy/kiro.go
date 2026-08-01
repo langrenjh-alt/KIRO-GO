@@ -31,7 +31,8 @@ const (
 	maxKiroActiveToolUses        = 128
 )
 
-// Endpoint configuration (auto-fallback on quota exhaustion).
+// Kiro streaming endpoint. The us-east-1 host is rewritten to the account's
+// effective API region immediately before each request.
 type kiroEndpoint struct {
 	URL       string
 	Origin    string
@@ -45,18 +46,6 @@ var kiroEndpoints = []kiroEndpoint{
 		Origin:    "AI_EDITOR",
 		AmzTarget: "",
 		Name:      "Kiro IDE",
-	},
-	{
-		URL:       "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse",
-		Origin:    "AI_EDITOR",
-		AmzTarget: "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
-		Name:      "CodeWhisperer",
-	},
-	{
-		URL:       "https://q.us-east-1.amazonaws.com/generateAssistantResponse",
-		Origin:    "AI_EDITOR",
-		AmzTarget: "AmazonQDeveloperStreamingService.SendMessage",
-		Name:      "AmazonQ",
 	},
 }
 
@@ -333,39 +322,8 @@ func setPayloadProfileArnForAccount(payload *KiroPayload, account *config.Accoun
 	}
 }
 
-// getSortedEndpoints returns endpoints ordered by user preference, with optional fallback.
-func getSortedEndpoints(preferred string) []kiroEndpoint {
-	fallback := config.GetEndpointFallback()
-
-	var primary int
-	switch preferred {
-	case "kiro":
-		primary = 0
-	case "codewhisperer":
-		primary = 1
-	case "amazonq":
-		primary = 2
-	default:
-		// "auto": Kiro first, then fallback to others
-		return []kiroEndpoint{kiroEndpoints[0], kiroEndpoints[1], kiroEndpoints[2]}
-	}
-
-	if !fallback {
-		// No fallback: only use the selected endpoint
-		return []kiroEndpoint{kiroEndpoints[primary]}
-	}
-
-	// With fallback: selected first, then others in order
-	result := []kiroEndpoint{kiroEndpoints[primary]}
-	for i, ep := range kiroEndpoints {
-		if i != primary {
-			result = append(result, ep)
-		}
-	}
-	return result
-}
-
-// CallKiroAPI calls the Kiro streaming API, trying each configured endpoint with automatic fallback.
+// CallKiroAPI calls the single regional Kiro streaming endpoint. Legacy
+// preferredEndpoint and endpointFallback settings are intentionally ignored.
 func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
 	originalProfileArn := ""
 	if payload != nil {
@@ -409,81 +367,65 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		}
 	}
 
-	// Build endpoint list ordered by configuration.
-	endpoints := getSortedEndpoints(config.GetPreferredEndpoint())
+	ep := kiroEndpoints[0]
+	// Update the origin field for the selected endpoint.
+	payload.ConversationState.CurrentMessage.UserInputMessage.Origin = ep.Origin
 
-	var lastErr error
-	for _, ep := range endpoints {
-		// Update the origin field for the selected endpoint.
-		payload.ConversationState.CurrentMessage.UserInputMessage.Origin = ep.Origin
+	// Target the data-plane region via the unified regionalizeURLForProfile.
+	// kiroRegionForProfile branches on IsApiKeyCredential: api_key accounts
+	// resolve from EffectiveApiRegion (no profile ARN), OAuth accounts derive
+	// from the profile ARN. regionalizeURLForRegion collapses both us-east-1
+	// hosts (q. and codewhisperer.) onto q.<region> for non-us-east-1 — there
+	// is no regional codewhisperer host — so this also routes the CodeWhisperer
+	// endpoint correctly for regional api_key accounts.
+	epURL := regionalizeURLForProfile(ep.URL, account, payload.ProfileArn)
 
-		// Target the data-plane region via the unified regionalizeURLForProfile.
-		// kiroRegionForProfile branches on IsApiKeyCredential: api_key accounts
-		// resolve from EffectiveApiRegion (no profile ARN), OAuth accounts derive
-		// from the profile ARN. regionalizeURLForRegion collapses both us-east-1
-		// hosts (q. and codewhisperer.) onto q.<region> for non-us-east-1 — there
-		// is no regional codewhisperer host — so this also routes the CodeWhisperer
-		// endpoint correctly for regional api_key accounts.
-		epURL := regionalizeURLForProfile(ep.URL, account, payload.ProfileArn)
-
-		reqBody, _ := json.Marshal(payload)
-		req, err := http.NewRequest("POST", epURL, bytes.NewReader(reqBody))
-		if err != nil {
-			lastErr = err
-			continue
-		}
-
-		host := ""
-		if parsedURL, parseErr := url.Parse(epURL); parseErr == nil {
-			host = parsedURL.Host
-		}
-		headerValues := buildStreamingHeaderValues(account, host)
-
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept", "*/*")
-		if ep.AmzTarget != "" {
-			req.Header.Set("X-Amz-Target", ep.AmzTarget)
-		}
-		applyKiroBaseHeaders(req, account, headerValues)
-		req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
-		req.Header.Set("x-amzn-codewhisperer-optout", "true")
-		req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
-		req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
-
-		resp, err := GetClientForProxy(ResolveAccountProxyURL(account)).Do(req)
-		if err != nil {
-			lastErr = err
-			logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, err)
-			continue
-		}
-
-		if resp.StatusCode == 429 {
-			errBody, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			return &UpstreamRateLimitError{Endpoint: ep.Name, Body: string(errBody)}
-		}
-
-		if resp.StatusCode != 200 {
-			errBody, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			lastErr = fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
-			// Authentication errors and payment errors are not retried across endpoints.
-			if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 402 {
-				return lastErr
-			}
-			logger.Warnf("[KiroAPI] Endpoint %s error: %v", ep.Name, lastErr)
-			continue
-		}
-
-		err = parseEventStream(resp.Body, callback)
-		resp.Body.Close()
+	reqBody, _ := json.Marshal(payload)
+	req, err := http.NewRequest("POST", epURL, bytes.NewReader(reqBody))
+	if err != nil {
 		return err
 	}
 
-	if lastErr != nil {
-		return lastErr
+	host := ""
+	if parsedURL, parseErr := url.Parse(epURL); parseErr == nil {
+		host = parsedURL.Host
 	}
-	return fmt.Errorf("all endpoints failed")
+	headerValues := buildStreamingHeaderValues(account, host)
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "*/*")
+	if ep.AmzTarget != "" {
+		req.Header.Set("X-Amz-Target", ep.AmzTarget)
+	}
+	applyKiroBaseHeaders(req, account, headerValues)
+	req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
+	req.Header.Set("x-amzn-codewhisperer-optout", "true")
+	req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
+	req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
+
+	resp, err := GetClientForProxy(ResolveAccountProxyURL(account)).Do(req)
+	if err != nil {
+		logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, err)
+		return err
+	}
+
+	if resp.StatusCode == 429 {
+		errBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return &UpstreamRateLimitError{Endpoint: ep.Name, Body: string(errBody)}
+	}
+
+	if resp.StatusCode != 200 {
+		errBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		err = fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
+		logger.Warnf("[KiroAPI] Endpoint %s error: %v", ep.Name, err)
+		return err
+	}
+
+	err = parseEventStream(resp.Body, callback)
+	resp.Body.Close()
+	return err
 }
 
 // accountEmailForLog returns the most informative stable identifier for an
