@@ -48,6 +48,9 @@
 
 ### Fixed
 
+- Kept long-running Claude, Chat Completions, and Responses streams alive while
+  Kiro is silent by forwarding a 25-second SSE heartbeat, matching kiro.rs
+  without changing active-stream content or protocol metadata.
 - Kept successful empty upstream turns as valid empty Claude messages instead
   of converting them into `empty_visible_output` gateway errors or account
   cooldowns; treated non-thinking reasoning events consistently as visible text.

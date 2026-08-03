@@ -190,6 +190,67 @@ func TestParseEventStreamPassesRepeatedDeltaTextThrough(t *testing.T) {
 	}
 }
 
+func TestParseEventStreamKeepsAliveDuringUpstreamSilenceThenContinues(t *testing.T) {
+	reader, writer := io.Pipe()
+	t.Cleanup(func() {
+		_ = reader.Close()
+		_ = writer.Close()
+	})
+
+	frame := awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "continued"})
+	go func() {
+		time.Sleep(35 * time.Millisecond)
+		_, _ = writer.Write(frame)
+		_ = writer.Close()
+	}()
+
+	var events []string
+	err := parseEventStreamWithKeepAlive(reader, &KiroStreamCallback{
+		OnKeepAlive: func() { events = append(events, "ping") },
+		OnText:      func(text string, _ bool) { events = append(events, text) },
+	}, 10*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) < 2 || events[0] != "ping" || events[len(events)-1] != "continued" {
+		t.Fatalf("events=%#v, want keepalive(s) followed by upstream content", events)
+	}
+}
+
+func TestParseEventStreamDoesNotKeepAliveWhileFramesAreActive(t *testing.T) {
+	reader, writer := io.Pipe()
+	t.Cleanup(func() {
+		_ = reader.Close()
+		_ = writer.Close()
+	})
+
+	frames := [][]byte{
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "a"}),
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "b"}),
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "c"}),
+	}
+	go func() {
+		for _, frame := range frames {
+			time.Sleep(5 * time.Millisecond)
+			_, _ = writer.Write(frame)
+		}
+		_ = writer.Close()
+	}()
+
+	var content strings.Builder
+	keepAlives := 0
+	err := parseEventStreamWithKeepAlive(reader, &KiroStreamCallback{
+		OnKeepAlive: func() { keepAlives++ },
+		OnText:      func(text string, _ bool) { content.WriteString(text) },
+	}, 30*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if keepAlives != 0 || content.String() != "abc" {
+		t.Fatalf("keepalives=%d content=%q, want no keepalive and intact active stream", keepAlives, content.String())
+	}
+}
+
 func TestParseEventStreamTreatsContentLengthExceededAsMaxTokens(t *testing.T) {
 	stream := bytes.NewReader(bytes.Join([][]byte{
 		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "partial answer"}),

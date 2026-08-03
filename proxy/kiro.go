@@ -34,6 +34,7 @@ const (
 	maxKiroActiveToolUses        = 128
 	maxKiroToolJSONRetries       = 2
 	maxKiroPreResponseRetries    = 8
+	kiroStreamKeepAliveInterval  = 25 * time.Second
 )
 
 // Kiro streaming endpoint. The us-east-1 host is rewritten to the account's
@@ -340,6 +341,9 @@ type KiroStreamCallback struct {
 	OnStopReason   func(reason string)
 	OnCredits      func(credits float64)
 	OnContextUsage func(percentage float64)
+	// OnKeepAlive runs serially with the other stream callbacks while the
+	// upstream is silent, so downstream SSE writes cannot interleave.
+	OnKeepAlive func()
 }
 
 // KiroReasoningContentEvent preserves all fields carried by a native Kiro
@@ -570,54 +574,135 @@ func accountEmailForLog(account *config.Account) string {
 
 // parseEventStream decodes an AWS binary Event Stream response body.
 func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
+	return parseEventStreamWithKeepAlive(body, callback, kiroStreamKeepAliveInterval)
+}
+
+type kiroEventStreamFrame struct {
+	prelude []byte
+	message []byte
+	err     error
+}
+
+func readKiroEventStreamFrame(body io.Reader) kiroEventStreamFrame {
+	prelude := make([]byte, 12)
+	if _, err := io.ReadFull(body, prelude); err != nil {
+		if err == io.EOF {
+			return kiroEventStreamFrame{err: io.EOF}
+		}
+		return kiroEventStreamFrame{err: fmt.Errorf("read Kiro event stream prelude: %w", err)}
+	}
+
+	totalLength := int(binary.BigEndian.Uint32(prelude[0:4]))
+	headersLength := int(binary.BigEndian.Uint32(prelude[4:8]))
+	if totalLength < 16 || totalLength > maxKiroEventStreamFrameBytes {
+		return kiroEventStreamFrame{err: fmt.Errorf("invalid Kiro event stream frame length %d", totalLength)}
+	}
+	if headersLength > totalLength-16 {
+		return kiroEventStreamFrame{err: fmt.Errorf(
+			"invalid Kiro event stream headers length %d for frame length %d",
+			headersLength,
+			totalLength,
+		)}
+	}
+	wantPreludeCRC := binary.BigEndian.Uint32(prelude[8:12])
+	if gotPreludeCRC := crc32.ChecksumIEEE(prelude[:8]); gotPreludeCRC != wantPreludeCRC {
+		return kiroEventStreamFrame{err: fmt.Errorf(
+			"invalid Kiro event stream prelude CRC: got %08x, want %08x",
+			gotPreludeCRC,
+			wantPreludeCRC,
+		)}
+	}
+
+	message := make([]byte, totalLength-12)
+	if _, err := io.ReadFull(body, message); err != nil {
+		return kiroEventStreamFrame{err: fmt.Errorf("read Kiro event stream frame: %w", err)}
+	}
+	return kiroEventStreamFrame{prelude: prelude, message: message}
+}
+
+func streamKiroEventStreamFrames(body io.Reader, frames chan<- kiroEventStreamFrame, done <-chan struct{}) {
+	defer close(frames)
+	for {
+		frame := readKiroEventStreamFrame(body)
+		select {
+		case frames <- frame:
+		case <-done:
+			return
+		}
+		if frame.err != nil {
+			return
+		}
+	}
+}
+
+func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback, keepAliveInterval time.Duration) error {
 	if callback == nil {
 		callback = &KiroStreamCallback{}
 	}
 
-	// Read directly without bufio to avoid buffering latency in streaming responses.
+	// io.ReadFull must wait for a complete upstream frame. Read it on a dedicated
+	// goroutine so the parser can keep the downstream SSE connection alive while
+	// Kiro is thinking. Callback dispatch remains serial on this goroutine.
+	var frames <-chan kiroEventStreamFrame
+	var done chan struct{}
+	var keepAlive <-chan time.Time
+	var keepAliveTimer *time.Timer
+	if callback.OnKeepAlive != nil && keepAliveInterval > 0 {
+		frameStream := make(chan kiroEventStreamFrame, 1)
+		frames = frameStream
+		done = make(chan struct{})
+		defer close(done)
+		go streamKiroEventStreamFrames(body, frameStream, done)
+
+		keepAliveTimer = time.NewTimer(keepAliveInterval)
+		defer keepAliveTimer.Stop()
+		keepAlive = keepAliveTimer.C
+	}
+	resetKeepAlive := func() {
+		if keepAliveTimer == nil {
+			return
+		}
+		if !keepAliveTimer.Stop() {
+			select {
+			case <-keepAliveTimer.C:
+			default:
+			}
+		}
+		keepAliveTimer.Reset(keepAliveInterval)
+	}
+
 	var inputTokens, outputTokens int
 	var totalCredits float64
 	toolUses := newToolUseAccumulator()
 	for {
-		// Prelude: 12 bytes (total_len + headers_len + crc)
-		prelude := make([]byte, 12)
-		_, err := io.ReadFull(body, prelude)
-		if err == io.EOF {
+		var frame kiroEventStreamFrame
+		if keepAliveTimer == nil {
+			frame = readKiroEventStreamFrame(body)
+		} else {
+			select {
+			case <-keepAlive:
+				callback.OnKeepAlive()
+				resetKeepAlive()
+				continue
+			case next, ok := <-frames:
+				if !ok {
+					frame.err = io.EOF
+				} else {
+					frame = next
+				}
+				resetKeepAlive()
+			}
+		}
+		if frame.err == io.EOF {
 			break
 		}
-		if err != nil {
-			return reportKiroStreamError(callback, fmt.Errorf("read Kiro event stream prelude: %w", err))
+		if frame.err != nil {
+			return reportKiroStreamError(callback, frame.err)
 		}
 
-		totalLength := int(binary.BigEndian.Uint32(prelude[0:4]))
+		prelude := frame.prelude
+		msgBuf := frame.message
 		headersLength := int(binary.BigEndian.Uint32(prelude[4:8]))
-
-		if totalLength < 16 || totalLength > maxKiroEventStreamFrameBytes {
-			return reportKiroStreamError(callback, fmt.Errorf("invalid Kiro event stream frame length %d", totalLength))
-		}
-		if headersLength > totalLength-16 {
-			return reportKiroStreamError(callback, fmt.Errorf(
-				"invalid Kiro event stream headers length %d for frame length %d",
-				headersLength,
-				totalLength,
-			))
-		}
-		wantPreludeCRC := binary.BigEndian.Uint32(prelude[8:12])
-		if gotPreludeCRC := crc32.ChecksumIEEE(prelude[:8]); gotPreludeCRC != wantPreludeCRC {
-			return reportKiroStreamError(callback, fmt.Errorf(
-				"invalid Kiro event stream prelude CRC: got %08x, want %08x",
-				gotPreludeCRC,
-				wantPreludeCRC,
-			))
-		}
-
-		// Read the remaining message bytes.
-		remaining := totalLength - 12
-		msgBuf := make([]byte, remaining)
-		_, err = io.ReadFull(body, msgBuf)
-		if err != nil {
-			return reportKiroStreamError(callback, fmt.Errorf("read Kiro event stream frame: %w", err))
-		}
 
 		wantMessageCRC := binary.BigEndian.Uint32(msgBuf[len(msgBuf)-4:])
 		messageCRC := crc32.NewIEEE()

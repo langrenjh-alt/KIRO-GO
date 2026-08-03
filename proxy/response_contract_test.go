@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/json"
 	"fmt"
+	"kiro-go/config"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -74,6 +75,47 @@ func TestResponseContractClaudeModelEcho(t *testing.T) {
 				t.Fatalf("message_start must not contain terminal context_management: %#v", message)
 			}
 		})
+	}
+}
+
+func TestResponseContractClaudeKeepAlivePrecedesDelayedContent(t *testing.T) {
+	h := newResponseContractHandler(t)
+	h.kiroCaller = func(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
+		callback.OnKeepAlive()
+		callback.OnText("continued", false)
+		callback.OnComplete(4, 2)
+		return nil
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(
+		`{"model":"claude-sonnet-4-6","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"test"}]}`,
+	))
+	rec := httptest.NewRecorder()
+	h.handleClaudeMessagesInternal(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	events := decodeResponseContractSSE(t, rec.Body.String())
+	if len(events) < 4 || events[0].Name != "message_start" || events[1].Name != "ping" {
+		t.Fatalf("keepalive prelude=%#v body=%s", events, rec.Body.String())
+	}
+	pings := 0
+	var text strings.Builder
+	for _, event := range events {
+		if event.Name == "ping" {
+			pings++
+		}
+		if event.Name != "content_block_delta" {
+			continue
+		}
+		delta := responseContractMap(t, event.Data["delta"], "content_block_delta.delta")
+		if delta["type"] == "text_delta" {
+			text.WriteString(fmt.Sprint(delta["text"]))
+		}
+	}
+	if pings != 1 || text.String() != "continued" || events[len(events)-1].Name != "message_stop" {
+		t.Fatalf("pings=%d text=%q terminal=%q body=%s", pings, text.String(), events[len(events)-1].Name, rec.Body.String())
 	}
 }
 

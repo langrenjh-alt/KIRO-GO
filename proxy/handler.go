@@ -1569,6 +1569,11 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 		}
 
 		callback := &KiroStreamCallback{
+			OnKeepAlive: func() {
+				ensureMessageStart()
+				h.sendSSE(w, flusher, "ping", map[string]interface{}{"type": "ping"})
+				pingSent = true
+			},
 			OnText: func(text string, isThinking bool) {
 				if text == "" {
 					return
@@ -1908,6 +1913,11 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 func (h *Handler) sendSSE(w http.ResponseWriter, flusher http.Flusher, event string, data interface{}) {
 	jsonData, _ := json.Marshal(data)
 	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, string(jsonData))
+	flusher.Flush()
+}
+
+func writeSSEKeepAlive(w http.ResponseWriter, flusher http.Flusher) {
+	fmt.Fprint(w, ": keep-alive\n\n")
 	flusher.Flush()
 }
 
@@ -2757,6 +2767,9 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		}
 
 		callback := &KiroStreamCallback{
+			OnKeepAlive: func() {
+				writeSSEKeepAlive(w, flusher)
+			},
 			OnText: func(text string, isThinking bool) {
 				if text == "" || stopFilter.Matched() != "" {
 					return

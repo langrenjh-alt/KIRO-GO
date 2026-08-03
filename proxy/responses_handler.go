@@ -654,6 +654,9 @@ func (h *Handler) handleResponsesStream(
 		}
 
 		callback := &KiroStreamCallback{
+			OnKeepAlive: func() {
+				writeSSEKeepAlive(w, flusher)
+			},
 			OnText: func(text string, isThinking bool) {
 				if text == "" {
 					return
