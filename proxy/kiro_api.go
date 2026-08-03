@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -268,6 +269,13 @@ func ListAvailableModels(account *config.Account) ([]ModelInfo, error) {
 // when it is missing. First tries ListAvailableProfiles; if that returns empty,
 // falls back to refreshing the token (which returns profileArn in the response).
 func ResolveProfileArn(account *config.Account) (string, error) {
+	return ResolveProfileArnContext(context.Background(), account)
+}
+
+func ResolveProfileArnContext(ctx context.Context, account *config.Account) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if account == nil {
 		return "", fmt.Errorf("account is nil")
 	}
@@ -292,7 +300,7 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 		// cached ARN then drives the data-plane region via kiroRegionForProfile — no
 		// separate region persistence is needed (and account.Region stays the auth
 		// region, which can legitimately differ from the profile's region).
-		profileArn, err := resolveProfileArnAcrossRegions(account)
+		profileArn, err := resolveProfileArnAcrossRegionsContext(ctx, account)
 		if err == nil && profileArn != "" {
 			if updateErr := config.UpdateAccountProfileArn(account.ID, profileArn); updateErr != nil {
 				logger.Warnf("[ProfileArn] Failed to cache profile ARN for %s: %v", account.Email, updateErr)
@@ -303,10 +311,13 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 		profileUnsupportedErr = err
 		profileUnsupported = isBuilderIDProfileUnsupportedError(account, err)
 	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 
 	// Fallback: refresh token to get profileArn from auth response
 	if account.RefreshToken != "" {
-		_, _, _, refreshedArn, refreshErr := auth.RefreshToken(account)
+		_, _, _, refreshedArn, refreshErr := auth.RefreshTokenContext(ctx, account)
 		if refreshErr == nil && refreshedArn != "" {
 			if updateErr := config.UpdateAccountProfileArn(account.ID, refreshedArn); updateErr != nil {
 				logger.Warnf("[ProfileArn] Failed to cache profile ARN for %s: %v", account.Email, updateErr)
@@ -314,6 +325,9 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 			account.ProfileArn = refreshedArn
 			return refreshedArn, nil
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 	if profileLookupSuppressed {
 		return "", fmt.Errorf("profile ARN resolution skipped: previous Builder ID profile lookup was unsupported")
@@ -415,9 +429,19 @@ func ensureRestProfileArn(account *config.Account) error {
 // Builder ID "unsupported" 403 is authoritative across all regions, so it
 // short-circuits the probe rather than repeating per region.
 func resolveProfileArnAcrossRegions(account *config.Account) (string, error) {
+	return resolveProfileArnAcrossRegionsContext(context.Background(), account)
+}
+
+func resolveProfileArnAcrossRegionsContext(ctx context.Context, account *config.Account) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var lastErr error
 	for _, region := range kiroProfileRegionCandidates(account) {
-		arn, probeErr := listAvailableProfilesWithRetryInRegion(account, region)
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		arn, probeErr := listAvailableProfilesWithRetryInRegionContext(ctx, account, region)
 		if probeErr == nil && strings.TrimSpace(arn) != "" {
 			return arn, nil
 		}
@@ -436,12 +460,19 @@ func resolveProfileArnAcrossRegions(account *config.Account) (string, error) {
 // short backoff. An empty profile list or 4xx (other than 429) is treated as
 // authoritative and not retried — they reflect account state, not upstream flakiness.
 func listAvailableProfilesWithRetryInRegion(account *config.Account, region string) (string, error) {
+	return listAvailableProfilesWithRetryInRegionContext(context.Background(), account, region)
+}
+
+func listAvailableProfilesWithRetryInRegionContext(ctx context.Context, account *config.Account, region string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	const maxAttempts = 3
 	backoff := 200 * time.Millisecond
 
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		profileArn, err := listAvailableProfilesInRegion(account, region)
+		profileArn, err := listAvailableProfilesInRegionContext(ctx, account, region)
 		if err == nil {
 			return profileArn, nil
 		}
@@ -451,7 +482,18 @@ func listAvailableProfilesWithRetryInRegion(account *config.Account, region stri
 		}
 		logger.Debugf("[ProfileArn] ListAvailableProfiles transient failure for %s in %s (attempt %d/%d): %v",
 			account.Email, region, attempt, maxAttempts, err)
-		time.Sleep(backoff)
+		timer := time.NewTimer(backoff)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return "", ctx.Err()
+		}
 		backoff *= 2
 	}
 	return "", lastErr
@@ -481,8 +523,15 @@ func isTransientProfileFetchError(err error) bool {
 // stored one — is what makes cross-region detection possible: the same credential is
 // probed against each candidate region until one returns a profile.
 func listAvailableProfilesInRegion(account *config.Account, region string) (string, error) {
+	return listAvailableProfilesInRegionContext(context.Background(), account, region)
+}
+
+func listAvailableProfilesInRegionContext(ctx context.Context, account *config.Account, region string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	endpoint := regionalizeURLForRegion(fmt.Sprintf("%s/ListAvailableProfiles", kiroRestAPIBase), region)
-	req, err := http.NewRequest("POST", endpoint, strings.NewReader(`{"maxResults":10}`))
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, strings.NewReader(`{"maxResults":10}`))
 	if err != nil {
 		return "", err
 	}

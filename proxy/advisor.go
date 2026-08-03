@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -65,6 +66,7 @@ func withoutNativeAdvisorTools(tools []ClaudeTool) []ClaudeTool {
 
 func (h *Handler) handleAdvisorRequest(
 	w http.ResponseWriter,
+	ctx context.Context,
 	req *ClaudeRequest,
 	responseModel string,
 	thinking bool,
@@ -109,10 +111,13 @@ func (h *Handler) handleAdvisorRequest(
 	} else if advisorReq.MaxTokens <= 0 {
 		advisorReq.MaxTokens = 4096
 	}
-	advisorPayload := ClaudeToKiro(&advisorReq, false)
+	advisorPayload := bindKiroPayloadContext(ClaudeToKiro(&advisorReq, false), ctx)
 	advisorEstimate := estimateClaudeRequestInputTokens(&advisorReq)
 	advisorResult, err := h.callClaudeBuffered(advisorModel, advisorPayload, false, advisorEstimate)
 	if err != nil {
+		if isDownstreamRequestCanceled(advisorPayload, err) {
+			return
+		}
 		h.handleAdvisorFailure(w, req.Model, err)
 		return
 	}
@@ -142,7 +147,7 @@ func (h *Handler) handleAdvisorRequest(
 	if h.promptCache != nil {
 		cacheProfile = h.promptCache.BuildClaudeProfile(executorEffectiveReq, executorEstimate, isolationSeed)
 	}
-	executorPayload := ClaudeToKiro(&executorReq, thinking)
+	executorPayload := bindKiroPayloadContext(ClaudeToKiro(&executorReq, thinking), ctx)
 	toolUseID := newClaudeServerToolUseID()
 	serverBlocks := []ClaudeContentBlock{
 		{Type: "server_tool_use", ID: toolUseID, Name: advisorToolName, Input: map[string]interface{}{}},
@@ -169,6 +174,9 @@ func (h *Handler) handleAdvisorRequest(
 	}
 	executorResult, err := h.callClaudeBuffered(req.Model, executorPayload, thinking, executorEstimate)
 	if err != nil {
+		if isDownstreamRequestCanceled(executorPayload, err) {
+			return
+		}
 		h.handleAdvisorFailure(w, req.Model, err)
 		return
 	}
@@ -331,8 +339,11 @@ func (h *Handler) callClaudeBuffered(
 			}
 			break
 		}
-		if err := h.ensureValidToken(account); err != nil {
+		if err := h.ensureValidTokenForPayload(account, payload); err != nil {
 			h.releaseAccount(account)
+			if isDownstreamRequestCanceled(payload, err) {
+				return nil, err
+			}
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
@@ -387,6 +398,9 @@ func (h *Handler) callClaudeBuffered(
 		}
 		if err := call(account, payload, callback); err != nil {
 			h.releaseAccount(account)
+			if isDownstreamRequestCanceled(payload, err) {
+				return nil, err
+			}
 			lastErr = err
 			if isKiroInputTooLongError(err) {
 				return nil, err
@@ -400,8 +414,13 @@ func (h *Handler) callClaudeBuffered(
 					return nil, err
 				}
 				retrySameID = decision.RetrySameID
-				h.sleepBeforeRateLimitRetry(decision)
+				if !h.waitBeforeRateLimitRetry(payload, decision) {
+					return nil, payload.requestContext.Err()
+				}
 				continue
+			}
+			if isKiroClientRequestError(err) {
+				return nil, err
 			}
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
@@ -432,6 +451,10 @@ func (h *Handler) callClaudeBuffered(
 func (h *Handler) handleAdvisorFailure(w http.ResponseWriter, model string, err error) {
 	h.recordFailureWithDetails("claude", model, "", err)
 	if isKiroInputTooLongError(err) {
+		h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	if isKiroClientRequestError(err) {
 		h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}

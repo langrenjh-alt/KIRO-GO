@@ -146,7 +146,7 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	kiroPayload := OpenAIToKiro(openaiReq, thinking)
+	kiroPayload := bindKiroPayloadContext(OpenAIToKiro(openaiReq, thinking), r.Context())
 
 	if req.Stream {
 		h.handleResponsesStream(w, kiroPayload, actualModel, requestedModel, thinking, estimatedInputTokens,
@@ -180,8 +180,11 @@ func (h *Handler) handleResponsesNonStream(
 			}
 			break
 		}
-		if err := h.ensureValidToken(account); err != nil {
+		if err := h.ensureValidTokenForPayload(account, payload); err != nil {
 			h.releaseAccount(account)
+			if isDownstreamRequestCanceled(payload, err) {
+				return
+			}
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
@@ -222,6 +225,9 @@ func (h *Handler) handleResponsesNonStream(
 		err := CallKiroAPI(account, payload, callback)
 		h.releaseAccount(account)
 		if err != nil {
+			if isDownstreamRequestCanceled(payload, err) {
+				return
+			}
 			lastErr = err
 			if isKiroInputTooLongError(err) {
 				h.recordFailureWithDetails("responses", model, account.ID, err)
@@ -241,8 +247,15 @@ func (h *Handler) handleResponsesNonStream(
 					return
 				}
 				retrySameID = decision.RetrySameID
-				h.sleepBeforeRateLimitRetry(decision)
+				if !h.waitBeforeRateLimitRetry(payload, decision) {
+					return
+				}
 				continue
+			}
+			if isKiroClientRequestError(err) {
+				h.recordFailureWithDetails("responses", model, account.ID, err)
+				h.sendOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+				return
 			}
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
@@ -473,8 +486,11 @@ func (h *Handler) handleResponsesStream(
 			}
 			break
 		}
-		if err := h.ensureValidToken(account); err != nil {
+		if err := h.ensureValidTokenForPayload(account, payload); err != nil {
 			h.releaseAccount(account)
+			if isDownstreamRequestCanceled(payload, err) {
+				return
+			}
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
@@ -751,6 +767,9 @@ func (h *Handler) handleResponsesStream(
 		err := CallKiroAPI(account, payload, callback)
 		h.releaseAccount(account)
 		if err != nil {
+			if isDownstreamRequestCanceled(payload, err) {
+				return
+			}
 			if isKiroInputTooLongError(err) {
 				send("response.failed", map[string]interface{}{
 					"type": "response.failed",
@@ -792,7 +811,9 @@ func (h *Handler) handleResponsesStream(
 				}
 				retrySameID = decision.RetrySameID
 				if !responseStarted {
-					h.sleepBeforeRateLimitRetry(decision)
+					if !h.waitBeforeRateLimitRetry(payload, decision) {
+						return
+					}
 					continue
 				}
 				send("response.failed", map[string]interface{}{
@@ -801,6 +822,18 @@ func (h *Handler) handleResponsesStream(
 						"id":     respID,
 						"status": "failed",
 						"error":  map[string]string{"type": "rate_limit_error", "message": err.Error()},
+					},
+				})
+				h.recordFailureWithDetails("responses", model, account.ID, err)
+				return
+			}
+			if isKiroClientRequestError(err) {
+				send("response.failed", map[string]interface{}{
+					"type": "response.failed",
+					"response": map[string]interface{}{
+						"id":     respID,
+						"status": "failed",
+						"error":  map[string]string{"type": "invalid_request_error", "message": err.Error()},
 					},
 				})
 				h.recordFailureWithDetails("responses", model, account.ID, err)

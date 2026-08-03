@@ -261,6 +261,31 @@ type KiroPayload struct {
 	// normalization. In particular, Anthropic's any/required mode expects one
 	// selected call even when Kiro proposes more than one.
 	ToolChoiceMode string `json:"-"`
+
+	// requestContext links the upstream request lifetime to the downstream
+	// client. It is intentionally unexported and never serialized.
+	requestContext context.Context
+}
+
+func bindKiroPayloadContext(payload *KiroPayload, ctx context.Context) *KiroPayload {
+	if payload != nil && ctx != nil {
+		payload.requestContext = ctx
+	}
+	return payload
+}
+
+func kiroPayloadContext(payload *KiroPayload) context.Context {
+	if payload != nil && payload.requestContext != nil {
+		return payload.requestContext
+	}
+	return context.Background()
+}
+
+func isDownstreamRequestCanceled(payload *KiroPayload, err error) bool {
+	if payload == nil || payload.requestContext == nil || payload.requestContext.Err() == nil {
+		return false
+	}
+	return err == nil || errors.Is(err, payload.requestContext.Err()) || errors.Is(err, context.Canceled)
 }
 
 type KiroUserInputMessage struct {
@@ -361,6 +386,19 @@ type KiroStreamProtocolError struct {
 	Err  error
 }
 
+type KiroHTTPError struct {
+	StatusCode int
+	Endpoint   string
+	Body       string
+}
+
+func (e *KiroHTTPError) Error() string {
+	if e == nil {
+		return "Kiro HTTP error"
+	}
+	return fmt.Sprintf("HTTP %d from %s: %s", e.StatusCode, e.Endpoint, e.Body)
+}
+
 func (e *KiroStreamProtocolError) Error() string {
 	if e == nil || e.Err == nil {
 		return "Kiro stream protocol error"
@@ -396,6 +434,9 @@ func isRetryableKiroStreamError(err error) bool {
 	if code, ok := kiroStreamProtocolErrorCode(err); ok {
 		return code == "upstream_tool_json_error"
 	}
+	if isKiroTransportError(err) {
+		return true
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
@@ -408,6 +449,39 @@ func isRetryableKiroStreamError(err error) bool {
 		(strings.Contains(message, "kiro stream exception") && strings.Contains(message, "internal")) ||
 		(strings.Contains(message, "internal_error") && strings.Contains(message, "stream")) ||
 		(strings.Contains(message, "received from peer") && strings.Contains(message, "stream"))
+}
+
+func isKiroTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.ErrClosedPipe) {
+		return true
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
+}
+
+func isKiroClientRequestError(err error) bool {
+	var httpErr *KiroHTTPError
+	if !errors.As(err, &httpErr) || httpErr.StatusCode < http.StatusBadRequest || httpErr.StatusCode >= http.StatusInternalServerError {
+		return false
+	}
+	switch httpErr.StatusCode {
+	case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden, http.StatusRequestTimeout, http.StatusTooManyRequests:
+		return false
+	default:
+		return true
+	}
+}
+
+func isKiroTransientHTTPError(err error) bool {
+	var httpErr *KiroHTTPError
+	return errors.As(err, &httpErr) && (httpErr.StatusCode == http.StatusRequestTimeout || httpErr.StatusCode >= http.StatusInternalServerError)
 }
 
 func isKiroToolJSONError(err error) bool {
@@ -446,6 +520,10 @@ func setPayloadProfileArnForAccount(payload *KiroPayload, account *config.Accoun
 // CallKiroAPI calls the single regional Kiro streaming endpoint. Legacy
 // preferredEndpoint and endpointFallback settings are intentionally ignored.
 func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
+	requestContext := kiroPayloadContext(payload)
+	if err := requestContext.Err(); err != nil {
+		return err
+	}
 	originalProfileArn := ""
 	if payload != nil {
 		originalProfileArn = payload.ProfileArn
@@ -479,8 +557,10 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 	}
 
 	if payload != nil && strings.TrimSpace(payload.ProfileArn) == "" {
-		if profileArn, err := ResolveProfileArn(account); err == nil {
+		if profileArn, err := ResolveProfileArnContext(requestContext, account); err == nil {
 			payload.ProfileArn = profileArn
+		} else if requestContext.Err() != nil {
+			return requestContext.Err()
 		} else if isProfileArnResolutionSoftError(err) {
 			logger.Debugf("[ProfileArn] Skipped profile ARN resolution for %s: %v", accountEmailForLog(account), err)
 		} else {
@@ -510,7 +590,7 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 	if marshalErr != nil {
 		return marshalErr
 	}
-	req, requestErr := http.NewRequest("POST", epURL, bytes.NewReader(reqBody))
+	req, requestErr := http.NewRequestWithContext(requestContext, "POST", epURL, bytes.NewReader(reqBody))
 	if requestErr != nil {
 		return requestErr
 	}
@@ -541,7 +621,7 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 	if resp.StatusCode != 200 {
 		errBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		err := fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
+		err := &KiroHTTPError{StatusCode: resp.StatusCode, Endpoint: ep.Name, Body: string(errBody)}
 		logger.Warnf("[KiroAPI] Endpoint %s error: %v", ep.Name, err)
 		return err
 	}

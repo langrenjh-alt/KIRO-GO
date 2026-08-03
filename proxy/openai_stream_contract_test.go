@@ -3,8 +3,10 @@ package proxy
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"kiro-go/config"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -227,6 +229,67 @@ func TestOpenAIChatStreamFlushesShortDeltaBeforeUpstreamCompletes(t *testing.T) 
 	}
 	if body := firstEvent + string(rest); !strings.Contains(body, `"content":"first"`) || !strings.Contains(body, `"content":" second"`) {
 		t.Fatalf("stream did not preserve both deltas: %s", body)
+	}
+}
+
+func TestOpenAIChatStreamFailureTerminatesWithErrorAndDone(t *testing.T) {
+	valid := awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "partial"})
+	broken := awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+		"toolUseId": "toolu_bad",
+		"name":      "broken",
+		"input":     `{"unterminated":`,
+		"stop":      true,
+	})
+	h := newOpenAIChatContractHandler(t, valid, broken)
+	rec := httptest.NewRecorder()
+	h.handleOpenAIChat(rec, httptest.NewRequest(
+		http.MethodPost,
+		"/v1/chat/completions",
+		strings.NewReader(`{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"test"}],"stream":true}`),
+	))
+
+	body := rec.Body.String()
+	if !strings.Contains(body, `"content":"partial"`) || !strings.Contains(body, `"error"`) {
+		t.Fatalf("stream must preserve partial content and expose failure: %s", body)
+	}
+	if !strings.HasSuffix(strings.TrimSpace(body), "data: [DONE]") {
+		t.Fatalf("failed stream is missing final [DONE]: %s", body)
+	}
+	frames := strings.Split(strings.TrimSpace(strings.ReplaceAll(body, "\r\n", "\n")), "\n\n")
+	if len(frames) < 2 || !strings.HasPrefix(frames[len(frames)-2], "data: {") {
+		t.Fatalf("failed stream is missing structured error frame: %#v", frames)
+	}
+	var envelope map[string]interface{}
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(frames[len(frames)-2], "data: ")), &envelope); err != nil {
+		t.Fatalf("decode error frame: %v", err)
+	}
+	errorBody := openAIChatContractMap(t, envelope["error"], "stream error")
+	if errorBody["type"] != "upstream_tool_json_error" || !strings.Contains(fmt.Sprint(errorBody["message"]), "invalid JSON for tool use") {
+		t.Fatalf("stream error=%#v", errorBody)
+	}
+}
+
+func TestOpenAIChatHeartbeatThenFailureTerminatesWithDone(t *testing.T) {
+	h, cleanup := setupResponsesTestHandler(t)
+	t.Cleanup(cleanup)
+	h.kiroCaller = func(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
+		callback.OnKeepAlive()
+		return &KiroStreamProtocolError{Code: "upstream_stream_error", Err: errors.New("invalid upstream stream")}
+	}
+
+	rec := httptest.NewRecorder()
+	h.handleOpenAIChat(rec, httptest.NewRequest(
+		http.MethodPost,
+		"/v1/chat/completions",
+		strings.NewReader(`{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"test"}],"stream":true}`),
+	))
+
+	body := rec.Body.String()
+	if !strings.Contains(body, ": keep-alive\n\n") || !strings.Contains(body, `"error"`) {
+		t.Fatalf("stream must preserve heartbeat and expose failure: %s", body)
+	}
+	if !strings.HasSuffix(strings.TrimSpace(body), "data: [DONE]") {
+		t.Fatalf("heartbeat-only failed stream is missing final [DONE]: %s", body)
 	}
 }
 

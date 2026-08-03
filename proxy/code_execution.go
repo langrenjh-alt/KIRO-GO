@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -86,6 +87,7 @@ func newCodeExecutionContainer() *ClaudeContainer {
 
 func (h *Handler) handleCodeExecutionRequest(
 	w http.ResponseWriter,
+	ctx context.Context,
 	req *ClaudeRequest,
 	responseModel string,
 	estimatedInputTokens int,
@@ -97,9 +99,12 @@ func (h *Handler) handleCodeExecutionRequest(
 	}
 	started := time.Now()
 	generatorReq := codeExecutionGeneratorRequest(req)
-	payload := ClaudeToKiro(generatorReq, false)
+	payload := bindKiroPayloadContext(ClaudeToKiro(generatorReq, false), ctx)
 	result, err := h.callClaudeBuffered(req.Model, payload, false, estimateClaudeRequestInputTokens(generatorReq))
 	if err != nil {
+		if isDownstreamRequestCanceled(payload, err) {
+			return
+		}
 		h.handleAdvisorFailure(w, req.Model, err)
 		return
 	}

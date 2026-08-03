@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
@@ -70,7 +71,8 @@ type Handler struct {
 	promptCache         *promptCacheTracker
 	promptCacheConfigMu sync.Mutex
 	traffic             *TrafficTracker
-	tokenRefreshMu      sync.Mutex
+	tokenRefreshOnce    sync.Once
+	tokenRefreshGate    chan struct{}
 	// Request-triggered expired-token refresh is single-flight per account.
 	expiredRefreshMu         sync.Mutex
 	refreshingExpiredTokens  map[string]int64
@@ -976,13 +978,13 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		return
 	}
 	if _, ok := findNativeCodeExecutionTool(&selectedReq); ok {
-		h.handleCodeExecutionRequest(w, &selectedReq, requestedModel, estimatedInputTokens, apiKeyID)
+		h.handleCodeExecutionRequest(w, r.Context(), &selectedReq, requestedModel, estimatedInputTokens, apiKeyID)
 		return
 	}
 	if _, ok := findNativeAdvisorTool(&selectedReq); ok {
 		isolationSeed := claudePromptCacheIsolationSeed(effectiveReq, apiKeyID, extractProvidedKey(r))
 		h.handleAdvisorRequest(
-			w, &selectedReq, requestedModel, thinking, thinkingResponseOpts, isolationSeed, apiKeyID,
+			w, r.Context(), &selectedReq, requestedModel, thinking, thinkingResponseOpts, isolationSeed, apiKeyID,
 		)
 		return
 	}
@@ -1000,7 +1002,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	cacheProfile := h.promptCache.BuildClaudeProfileForRequest(effectiveReq, estimatedInputTokens, isolationSeed, requestBodyFingerprint)
 
 	// 转换请求
-	kiroPayload := ClaudeToKiro(&selectedReq, thinking)
+	kiroPayload := bindKiroPayloadContext(ClaudeToKiro(&selectedReq, thinking), r.Context())
 
 	// Stream or non-stream
 	if req.Stream {
@@ -1028,11 +1030,19 @@ func setAnthropicRequestID(w http.ResponseWriter) {
 // connections avoids reusing a connection that just reported an HTTP/2 stream
 // INTERNAL_ERROR. Callers must increase their attempt budget when this returns
 // true and must never call it after writing a response event.
-func (h *Handler) retryKiroPreResponse(account *config.Account, retryCount *int, excluded map[string]bool, retrySameID *string) bool {
+func (h *Handler) retryKiroPreResponse(payload *KiroPayload, account *config.Account, retryCount *int, excluded map[string]bool, retrySameID *string) (bool, error) {
 	if account == nil || retryCount == nil || *retryCount >= maxKiroPreResponseRetries {
-		return false
+		return false, nil
 	}
-	*retryCount = *retryCount + 1
+	nextRetryCount := *retryCount + 1
+	delay := 100 * time.Millisecond
+	for i := 1; i < nextRetryCount && i < 4; i++ {
+		delay *= 2
+	}
+	if !waitForRateLimitRetry(kiroPayloadContext(payload), rateLimitDecision{Delay: delay}) {
+		return false, kiroPayloadContext(payload).Err()
+	}
+	*retryCount = nextRetryCount
 	if h.pool != nil && h.pool.Count() > 1 && *retryCount > 2 {
 		// A default switch-account policy allows one pass through the pool.
 		// For a transport-wide peer reset, start one bounded fresh pass rather
@@ -1047,12 +1057,7 @@ func (h *Handler) retryKiroPreResponse(account *config.Account, retryCount *int,
 		*retrySameID = account.ID
 	}
 	CloseKiroIdleConnections()
-	delay := 100 * time.Millisecond
-	for i := 1; i < *retryCount && i < 4; i++ {
-		delay *= 2
-	}
-	time.Sleep(delay)
-	return true
+	return true, nil
 }
 
 func readRequestBodyWithLimit(w http.ResponseWriter, r *http.Request, maxBytes int64) ([]byte, error) {
@@ -1165,8 +1170,11 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 			}
 			break
 		}
-		if err := h.ensureValidToken(account); err != nil {
+		if err := h.ensureValidTokenForPayload(account, payload); err != nil {
 			h.releaseAccount(account)
+			if isDownstreamRequestCanceled(payload, err) {
+				return
+			}
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
@@ -1682,6 +1690,9 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 		err := call(account, payload, callback)
 		h.releaseAccount(account)
 		if err != nil {
+			if isDownstreamRequestCanceled(payload, err) {
+				return
+			}
 			lastErr = err
 			if isKiroInputTooLongError(err) {
 				h.recordFailureWithDetails("claude", model, account.ID, err)
@@ -1710,10 +1721,16 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 					logger.Warnf("[KiroAPI] retrying Claude stream after truncated tool JSON account_id=%s retry=%d/%d: %v", account.ID, toolJSONRetryCounts[account.ID], maxKiroToolJSONRetries, err)
 					continue
 				}
-				if !messageStarted && isRetryableKiroStreamError(err) && h.retryKiroPreResponse(account, &preResponseRetryCount, excluded, &retrySameID) {
-					attemptLimit++
-					logger.Warnf("[KiroAPI] retrying Claude stream after pre-response protocol error account_id=%s code=%s retry=%d/%d: %v", account.ID, code, preResponseRetryCount, maxKiroPreResponseRetries, err)
-					continue
+				if !messageStarted && isRetryableKiroStreamError(err) {
+					retried, retryErr := h.retryKiroPreResponse(payload, account, &preResponseRetryCount, excluded, &retrySameID)
+					if retryErr != nil {
+						return
+					}
+					if retried {
+						attemptLimit++
+						logger.Warnf("[KiroAPI] retrying Claude stream after pre-response protocol error account_id=%s code=%s retry=%d/%d: %v", account.ID, code, preResponseRetryCount, maxKiroPreResponseRetries, err)
+						continue
+					}
 				}
 				h.recordFailureWithDetails("claude", model, account.ID, err)
 				if !messageStarted {
@@ -1742,7 +1759,9 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 				}
 				retrySameID = decision.RetrySameID
 				if !messageStarted {
-					h.sleepBeforeRateLimitRetry(decision)
+					if !h.waitBeforeRateLimitRetry(payload, decision) {
+						return
+					}
 					continue
 				}
 				h.recordFailureWithDetails("claude", model, account.ID, err)
@@ -1752,10 +1771,28 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 				})
 				return
 			}
-			if !messageStarted && isRetryableKiroStreamError(err) && h.retryKiroPreResponse(account, &preResponseRetryCount, excluded, &retrySameID) {
-				attemptLimit++
-				logger.Warnf("[KiroAPI] retrying Claude stream after transient pre-response error account_id=%s retry=%d/%d: %v", account.ID, preResponseRetryCount, maxKiroPreResponseRetries, err)
-				continue
+			if isKiroClientRequestError(err) {
+				h.recordFailureWithDetails("claude", model, account.ID, err)
+				if !messageStarted {
+					h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+				} else {
+					h.sendSSE(w, flusher, "error", map[string]interface{}{
+						"type":  "error",
+						"error": map[string]string{"type": "invalid_request_error", "message": err.Error()},
+					})
+				}
+				return
+			}
+			if !messageStarted && isRetryableKiroStreamError(err) {
+				retried, retryErr := h.retryKiroPreResponse(payload, account, &preResponseRetryCount, excluded, &retrySameID)
+				if retryErr != nil {
+					return
+				}
+				if retried {
+					attemptLimit++
+					logger.Warnf("[KiroAPI] retrying Claude stream after transient pre-response error account_id=%s retry=%d/%d: %v", account.ID, preResponseRetryCount, maxKiroPreResponseRetries, err)
+					continue
+				}
 			}
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
@@ -2141,8 +2178,11 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			}
 			break
 		}
-		if err := h.ensureValidToken(account); err != nil {
+		if err := h.ensureValidTokenForPayload(account, payload); err != nil {
 			h.releaseAccount(account)
+			if isDownstreamRequestCanceled(payload, err) {
+				return
+			}
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
@@ -2222,16 +2262,25 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		err := call(account, payload, callback)
 		h.releaseAccount(account)
 		if err != nil {
+			if isDownstreamRequestCanceled(payload, err) {
+				return
+			}
 			lastErr = err
 			if isKiroInputTooLongError(err) {
 				h.recordFailureWithDetails("claude", model, account.ID, err)
 				h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 				return
 			}
-			if !isKiroToolJSONError(err) && isRetryableKiroStreamError(err) && h.retryKiroPreResponse(account, &preResponseRetryCount, excluded, &retrySameID) {
-				attemptLimit++
-				logger.Warnf("[KiroAPI] retrying Claude non-stream after transient pre-response error account_id=%s retry=%d/%d: %v", account.ID, preResponseRetryCount, maxKiroPreResponseRetries, err)
-				continue
+			if !isKiroToolJSONError(err) && isRetryableKiroStreamError(err) {
+				retried, retryErr := h.retryKiroPreResponse(payload, account, &preResponseRetryCount, excluded, &retrySameID)
+				if retryErr != nil {
+					return
+				}
+				if retried {
+					attemptLimit++
+					logger.Warnf("[KiroAPI] retrying Claude non-stream after transient pre-response error account_id=%s retry=%d/%d: %v", account.ID, preResponseRetryCount, maxKiroPreResponseRetries, err)
+					continue
+				}
 			}
 			if code, protocolErr := kiroStreamProtocolErrorCode(err); protocolErr {
 				h.recordFailureWithDetails("claude", model, account.ID, err)
@@ -2246,8 +2295,15 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 					return
 				}
 				retrySameID = decision.RetrySameID
-				h.sleepBeforeRateLimitRetry(decision)
+				if !h.waitBeforeRateLimitRetry(payload, decision) {
+					return
+				}
 				continue
+			}
+			if isKiroClientRequestError(err) {
+				h.recordFailureWithDetails("claude", model, account.ID, err)
+				h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+				return
 			}
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
@@ -2441,7 +2497,7 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	req.Model = actualModel
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
 
-	kiroPayload := OpenAIToKiro(&req, thinking)
+	kiroPayload := bindKiroPayloadContext(OpenAIToKiro(&req, thinking), r.Context())
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	if req.Stream {
@@ -2473,6 +2529,19 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	var lastErr error
 	reqStart := time.Now()
 	preResponseRetryCount := 0
+	streamCommitted := false
+	finishWithStreamError := func(errType string, err error) {
+		message := "upstream stream failed"
+		if err != nil {
+			message = err.Error()
+		}
+		data, _ := json.Marshal(map[string]interface{}{
+			"error": map[string]string{"type": errType, "message": message},
+		})
+		fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", data)
+		flusher.Flush()
+		streamCommitted = true
+	}
 
 	attemptLimit := h.maxAccountAttempts()
 	for attempt := 0; attempt < attemptLimit; attempt++ {
@@ -2486,8 +2555,11 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			}
 			break
 		}
-		if err := h.ensureValidToken(account); err != nil {
+		if err := h.ensureValidTokenForPayload(account, payload); err != nil {
 			h.releaseAccount(account)
+			if isDownstreamRequestCanceled(payload, err) {
+				return
+			}
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
@@ -2529,6 +2601,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			fmt.Fprintf(w, "data: %s\n\n", string(data))
 			flusher.Flush()
 			responseStarted = true
+			streamCommitted = true
 		}
 
 		ensureAssistantRole := func() {
@@ -2760,6 +2833,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		callback := &KiroStreamCallback{
 			OnKeepAlive: func() {
 				writeSSEKeepAlive(w, flusher)
+				streamCommitted = true
 			},
 			OnText: func(text string, isThinking bool) {
 				if text == "" || stopFilter.Matched() != "" {
@@ -2816,6 +2890,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				fmt.Fprintf(w, "data: %s\n\n", string(data))
 				flusher.Flush()
 				responseStarted = true
+				streamCommitted = true
 			},
 			OnComplete: func(inTok, outTok int) {
 				inputTokens = inTok
@@ -2835,26 +2910,43 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		call := h.kiroCaller
+		if call == nil {
+			call = CallKiroAPI
+		}
+		err := call(account, payload, callback)
 		h.releaseAccount(account)
 		if err != nil {
+			if isDownstreamRequestCanceled(payload, err) {
+				return
+			}
 			lastErr = err
 			if isKiroInputTooLongError(err) {
 				h.recordFailureWithDetails("openai", model, account.ID, err)
-				if !responseStarted {
+				if !streamCommitted {
 					h.sendOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+				} else {
+					finishWithStreamError("invalid_request_error", err)
 				}
 				return
 			}
-			if !responseStarted && isRetryableKiroStreamError(err) && h.retryKiroPreResponse(account, &preResponseRetryCount, excluded, &retrySameID) {
-				attemptLimit++
-				logger.Warnf("[KiroAPI] retrying OpenAI stream after transient pre-response error account_id=%s retry=%d/%d: %v", account.ID, preResponseRetryCount, maxKiroPreResponseRetries, err)
-				continue
+			if !responseStarted && isRetryableKiroStreamError(err) {
+				retried, retryErr := h.retryKiroPreResponse(payload, account, &preResponseRetryCount, excluded, &retrySameID)
+				if retryErr != nil {
+					return
+				}
+				if retried {
+					attemptLimit++
+					logger.Warnf("[KiroAPI] retrying OpenAI stream after transient pre-response error account_id=%s retry=%d/%d: %v", account.ID, preResponseRetryCount, maxKiroPreResponseRetries, err)
+					continue
+				}
 			}
 			if code, protocolErr := kiroStreamProtocolErrorCode(err); protocolErr {
 				h.recordFailureWithDetails("openai", model, account.ID, err)
-				if !responseStarted {
+				if !streamCommitted {
 					h.sendOpenAIError(w, http.StatusBadGateway, code, err.Error())
+				} else {
+					finishWithStreamError(code, err)
 				}
 				return
 			}
@@ -2863,17 +2955,31 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				decision := h.applyRateLimitPolicy(account, retryCounts, excluded)
 				if decision.Return429 {
 					h.recordFailureWithDetails("openai", model, account.ID, err)
-					if !responseStarted {
+					if !streamCommitted {
 						h.sendOpenAIError(w, http.StatusTooManyRequests, "rate_limit_error", err.Error())
+					} else {
+						finishWithStreamError("rate_limit_error", err)
 					}
 					return
 				}
 				retrySameID = decision.RetrySameID
 				if !responseStarted {
-					h.sleepBeforeRateLimitRetry(decision)
+					if !h.waitBeforeRateLimitRetry(payload, decision) {
+						return
+					}
 					continue
 				}
 				h.recordFailureWithDetails("openai", model, account.ID, err)
+				finishWithStreamError("rate_limit_error", err)
+				return
+			}
+			if isKiroClientRequestError(err) {
+				h.recordFailureWithDetails("openai", model, account.ID, err)
+				if !streamCommitted {
+					h.sendOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+				} else {
+					finishWithStreamError("invalid_request_error", err)
+				}
 				return
 			}
 			excluded[account.ID] = true
@@ -2882,6 +2988,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				continue
 			}
 			h.recordFailureWithDetails("openai", model, account.ID, err)
+			finishWithStreamError("server_error", err)
 			return
 		}
 
@@ -2948,26 +3055,47 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	}
 
 	if lastErr == nil {
-		h.recordFailureWithDetails("openai", model, "", fmt.Errorf("No available accounts"))
-		h.sendOpenAIError(w, http.StatusServiceUnavailable, "server_error", "No available accounts")
+		lastErr = fmt.Errorf("No available accounts")
+		h.recordFailureWithDetails("openai", model, "", lastErr)
+		if streamCommitted {
+			finishWithStreamError("server_error", lastErr)
+		} else {
+			h.sendOpenAIError(w, http.StatusServiceUnavailable, "server_error", lastErr.Error())
+		}
 		return
 	}
 
 	h.recordFailureWithDetails("openai", model, "", lastErr)
 	if isAccountRefreshInProgressError(lastErr) {
+		if streamCommitted {
+			finishWithStreamError("account_refreshing", lastErr)
+			return
+		}
 		w.Header().Set("Retry-After", fmt.Sprintf("%d", int(expiredAccountRefreshWait.Seconds())))
 		h.sendOpenAIError(w, accountRefreshInProgressStatus, "account_refreshing", accountRefreshInProgressMessage)
 		return
 	}
 	if isAllAccountsConcurrencyFullError(lastErr) {
-		h.sendOpenAIError(w, http.StatusServiceUnavailable, "server_error", allAccountsConcurrencyFullMessage)
+		if streamCommitted {
+			finishWithStreamError("server_error", lastErr)
+		} else {
+			h.sendOpenAIError(w, http.StatusServiceUnavailable, "server_error", allAccountsConcurrencyFullMessage)
+		}
 		return
 	}
 	if isRateLimitError(lastErr) {
-		h.sendOpenAIError(w, http.StatusTooManyRequests, "rate_limit_error", lastErr.Error())
+		if streamCommitted {
+			finishWithStreamError("rate_limit_error", lastErr)
+		} else {
+			h.sendOpenAIError(w, http.StatusTooManyRequests, "rate_limit_error", lastErr.Error())
+		}
 		return
 	}
-	h.sendOpenAIError(w, http.StatusInternalServerError, "server_error", lastErr.Error())
+	if streamCommitted {
+		finishWithStreamError("server_error", lastErr)
+	} else {
+		h.sendOpenAIError(w, http.StatusInternalServerError, "server_error", lastErr.Error())
+	}
 }
 
 // handleOpenAINonStream OpenAI 非流式响应
@@ -2991,8 +3119,11 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			}
 			break
 		}
-		if err := h.ensureValidToken(account); err != nil {
+		if err := h.ensureValidTokenForPayload(account, payload); err != nil {
 			h.releaseAccount(account)
+			if isDownstreamRequestCanceled(payload, err) {
+				return
+			}
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
@@ -3047,19 +3178,32 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		call := h.kiroCaller
+		if call == nil {
+			call = CallKiroAPI
+		}
+		err := call(account, payload, callback)
 		h.releaseAccount(account)
 		if err != nil {
+			if isDownstreamRequestCanceled(payload, err) {
+				return
+			}
 			lastErr = err
 			if isKiroInputTooLongError(err) {
 				h.recordFailureWithDetails("openai", model, account.ID, err)
 				h.sendOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 				return
 			}
-			if !isKiroToolJSONError(err) && isRetryableKiroStreamError(err) && h.retryKiroPreResponse(account, &preResponseRetryCount, excluded, &retrySameID) {
-				attemptLimit++
-				logger.Warnf("[KiroAPI] retrying OpenAI non-stream after transient pre-response error account_id=%s retry=%d/%d: %v", account.ID, preResponseRetryCount, maxKiroPreResponseRetries, err)
-				continue
+			if !isKiroToolJSONError(err) && isRetryableKiroStreamError(err) {
+				retried, retryErr := h.retryKiroPreResponse(payload, account, &preResponseRetryCount, excluded, &retrySameID)
+				if retryErr != nil {
+					return
+				}
+				if retried {
+					attemptLimit++
+					logger.Warnf("[KiroAPI] retrying OpenAI non-stream after transient pre-response error account_id=%s retry=%d/%d: %v", account.ID, preResponseRetryCount, maxKiroPreResponseRetries, err)
+					continue
+				}
 			}
 			if code, protocolErr := kiroStreamProtocolErrorCode(err); protocolErr {
 				h.recordFailureWithDetails("openai", model, account.ID, err)
@@ -3074,8 +3218,15 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 					return
 				}
 				retrySameID = decision.RetrySameID
-				h.sleepBeforeRateLimitRetry(decision)
+				if !h.waitBeforeRateLimitRetry(payload, decision) {
+					return
+				}
 				continue
+			}
+			if isKiroClientRequestError(err) {
+				h.recordFailureWithDetails("openai", model, account.ID, err)
+				h.sendOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+				return
 			}
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
@@ -3171,6 +3322,10 @@ func (h *Handler) sendOpenAIError(w http.ResponseWriter, status int, errType, me
 // force bypasses the not-near-expiry fast path for explicit admin "refresh now"
 // actions and the 401/403 retry path.
 func (h *Handler) refreshAccountToken(account *config.Account, force bool) error {
+	return h.refreshAccountTokenContext(context.Background(), account, force)
+}
+
+func (h *Handler) refreshAccountTokenContext(ctx context.Context, account *config.Account, force bool) error {
 	if account == nil {
 		return fmt.Errorf("account is nil")
 	}
@@ -3183,8 +3338,16 @@ func (h *Handler) refreshAccountToken(account *config.Account, force bool) error
 		return nil
 	}
 
-	h.tokenRefreshMu.Lock()
-	defer h.tokenRefreshMu.Unlock()
+	h.tokenRefreshOnce.Do(func() {
+		h.tokenRefreshGate = make(chan struct{}, 1)
+		h.tokenRefreshGate <- struct{}{}
+	})
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-h.tokenRefreshGate:
+	}
+	defer func() { h.tokenRefreshGate <- struct{}{} }()
 
 	// Another goroutine may have refreshed this account while we waited on the
 	// lock. Adopt the freshest persisted token before refreshing so we never
@@ -3199,7 +3362,7 @@ func (h *Handler) refreshAccountToken(account *config.Account, force bool) error
 		}
 	}
 
-	accessToken, refreshToken, expiresAt, profileArn, err := auth.RefreshToken(account)
+	accessToken, refreshToken, expiresAt, profileArn, err := auth.RefreshTokenContext(ctx, account)
 	if err != nil {
 		return err
 	}
@@ -3221,6 +3384,21 @@ func (h *Handler) refreshAccountToken(account *config.Account, force bool) error
 // ensureValidToken 确保 token 有效
 func (h *Handler) ensureValidToken(account *config.Account) error {
 	return h.refreshAccountToken(account, false)
+}
+
+func (h *Handler) ensureValidTokenForPayload(account *config.Account, payload *KiroPayload) error {
+	ctx := context.Background()
+	if payload != nil && payload.requestContext != nil {
+		ctx = payload.requestContext
+	}
+	return h.refreshAccountTokenContext(ctx, account, false)
+}
+
+func (h *Handler) ensureValidTokenContext(ctx context.Context, account *config.Account) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return h.refreshAccountTokenContext(ctx, account, false)
 }
 
 // ==================== 管理 API ====================
@@ -4578,19 +4756,20 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"apiKey":                config.GetApiKey(),
-		"requireApiKey":         config.IsApiKeyRequired(),
-		"port":                  config.GetPort(),
-		"host":                  config.GetHost(),
-		"allowOverUsage":        config.GetAllowOverUsage(),
-		"promptCacheMaxRatio":   config.GetPromptCacheMaxRatio(),
-		"promptCacheMaxEntries": config.GetPromptCacheMaxEntries(),
-		"promptCacheTTLSeconds": config.GetPromptCacheTTLSeconds(),
-		"rateLimit":             config.GetRateLimitConfig(),
-		"scheduling":            config.GetSchedulingConfig(),
-		"accountPriority":       config.GetAccountPriorityConfig(),
-		"cacheMode":             config.GetCacheMode(),
-		"functionCache":         config.GetFunctionCacheConfig(),
+		"apiKey":                           config.GetApiKey(),
+		"requireApiKey":                    config.IsApiKeyRequired(),
+		"port":                             config.GetPort(),
+		"host":                             config.GetHost(),
+		"allowOverUsage":                   config.GetAllowOverUsage(),
+		"accountConcurrencyRefreshSeconds": config.GetAccountConcurrencyRefreshSeconds(),
+		"promptCacheMaxRatio":              config.GetPromptCacheMaxRatio(),
+		"promptCacheMaxEntries":            config.GetPromptCacheMaxEntries(),
+		"promptCacheTTLSeconds":            config.GetPromptCacheTTLSeconds(),
+		"rateLimit":                        config.GetRateLimitConfig(),
+		"scheduling":                       config.GetSchedulingConfig(),
+		"accountPriority":                  config.GetAccountPriorityConfig(),
+		"cacheMode":                        config.GetCacheMode(),
+		"functionCache":                    config.GetFunctionCacheConfig(),
 	})
 }
 
@@ -4639,18 +4818,19 @@ func (h *Handler) apiUpdatePromptFilter(w http.ResponseWriter, r *http.Request) 
 
 func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ApiKey                *string                       `json:"apiKey,omitempty"`
-		RequireApiKey         *bool                         `json:"requireApiKey,omitempty"`
-		Password              string                        `json:"password,omitempty"`
-		AllowOverUsage        *bool                         `json:"allowOverUsage,omitempty"`
-		PromptCacheMaxRatio   *float64                      `json:"promptCacheMaxRatio,omitempty"`
-		PromptCacheMaxEntries *int                          `json:"promptCacheMaxEntries,omitempty"`
-		PromptCacheTTLSeconds *int                          `json:"promptCacheTTLSeconds,omitempty"`
-		RateLimit             *config.RateLimitConfig       `json:"rateLimit,omitempty"`
-		Scheduling            *config.SchedulingConfig      `json:"scheduling,omitempty"`
-		AccountPriority       *config.AccountPriorityConfig `json:"accountPriority,omitempty"`
-		CacheMode             *string                       `json:"cacheMode,omitempty"`
-		FunctionCache         *config.FunctionCacheConfig   `json:"functionCache,omitempty"`
+		ApiKey                           *string                       `json:"apiKey,omitempty"`
+		RequireApiKey                    *bool                         `json:"requireApiKey,omitempty"`
+		Password                         string                        `json:"password,omitempty"`
+		AllowOverUsage                   *bool                         `json:"allowOverUsage,omitempty"`
+		AccountConcurrencyRefreshSeconds *int                          `json:"accountConcurrencyRefreshSeconds,omitempty"`
+		PromptCacheMaxRatio              *float64                      `json:"promptCacheMaxRatio,omitempty"`
+		PromptCacheMaxEntries            *int                          `json:"promptCacheMaxEntries,omitempty"`
+		PromptCacheTTLSeconds            *int                          `json:"promptCacheTTLSeconds,omitempty"`
+		RateLimit                        *config.RateLimitConfig       `json:"rateLimit,omitempty"`
+		Scheduling                       *config.SchedulingConfig      `json:"scheduling,omitempty"`
+		AccountPriority                  *config.AccountPriorityConfig `json:"accountPriority,omitempty"`
+		CacheMode                        *string                       `json:"cacheMode,omitempty"`
+		FunctionCache                    *config.FunctionCacheConfig   `json:"functionCache,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -4677,6 +4857,11 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"error": "cacheMode must be native or function_simulation"})
 		return
 	}
+	if req.AccountConcurrencyRefreshSeconds != nil && (*req.AccountConcurrencyRefreshSeconds < config.MinAccountConcurrencyRefreshSeconds || *req.AccountConcurrencyRefreshSeconds > config.MaxAccountConcurrencyRefreshSeconds) {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("accountConcurrencyRefreshSeconds must be between %d and %d", config.MinAccountConcurrencyRefreshSeconds, config.MaxAccountConcurrencyRefreshSeconds)})
+		return
+	}
 
 	if req.ApiKey != nil || req.RequireApiKey != nil || req.Password != "" {
 		if err := config.UpdateSettingsPatch(req.ApiKey, req.RequireApiKey, req.Password); err != nil {
@@ -4695,6 +4880,13 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		// Rebuild the pool so over-quota accounts are re-included or dropped immediately.
 		h.pool.Reload()
+	}
+	if req.AccountConcurrencyRefreshSeconds != nil {
+		if err := config.UpdateAccountConcurrencyRefreshSeconds(*req.AccountConcurrencyRefreshSeconds); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
 	}
 	if req.PromptCacheMaxRatio != nil || req.PromptCacheMaxEntries != nil || req.PromptCacheTTLSeconds != nil {
 		h.promptCacheConfigMu.Lock()
@@ -4828,7 +5020,10 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})
 		return
 	}
-	if err := h.ensureValidToken(account); err != nil {
+	if err := h.ensureValidTokenContext(r.Context(), account); err != nil {
+		if r.Context().Err() != nil {
+			return
+		}
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Token refresh failed: " + err.Error()})
 		return
@@ -4866,7 +5061,7 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 		MaxTokens: 5,
 		Stream:    false,
 	}
-	kiroPayload := OpenAIToKiro(openaiReq, thinking)
+	kiroPayload := bindKiroPayloadContext(OpenAIToKiro(openaiReq, thinking), r.Context())
 
 	var content string
 	callback := &KiroStreamCallback{

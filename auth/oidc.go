@@ -2,6 +2,7 @@ package auth
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -25,6 +26,18 @@ var socialTokenURL = func() string {
 // RefreshToken 刷新 access token
 // Returns: accessToken, refreshToken, expiresAt, profileArn, error
 func RefreshToken(account *config.Account) (string, string, int64, string, error) {
+	return RefreshTokenContext(context.Background(), account)
+}
+
+// RefreshTokenContext refreshes an access token and cancels the outbound IdP
+// request when the caller no longer needs the result.
+func RefreshTokenContext(ctx context.Context, account *config.Account) (string, string, int64, string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if account == nil {
+		return "", "", 0, "", fmt.Errorf("account is nil")
+	}
 	// Resolve per-account proxy: account.ProxyURL > global config
 	proxyURL := account.ProxyURL
 	if proxyURL == "" {
@@ -37,12 +50,12 @@ func RefreshToken(account *config.Account) (string, string, int64, string, error
 	// endpoint. Selecting it on AuthMethod (rather than letting it fall through to the
 	// OIDC branch, which requires clientSecret) is what makes these accounts refresh.
 	if account.AuthMethod == "external_idp" {
-		return refreshExternalIdpToken(account.RefreshToken, account.ClientID, account.TokenEndpoint, account.Scopes, client)
+		return refreshExternalIdpTokenContext(ctx, account.RefreshToken, account.ClientID, account.TokenEndpoint, account.Scopes, client)
 	}
 	if account.AuthMethod == "social" {
-		return refreshSocialToken(account.RefreshToken, client)
+		return refreshSocialTokenContext(ctx, account.RefreshToken, client)
 	}
-	return refreshOIDCToken(account.RefreshToken, account.ClientID, account.ClientSecret, account.Region, client)
+	return refreshOIDCTokenContext(ctx, account.RefreshToken, account.ClientID, account.ClientSecret, account.Region, client)
 }
 
 // refreshExternalIdpToken refreshes an external-IdP (enterprise SSO) access token
@@ -52,6 +65,10 @@ func RefreshToken(account *config.Account) (string, string, int64, string, error
 // via ListAvailableProfiles using the EXTERNAL_IDP token type), so "" is returned
 // for the profileArn.
 func refreshExternalIdpToken(refreshToken, clientID, tokenEndpoint, scopes string, client *http.Client) (string, string, int64, string, error) {
+	return refreshExternalIdpTokenContext(context.Background(), refreshToken, clientID, tokenEndpoint, scopes, client)
+}
+
+func refreshExternalIdpTokenContext(ctx context.Context, refreshToken, clientID, tokenEndpoint, scopes string, client *http.Client) (string, string, int64, string, error) {
 	if clientID == "" || tokenEndpoint == "" {
 		return "", "", 0, "", fmt.Errorf("external IdP refresh requires clientId and tokenEndpoint")
 	}
@@ -62,7 +79,7 @@ func refreshExternalIdpToken(refreshToken, clientID, tokenEndpoint, scopes strin
 	if scopes != "" {
 		form.Set("scope", scopes)
 	}
-	accessToken, newRefreshToken, expiresIn, err := postExternalIdpToken(client, tokenEndpoint, form)
+	accessToken, newRefreshToken, expiresIn, err := postExternalIdpTokenContext(ctx, client, tokenEndpoint, form)
 	if err != nil {
 		return "", "", 0, "", err
 	}
@@ -80,6 +97,10 @@ func refreshExternalIdpToken(refreshToken, clientID, tokenEndpoint, scopes strin
 // shape. Shared by the authorization-code exchange (login) and the refresh_token
 // grant (renewal).
 func postExternalIdpToken(client *http.Client, tokenEndpoint string, form url.Values) (accessToken, refreshToken string, expiresIn int, err error) {
+	return postExternalIdpTokenContext(context.Background(), client, tokenEndpoint, form)
+}
+
+func postExternalIdpTokenContext(ctx context.Context, client *http.Client, tokenEndpoint string, form url.Values) (accessToken, refreshToken string, expiresIn int, err error) {
 	if strings.TrimSpace(tokenEndpoint) == "" {
 		return "", "", 0, fmt.Errorf("external IdP token endpoint is empty")
 	}
@@ -93,7 +114,7 @@ func postExternalIdpToken(client *http.Client, tokenEndpoint string, form url.Va
 	if err := ValidateExternalIdpEndpoint(tokenEndpoint); err != nil {
 		return "", "", 0, fmt.Errorf("external IdP token endpoint rejected: %w", err)
 	}
-	req, err := http.NewRequest("POST", tokenEndpoint, strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(ctx, "POST", tokenEndpoint, strings.NewReader(form.Encode()))
 	if err != nil {
 		return "", "", 0, fmt.Errorf("failed to build external IdP token request: %w", err)
 	}
@@ -129,6 +150,10 @@ func postExternalIdpToken(client *http.Client, tokenEndpoint string, form url.Va
 
 // refreshOIDCToken IdC/Builder ID token 刷新
 func refreshOIDCToken(refreshToken, clientID, clientSecret, region string, client *http.Client) (string, string, int64, string, error) {
+	return refreshOIDCTokenContext(context.Background(), refreshToken, clientID, clientSecret, region, client)
+}
+
+func refreshOIDCTokenContext(ctx context.Context, refreshToken, clientID, clientSecret, region string, client *http.Client) (string, string, int64, string, error) {
 	if clientID == "" || clientSecret == "" {
 		return "", "", 0, "", fmt.Errorf("OIDC refresh requires clientId and clientSecret")
 	}
@@ -146,7 +171,7 @@ func refreshOIDCToken(refreshToken, clientID, clientSecret, region string, clien
 	}
 
 	body, _ := json.Marshal(payload)
-	req, _ := http.NewRequest("POST", url, bytes.NewReader(body))
+	req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := client.Do(req)
@@ -177,6 +202,10 @@ func refreshOIDCToken(refreshToken, clientID, clientSecret, region string, clien
 
 // refreshSocialToken Social (GitHub/Google) token 刷新
 func refreshSocialToken(refreshToken string, client *http.Client) (string, string, int64, string, error) {
+	return refreshSocialTokenContext(context.Background(), refreshToken, client)
+}
+
+func refreshSocialTokenContext(ctx context.Context, refreshToken string, client *http.Client) (string, string, int64, string, error) {
 	url := socialTokenURL()
 
 	payload := map[string]string{
@@ -184,7 +213,7 @@ func refreshSocialToken(refreshToken string, client *http.Client) (string, strin
 	}
 
 	body, _ := json.Marshal(payload)
-	req, _ := http.NewRequest("POST", url, bytes.NewReader(body))
+	req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := client.Do(req)

@@ -22,6 +22,7 @@ func TestIsRetryableKiroStreamError(t *testing.T) {
 	transient := []error{
 		context.DeadlineExceeded,
 		&url.Error{Op: "read", URL: "https://q.example", Err: context.DeadlineExceeded},
+		fmt.Errorf("read Kiro event stream frame: %w", io.ErrUnexpectedEOF),
 		errors.New("Kiro stream exception InternalServerException: Encountered an unexpected error when processing the request, please try again."),
 		errors.New("read Kiro event stream prelude: stream error: stream ID 11241; INTERNAL_ERROR; received from peer"),
 		&KiroStreamProtocolError{Code: "upstream_tool_json_error", Err: errors.New("unexpected EOF")},
@@ -33,6 +34,9 @@ func TestIsRetryableKiroStreamError(t *testing.T) {
 	}
 	if isRetryableKiroStreamError(errors.New("Kiro stream exception ValidationException: invalid tool")) {
 		t.Fatal("permanent validation exception must not be classified as transient")
+	}
+	if isRetryableKiroStreamError(&KiroHTTPError{StatusCode: http.StatusBadRequest, Endpoint: "test", Body: "invalid request"}) {
+		t.Fatal("permanent HTTP 400 must not be classified as transient")
 	}
 }
 

@@ -133,6 +133,11 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 
 	errMsg := err.Error()
 	switch {
+	case isKiroTransportError(err), isRetryableKiroStreamError(err), isKiroTransientHTTPError(err):
+		// Connection resets, proxy failures, timeouts, and retryable stream
+		// framing errors do not indicate a bad credential. Penalizing them can
+		// cool every account after a shared network incident.
+		return
 	case isOverageErrorMessage(errMsg):
 		h.disableAccountOverage(account)
 		h.pool.RecordError(account.ID, false)
@@ -151,6 +156,10 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 		h.pool.RecordError(account.ID, false)
 	case isAuthErrorMessage(errMsg):
 		h.disableAccount(account, "BANNED", "Authentication failed - token invalid or expired")
+	case isKiroClientRequestError(err):
+		// Request and configuration errors are independent of credential health.
+		// Authentication, quota, and rate-limit statuses are handled above.
+		return
 	default:
 		h.pool.RecordError(account.ID, false)
 	}
@@ -319,12 +328,12 @@ func retrySameDelay(cfg config.RateLimitConfig, retryNumber int) time.Duration {
 	return time.Duration(delayMs) * time.Millisecond
 }
 
-func (h *Handler) sleepBeforeRateLimitRetry(decision rateLimitDecision) {
+func (h *Handler) waitBeforeRateLimitRetry(payload *KiroPayload, decision rateLimitDecision) bool {
 	if decision.Delay <= 0 {
-		return
+		return true
 	}
 	logger.Warnf("[RateLimit] Waiting %s before same-account retry", decision.Delay)
-	time.Sleep(decision.Delay)
+	return waitForRateLimitRetry(kiroPayloadContext(payload), decision)
 }
 
 func waitForRateLimitRetry(ctx context.Context, decision rateLimitDecision) bool {

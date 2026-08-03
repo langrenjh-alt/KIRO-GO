@@ -1,6 +1,11 @@
 package proxy
 
 import (
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"path/filepath"
 	"testing"
 	"time"
@@ -26,6 +31,36 @@ func TestAccountFailureClassifiers(t *testing.T) {
 		if !tc.fn(tc.msg) {
 			t.Fatalf("%s classifier did not match %q", tc.name, tc.msg)
 		}
+	}
+}
+
+func TestTransientTransportFailureDoesNotCooldownAccount(t *testing.T) {
+	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	account := config.Account{ID: "transport-account", Enabled: true, AccessToken: "token"}
+	if err := config.AddAccount(account); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+	p := accountpool.GetPool()
+	p.Reload()
+	h := &Handler{pool: p}
+
+	transientErrors := []error{
+		&url.Error{Op: "Post", URL: "https://q.example", Err: errors.New("connection reset")},
+		fmt.Errorf("read Kiro event stream frame: %w", io.ErrUnexpectedEOF),
+		&KiroHTTPError{StatusCode: http.StatusServiceUnavailable, Endpoint: "test", Body: "high load"},
+		&KiroHTTPError{StatusCode: http.StatusBadRequest, Endpoint: "test", Body: "invalid request"},
+	}
+	for _, transientErr := range transientErrors {
+		for i := 0; i < 5; i++ {
+			h.handleAccountFailure(&account, transientErr)
+		}
+	}
+	if leased, _ := p.AcquireNextForModelExcluding("", nil); leased == nil || leased.ID != account.ID {
+		t.Fatalf("transport failure made healthy account unavailable: %#v", leased)
+	} else {
+		p.Release(leased.ID)
 	}
 }
 

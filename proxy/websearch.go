@@ -352,8 +352,12 @@ func (h *Handler) executeWebSearch(
 		}
 		execution.LastAccountID = account.ID
 
-		if err := h.ensureValidToken(account); err != nil {
+		if err := h.ensureValidTokenContext(ctx, account); err != nil {
 			h.releaseAccount(account)
+			if ctx.Err() != nil {
+				lastErr = ctx.Err()
+				break
+			}
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
