@@ -18,6 +18,9 @@
   let filterKeyword = '';
   let filterStatus = 'all';
   let privacyModeEnabled = true;
+  let accountConcurrencyRefreshSeconds = 5;
+  let accountConcurrencyRefreshTimer = null;
+  let accountConcurrencyRefreshPending = false;
   let promptRules = [];
   let builderIdSession = '';
   let builderIdPollTimer = null;
@@ -1343,6 +1346,54 @@
     renderAccounts();
   }
 
+  function shouldRefreshAccountConcurrency() {
+    return document.visibilityState === 'visible' &&
+      !$('mainPage').classList.contains('hidden') &&
+      !$('tabAccounts').classList.contains('hidden');
+  }
+
+  function stopAccountConcurrencyRefresh() {
+    if (accountConcurrencyRefreshTimer) {
+      clearTimeout(accountConcurrencyRefreshTimer);
+      accountConcurrencyRefreshTimer = null;
+    }
+  }
+
+  function scheduleAccountConcurrencyRefresh(immediate) {
+    stopAccountConcurrencyRefresh();
+    if (!shouldRefreshAccountConcurrency()) return;
+    const delay = immediate ? 0 : accountConcurrencyRefreshSeconds * 1000;
+    accountConcurrencyRefreshTimer = setTimeout(async () => {
+      accountConcurrencyRefreshTimer = null;
+      await loadAccountConcurrency();
+      scheduleAccountConcurrencyRefresh(false);
+    }, delay);
+  }
+
+  async function loadAccountConcurrency() {
+    if (accountConcurrencyRefreshPending || !shouldRefreshAccountConcurrency()) return;
+    accountConcurrencyRefreshPending = true;
+    try {
+      const res = await api('/accounts');
+      const latest = await res.json();
+      if (!res.ok || !Array.isArray(latest)) return;
+      const counts = new Map(latest.map(a => [String(a.id), Math.max(0, Number(a.inFlight) || 0)]));
+      accountsData.forEach(a => {
+        if (counts.has(String(a.id))) a.inFlight = counts.get(String(a.id));
+      });
+      qsa('.account-concurrency-value', $('accountsList')).forEach(el => {
+        const count = counts.get(el.dataset.accountId);
+        if (count === undefined) return;
+        el.textContent = String(count);
+        el.classList.toggle('is-active', count > 0);
+      });
+    } catch (e) {
+      // Background status polling is best-effort; foreground actions report errors.
+    } finally {
+      accountConcurrencyRefreshPending = false;
+    }
+  }
+
   // Account list
   function getFilteredAccounts() {
     return accountsData.filter(a => {
@@ -1543,6 +1594,7 @@
         '<div class="account-stat"><div class="account-stat-value">' + formatNum(a.totalTokens || 0) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.tokens')) + '</div></div>' +
         '<div class="account-stat"><div class="account-stat-value">' + (a.totalCredits || 0).toFixed(1) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.credits')) + '</div></div>' +
         '<div class="account-stat"><div class="account-stat-value">' + escapeHtml(formatTokenExpiry(a.expiresAt)) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.expiry')) + '</div></div>' +
+        '<div class="account-stat account-stat-concurrency"><div class="account-stat-value account-concurrency-value' + (Number(a.inFlight) > 0 ? ' is-active' : '') + '" data-account-id="' + idAttr + '">' + Math.max(0, Number(a.inFlight) || 0) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.concurrency')) + '</div></div>' +
         '</div>' +
         '</div>';
     }).join('');
@@ -2096,6 +2148,12 @@
     const d = await res.json();
     $('requireApiKey').checked = d.requireApiKey;
     $('allowOverUsage').checked = d.allowOverUsage || false;
+    const concurrencyRefreshSeconds = Number(d.accountConcurrencyRefreshSeconds);
+    accountConcurrencyRefreshSeconds = Number.isInteger(concurrencyRefreshSeconds) && concurrencyRefreshSeconds >= 5 && concurrencyRefreshSeconds <= 60
+      ? concurrencyRefreshSeconds
+      : 5;
+    $('accountConcurrencyRefreshSeconds').value = String(accountConcurrencyRefreshSeconds);
+    scheduleAccountConcurrencyRefresh(false);
     const promptCacheMaxRatio = Number(d.promptCacheMaxRatio);
     $('promptCacheMaxRatio').value = Number.isFinite(promptCacheMaxRatio) && promptCacheMaxRatio > 0 && promptCacheMaxRatio <= 1
       ? String(promptCacheMaxRatio)
@@ -2241,6 +2299,27 @@
     const allowOverUsage = $('allowOverUsage').checked;
     await api('/settings', { method: 'POST', body: JSON.stringify({ allowOverUsage }) });
     toast(t('settings.overUsageSaved'), 'success');
+  }
+  async function saveAccountConcurrencyRefresh() {
+    const input = $('accountConcurrencyRefreshSeconds');
+    const seconds = Number(input.value);
+    if (!Number.isInteger(seconds) || seconds < 5 || seconds > 60) {
+      toast(t('settings.accountConcurrencyRefreshSecondsInvalid'), 'warning');
+      input.focus();
+      return;
+    }
+    try {
+      const res = await api('/settings', {
+        method: 'POST', body: JSON.stringify({ accountConcurrencyRefreshSeconds: seconds })
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.success === false) throw new Error(d.error || t('common.saveFailed'));
+      accountConcurrencyRefreshSeconds = seconds;
+      scheduleAccountConcurrencyRefresh(true);
+      toast(t('settings.accountStatusDisplaySaved'), 'success');
+    } catch (e) {
+      toast((e && e.message) || t('common.saveFailed'), 'error');
+    }
   }
   async function saveDispatchLimits(id) {
     const maxConcurrency = Number($('maxConcurrencyInput').value);
@@ -3656,6 +3735,8 @@
       else requestAnimationFrame(drawTrafficChart);
     }
     if (tab === 'logs') loadLogs();
+    if (tab === 'accounts') scheduleAccountConcurrencyRefresh(true);
+    else stopAccountConcurrencyRefresh();
   }
 
   // Event wiring
@@ -3691,6 +3772,10 @@
     });
     window.addEventListener('resize', positionOpenCustomSelects);
     window.addEventListener('scroll', positionOpenCustomSelects, true);
+    document.addEventListener('visibilitychange', () => {
+      if (shouldRefreshAccountConcurrency()) scheduleAccountConcurrencyRefresh(true);
+      else stopAccountConcurrencyRefresh();
+    });
 
     $('loginThemeToggle').addEventListener('click', toggleTheme);
     $('mainThemeToggle').addEventListener('click', toggleTheme);
@@ -3776,6 +3861,7 @@
   function bindSettingsEvents() {
     $('saveRequireApiKeyBtn').addEventListener('click', saveRequireApiKey);
     $('saveOverUsageBtn').addEventListener('click', saveOverUsageConfig);
+    $('saveAccountConcurrencyRefreshBtn').addEventListener('click', saveAccountConcurrencyRefresh);
 	$('saveDispatchPoliciesBtn').addEventListener('click', saveDispatchPolicies);
     $('savePromptCacheBtn').addEventListener('click', savePromptCacheConfig);
 	$('cacheMode').addEventListener('change', onCacheModeChange);

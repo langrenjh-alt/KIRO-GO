@@ -55,6 +55,39 @@ func TestUpdateSettingsPatchCanExplicitlyDisableAPIKey(t *testing.T) {
 	}
 }
 
+func TestAccountConcurrencyRefreshSettings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := Init(path); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+	if got := GetAccountConcurrencyRefreshSeconds(); got != DefaultAccountConcurrencyRefreshSeconds {
+		t.Fatalf("default refresh interval=%d, want %d", got, DefaultAccountConcurrencyRefreshSeconds)
+	}
+	if err := UpdateAccountConcurrencyRefreshSeconds(10); err != nil {
+		t.Fatalf("update refresh interval: %v", err)
+	}
+	if got := GetAccountConcurrencyRefreshSeconds(); got != 10 {
+		t.Fatalf("refresh interval=%d, want 10", got)
+	}
+	if err := UpdateAccountConcurrencyRefreshSeconds(MinAccountConcurrencyRefreshSeconds - 1); err == nil {
+		t.Fatal("expected interval below minimum to fail")
+	}
+	if got := GetAccountConcurrencyRefreshSeconds(); got != 10 {
+		t.Fatalf("invalid update changed refresh interval to %d", got)
+	}
+	var persisted Config
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if err := json.Unmarshal(raw, &persisted); err != nil {
+		t.Fatalf("decode config: %v", err)
+	}
+	if persisted.AccountConcurrencyRefreshSeconds != 10 {
+		t.Fatalf("persisted refresh interval=%d, want 10", persisted.AccountConcurrencyRefreshSeconds)
+	}
+}
+
 func TestPromptCacheConfigClampsLegacyOutOfRangeValues(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(path, []byte(`{"promptCacheMaxRatio":0.001,"promptCacheMaxEntries":2097152,"promptCacheTTLSeconds":600}`), 0600); err != nil {

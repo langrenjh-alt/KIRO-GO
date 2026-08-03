@@ -18,6 +18,7 @@ func TestSettingsAPIPersistsDispatchAndCachePolicies(t *testing.T) {
 	}
 	h := &Handler{pool: accountpool.GetPool(), promptCache: newPromptCacheTracker(defaultPromptCacheTTL)}
 	body := `{
+		"accountConcurrencyRefreshSeconds":9,
 		"scheduling":{"mode":"least_requests"},
 		"rateLimit":{"mode":"retry_same","retrySameAccount":2,"retryDelayMs":25,"retryBackoffMultiplier":2,"retryMaxDelayMs":100},
 		"accountPriority":{"enabled":true,"rules":[{"id":"opus","models":["claude-opus"],"accountLevels":["power"],"enabled":true}]},
@@ -32,6 +33,9 @@ func TestSettingsAPIPersistsDispatchAndCachePolicies(t *testing.T) {
 	if got := config.GetSchedulingConfig().Mode; got != config.SchedulingModeLeastRequests {
 		t.Fatalf("scheduling mode=%q", got)
 	}
+	if got := config.GetAccountConcurrencyRefreshSeconds(); got != 9 {
+		t.Fatalf("account concurrency refresh interval=%d", got)
+	}
 	if got := config.GetRateLimitConfig(); got.Mode != config.RateLimitModeRetrySame || got.RetrySameAccount != 2 {
 		t.Fatalf("rate policy=%+v", got)
 	}
@@ -45,10 +49,22 @@ func TestSettingsAPIPersistsDispatchAndCachePolicies(t *testing.T) {
 	if err := json.NewDecoder(getRecorder.Body).Decode(&settings); err != nil {
 		t.Fatalf("decode settings: %v", err)
 	}
-	for _, key := range []string{"rateLimit", "scheduling", "accountPriority", "cacheMode", "functionCache"} {
+	for _, key := range []string{"accountConcurrencyRefreshSeconds", "rateLimit", "scheduling", "accountPriority", "cacheMode", "functionCache"} {
 		if _, ok := settings[key]; !ok {
 			t.Fatalf("settings response missing %q: %#v", key, settings)
 		}
+	}
+}
+
+func TestSettingsAPIRejectsInvalidAccountConcurrencyRefreshInterval(t *testing.T) {
+	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	h := &Handler{pool: accountpool.GetPool()}
+	recorder := httptest.NewRecorder()
+	h.apiUpdateSettings(recorder, httptest.NewRequest(http.MethodPost, "/admin/api/settings", strings.NewReader(`{"accountConcurrencyRefreshSeconds":4}`)))
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("update status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 }
 

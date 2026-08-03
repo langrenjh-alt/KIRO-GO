@@ -251,6 +251,10 @@ type Config struct {
 	// solely because usageCurrent >= usageLimit.
 	AllowOverUsage bool `json:"allowOverUsage,omitempty"`
 
+	// AccountConcurrencyRefreshSeconds controls how often the admin account list
+	// polls current in-flight request counts.
+	AccountConcurrencyRefreshSeconds int `json:"accountConcurrencyRefreshSeconds,omitempty"`
+
 	// Dispatch and failure policies.
 	RateLimit       RateLimitConfig       `json:"rateLimit,omitempty"`
 	Scheduling      SchedulingConfig      `json:"scheduling,omitempty"`
@@ -1289,6 +1293,41 @@ func UpdateAllowOverUsage(allow bool) error {
 	defer cfgLock.Unlock()
 	cfg.AllowOverUsage = allow
 	return Save()
+}
+
+const (
+	DefaultAccountConcurrencyRefreshSeconds = 5
+	MinAccountConcurrencyRefreshSeconds     = 5
+	MaxAccountConcurrencyRefreshSeconds     = 60
+)
+
+// GetAccountConcurrencyRefreshSeconds returns the admin account-card polling interval.
+func GetAccountConcurrencyRefreshSeconds() int {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.AccountConcurrencyRefreshSeconds < MinAccountConcurrencyRefreshSeconds || cfg.AccountConcurrencyRefreshSeconds > MaxAccountConcurrencyRefreshSeconds {
+		return DefaultAccountConcurrencyRefreshSeconds
+	}
+	return cfg.AccountConcurrencyRefreshSeconds
+}
+
+// UpdateAccountConcurrencyRefreshSeconds validates and persists the admin polling interval.
+func UpdateAccountConcurrencyRefreshSeconds(seconds int) error {
+	if seconds < MinAccountConcurrencyRefreshSeconds || seconds > MaxAccountConcurrencyRefreshSeconds {
+		return fmt.Errorf("accountConcurrencyRefreshSeconds must be between %d and %d", MinAccountConcurrencyRefreshSeconds, MaxAccountConcurrencyRefreshSeconds)
+	}
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg == nil {
+		return fmt.Errorf("config is not initialized")
+	}
+	previous := cfg.AccountConcurrencyRefreshSeconds
+	cfg.AccountConcurrencyRefreshSeconds = seconds
+	if err := Save(); err != nil {
+		cfg.AccountConcurrencyRefreshSeconds = previous
+		return err
+	}
+	return nil
 }
 
 // GetGlobalRegion returns the configured default region (empty → "us-east-1").
