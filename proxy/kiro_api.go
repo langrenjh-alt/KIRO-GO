@@ -78,11 +78,9 @@ func regionalizeURLForProfile(rawURL string, account *config.Account, profileArn
 }
 
 // regionalizeURLForRegion rewrites a hardcoded us-east-1 Kiro endpoint to target
-// the given region. Amazon Q is regional (q.{region}.amazonaws.com), but the
-// CodeWhisperer REST host only exists in us-east-1 — every other region is served
-// by the regional Amazon Q host instead. So for a non-us-east-1 region BOTH
-// us-east-1 hosts (q.us-east-1.* and codewhisperer.us-east-1.*) collapse onto
-// q.{region}.amazonaws.com; there is deliberately no codewhisperer.{region} host.
+// the given region. Amazon Q and Kiro Runtime are regional. The CodeWhisperer
+// host only exists in us-east-1, so every other region uses q.{region} for that
+// endpoint while retaining the CodeWhisperer x-amz-target.
 // It is a no-op for us-east-1 or an empty region. This region-targeted primitive
 // also backs cross-region profile probing (listAvailableProfilesInRegion).
 func regionalizeURLForRegion(rawURL, region string) string {
@@ -94,6 +92,7 @@ func regionalizeURLForRegion(rawURL, region string) string {
 	return strings.NewReplacer(
 		"q.us-east-1.amazonaws.com", regionalHost,
 		"codewhisperer.us-east-1.amazonaws.com", regionalHost,
+		"runtime.us-east-1.kiro.dev", "runtime."+region+".kiro.dev",
 	).Replace(rawURL)
 }
 

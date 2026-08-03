@@ -766,23 +766,212 @@ func TestCallKiroAPIRebuildsRegionForApiKeyAccount(t *testing.T) {
 	}
 }
 
-func TestKiroStreamingUsesOnlyRegionalQEndpoint(t *testing.T) {
-	if len(kiroEndpoints) != 1 {
-		t.Fatalf("streaming endpoint count: want 1, got %d", len(kiroEndpoints))
+func TestKiroApiKeyEndpointOrderAndRegionalization(t *testing.T) {
+	if len(kiroEndpoints) != 4 {
+		t.Fatalf("streaming endpoint count: want 4, got %d", len(kiroEndpoints))
 	}
 
-	ep := kiroEndpoints[0]
-	if ep.URL != "https://q.us-east-1.amazonaws.com/generateAssistantResponse" {
-		t.Fatalf("unexpected streaming endpoint: %q", ep.URL)
+	wantURLs := []string{
+		"https://q.us-east-1.amazonaws.com/generateAssistantResponse",
+		"https://runtime.us-east-1.kiro.dev/generateAssistantResponse",
+		"https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse",
+		"https://q.us-east-1.amazonaws.com/generateAssistantResponse",
 	}
-	if ep.AmzTarget != "" {
-		t.Fatalf("regional Q endpoint must not use a fallback X-Amz-Target: %q", ep.AmzTarget)
+	wantTargets := []string{
+		"",
+		"",
+		"AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+		"AmazonQDeveloperStreamingService.SendMessage",
+	}
+	wantRegionalURLs := []string{
+		"https://q.eu-central-1.amazonaws.com/generateAssistantResponse",
+		"https://runtime.eu-central-1.kiro.dev/generateAssistantResponse",
+		"https://q.eu-central-1.amazonaws.com/generateAssistantResponse",
+		"https://q.eu-central-1.amazonaws.com/generateAssistantResponse",
 	}
 
-	got := regionalizeURLForRegion(ep.URL, "eu-central-1")
-	want := "https://q.eu-central-1.amazonaws.com/generateAssistantResponse"
-	if got != want {
-		t.Fatalf("regional endpoint: want %q, got %q", want, got)
+	for i, ep := range kiroEndpoints {
+		if ep.URL != wantURLs[i] {
+			t.Fatalf("endpoint %d URL: want %q, got %q", i+1, wantURLs[i], ep.URL)
+		}
+		if ep.AmzTarget != wantTargets[i] {
+			t.Fatalf("endpoint %d target: want %q, got %q", i+1, wantTargets[i], ep.AmzTarget)
+		}
+		if got := regionalizeURLForRegion(ep.URL, "eu-central-1"); got != wantRegionalURLs[i] {
+			t.Fatalf("endpoint %d regional URL: want %q, got %q", i+1, wantRegionalURLs[i], got)
+		}
+	}
+
+	apiKeyEndpoints := kiroEndpointsForAccount(&config.Account{AuthMethod: "api_key", KiroApiKey: "key"})
+	if len(apiKeyEndpoints) != 4 {
+		t.Fatalf("API key endpoint count: want 4, got %d", len(apiKeyEndpoints))
+	}
+	oauthEndpoints := kiroEndpointsForAccount(&config.Account{AuthMethod: "social", AccessToken: "token"})
+	if len(oauthEndpoints) != 1 || oauthEndpoints[0].Name != "Kiro IDE" {
+		t.Fatalf("OAuth endpoints: want only Kiro IDE, got %+v", oauthEndpoints)
+	}
+}
+
+func TestCallKiroAPIApiKeyFallsBackWithSameKeyAndBody(t *testing.T) {
+	if err := config.Init(t.TempDir() + "/config.json"); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+
+	type capturedRequest struct {
+		URL           string
+		Host          string
+		Authorization string
+		TokenType     string
+		AmzTarget     string
+		Connection    string
+		UserAgent     string
+		Close         bool
+		Body          string
+	}
+	var requests []capturedRequest
+	statuses := []int{http.StatusTooManyRequests, http.StatusTeapot, http.StatusServiceUnavailable, http.StatusNoContent}
+	kiroHttpStore.Store(&http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			body, err := io.ReadAll(req.Body)
+			if err != nil {
+				t.Fatalf("read request body: %v", err)
+			}
+			requests = append(requests, capturedRequest{
+				URL:           req.URL.String(),
+				Host:          req.Host,
+				Authorization: req.Header.Get("Authorization"),
+				TokenType:     req.Header.Get("tokentype"),
+				AmzTarget:     req.Header.Get("X-Amz-Target"),
+				Connection:    req.Header.Get("Connection"),
+				UserAgent:     req.Header.Get("User-Agent"),
+				Close:         req.Close,
+				Body:          string(body),
+			})
+			status := statuses[len(requests)-1]
+			responseBody := http.StatusText(status)
+			if status >= http.StatusOK && status < http.StatusMultipleChoices {
+				responseBody = ""
+			}
+			return &http.Response{
+				StatusCode: status,
+				Body:       io.NopCloser(strings.NewReader(responseBody)),
+				Header:     make(http.Header),
+			}, nil
+		}),
+	})
+	t.Cleanup(func() { InitKiroHttpClient("") })
+
+	account := &config.Account{
+		ID:          "api-key-four-endpoints",
+		AuthMethod:  "api_key",
+		KiroApiKey:  "kiro-key-123",
+		AccessToken: "must-not-be-used",
+		ApiRegion:   "eu-central-1",
+		MachineId:   "machine-123",
+	}
+	payload := &KiroPayload{}
+	payload.ConversationState.ConversationID = "conversation-123"
+	if err := CallKiroAPI(account, payload, nil); err != nil {
+		t.Fatalf("CallKiroAPI: %v", err)
+	}
+
+	if len(requests) != 4 {
+		t.Fatalf("request count: want 4, got %d", len(requests))
+	}
+	wantURLs := []string{
+		"https://q.eu-central-1.amazonaws.com/generateAssistantResponse",
+		"https://runtime.eu-central-1.kiro.dev/generateAssistantResponse",
+		"https://q.eu-central-1.amazonaws.com/generateAssistantResponse",
+		"https://q.eu-central-1.amazonaws.com/generateAssistantResponse",
+	}
+	wantHosts := []string{
+		"q.eu-central-1.amazonaws.com",
+		"runtime.eu-central-1.kiro.dev",
+		"q.eu-central-1.amazonaws.com",
+		"q.eu-central-1.amazonaws.com",
+	}
+	wantTargets := []string{
+		"",
+		"",
+		"AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+		"AmazonQDeveloperStreamingService.SendMessage",
+	}
+	for i, req := range requests {
+		if req.URL != wantURLs[i] || req.Host != wantHosts[i] {
+			t.Errorf("request %d route: URL=%q Host=%q", i+1, req.URL, req.Host)
+		}
+		if req.Authorization != "Bearer kiro-key-123" || req.TokenType != "API_KEY" {
+			t.Errorf("request %d credential headers: authorization=%q tokentype=%q", i+1, req.Authorization, req.TokenType)
+		}
+		if req.AmzTarget != wantTargets[i] {
+			t.Errorf("request %d target: want %q, got %q", i+1, wantTargets[i], req.AmzTarget)
+		}
+		if req.Connection != "close" || !req.Close {
+			t.Errorf("request %d connection: header=%q close=%v", i+1, req.Connection, req.Close)
+		}
+		if req.Body != requests[0].Body {
+			t.Errorf("request %d body differs from first attempt", i+1)
+		}
+		wantRuntimeFingerprint := i == 1
+		gotRuntimeFingerprint := strings.Contains(req.UserAgent, "api/codewhispererruntime#1.0.0")
+		if gotRuntimeFingerprint != wantRuntimeFingerprint {
+			t.Errorf("request %d runtime fingerprint=%v, want %v: %q", i+1, gotRuntimeFingerprint, wantRuntimeFingerprint, req.UserAgent)
+		}
+	}
+}
+
+func TestCallKiroAPIApiKeyStopsAtFirstSuccessfulEndpoint(t *testing.T) {
+	if err := config.Init(t.TempDir() + "/config.json"); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+
+	requests := 0
+	kiroHttpStore.Store(&http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			requests++
+			status := http.StatusTooManyRequests
+			if requests == 2 {
+				status = http.StatusOK
+			}
+			return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
+		}),
+	})
+	t.Cleanup(func() { InitKiroHttpClient("") })
+
+	err := CallKiroAPI(&config.Account{AuthMethod: "api_key", KiroApiKey: "key"}, &KiroPayload{}, nil)
+	if err != nil {
+		t.Fatalf("CallKiroAPI: %v", err)
+	}
+	if requests != 2 {
+		t.Fatalf("request count: want success to stop at 2, got %d", requests)
+	}
+}
+
+func TestCallKiroAPIApiKeyDoesNotFallbackFirstEndpointClientError(t *testing.T) {
+	if err := config.Init(t.TempDir() + "/config.json"); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+
+	requests := 0
+	kiroHttpStore.Store(&http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			requests++
+			return &http.Response{
+				StatusCode: http.StatusBadRequest,
+				Body:       io.NopCloser(strings.NewReader("invalid request")),
+				Header:     make(http.Header),
+			}, nil
+		}),
+	})
+	t.Cleanup(func() { InitKiroHttpClient("") })
+
+	err := CallKiroAPI(&config.Account{AuthMethod: "api_key", KiroApiKey: "key"}, &KiroPayload{}, nil)
+	var httpErr *KiroHTTPError
+	if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusBadRequest {
+		t.Fatalf("CallKiroAPI error=%v, want HTTP 400", err)
+	}
+	if requests != 1 {
+		t.Fatalf("request count: want 1 for non-retryable first endpoint status, got %d", requests)
 	}
 }
 

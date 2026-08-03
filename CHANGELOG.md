@@ -23,6 +23,9 @@
 
 ### Changed
 
+- Kiro API-key requests now keep one leased key and one serialized payload
+  while trying the regional IDE, Kiro Runtime, CodeWhisperer-target, and
+  Amazon Q-target endpoints in order, stopping on the first 2xx response.
 - Forward complete conversation payloads to Kiro without the former 900 KiB
   history truncation, and return Kiro's `Input is too long` response directly
   instead of compacting and retrying the request.
