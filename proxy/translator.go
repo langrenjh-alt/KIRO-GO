@@ -50,24 +50,6 @@ const minimalFallbackUserContent = "."
 const toolResultsContinuationPrefix = "Tool results:"
 const toolResultImagePlaceholder = "[Tool returned an image; the image is attached to this message.]"
 
-// maxPayloadBytes is the upper bound for the serialized Kiro request body.
-// Kiro's upstream rejects oversized requests with HTTP 400
-// "Input is too long." (CONTENT_LENGTH_EXCEEDS_THRESHOLD). When a converted
-// payload exceeds this size we drop the oldest history turns (keeping the
-// system priming, the most recent turns, the active tool turn, and the current
-// message) and insert a placeholder note so the model knows context was elided.
-// The limit is kept conservatively below the observed upstream threshold to
-// leave room for headers and minor serialization overhead.
-const maxPayloadBytes = 900 * 1024
-
-// truncationPlaceholder is inserted in history where older turns were dropped to
-// fit within maxPayloadBytes.
-const truncationPlaceholder = "[Earlier conversation history was truncated to fit the model's input limit. Older messages and tool activity have been omitted.]"
-
-// minRecentHistoryTurns is the number of most-recent history entries always kept
-// (in addition to system priming and the active tool turn) when truncating.
-const minRecentHistoryTurns = 4
-
 // ParseModelAndThinking resolves a client-supplied model name to a Kiro model ID
 // and reports whether thinking mode was requested via the configured suffix.
 func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
@@ -209,6 +191,7 @@ type ClaudeResponse struct {
 	Type              string                  `json:"type"`
 	Role              string                  `json:"role"`
 	Content           []ClaudeContentBlock    `json:"content"`
+	Container         *ClaudeContainer        `json:"container,omitempty"`
 	Model             string                  `json:"model"`
 	StopReason        string                  `json:"stop_reason"`
 	StopSequence      *string                 `json:"stop_sequence"`
@@ -235,6 +218,17 @@ type ClaudeUsage struct {
 	CacheCreation            *ClaudeCacheCreationUsage  `json:"cache_creation"`
 	ServiceTier              string                     `json:"service_tier"`
 	InferenceGeo             string                     `json:"inference_geo"`
+	ServerToolUse            *ClaudeServerToolUsage     `json:"server_tool_use,omitempty"`
+}
+
+type ClaudeContainer struct {
+	ID        string `json:"id"`
+	ExpiresAt string `json:"expires_at"`
+}
+
+type ClaudeServerToolUsage struct {
+	WebSearchRequests int `json:"web_search_requests"`
+	WebFetchRequests  int `json:"web_fetch_requests"`
 }
 
 type ClaudeOutputTokensDetails struct {
@@ -364,11 +358,30 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 
 	// 转换工具
 	kiroTools, toolNameMap := convertClaudeTools(filterClaudeToolsForChoice(req.Tools, toolChoice))
+	// Bedrock requires a toolConfig whenever toolUse/toolResult blocks are
+	// present. Some clients omit `tools` when posting the result of a previous
+	// tool call; in that case the structured result cannot be sent upstream even
+	// if the history still contains the matching assistant toolUse. Rebuild the
+	// history in flattened form and keep the result text in the current turn.
+	if keepCurrentToolResults && len(kiroTools) == 0 {
+		keepCurrentToolResults = false
+		history = sanitizeKiroHistory(history, nil)
+		if len(currentToolResults) > 0 && !toolResultsFolded {
+			finalContent = joinHistoryText(finalContent, buildToolResultsContinuation(currentToolResults))
+			toolResultsFolded = true
+		}
+	}
 
 	// 构建 payload
 	payload := &KiroPayload{}
 	payload.ToolNameMap = toolNameMap
 	payload.StopSequences = append([]string(nil), req.StopSequences...)
+	payload.StructuredOutput = req.OutputConfig != nil && req.OutputConfig.Format != nil
+	if payload.StructuredOutput {
+		payload.StructuredOutputType = req.OutputConfig.Format.Type
+		payload.StructuredOutputSchema = append(json.RawMessage(nil), req.OutputConfig.Format.Schema...)
+	}
+	payload.ToolChoiceMode = toolChoice.Mode
 	payload.ConversationState.ChatTriggerType = "MANUAL"
 	payload.ConversationState.AgentTaskType = "vibe"
 	payload.ConversationState.AgentContinuationId = uuid.New().String()
@@ -405,8 +418,6 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		}
 	}
 	payload.AdditionalModelRequestFields = buildClaudeAdditionalModelRequestFields(req, modelID, thinking)
-
-	truncatePayloadToLimit(payload, systemPrompt != "")
 
 	return payload
 }
@@ -1324,7 +1335,7 @@ func KiroToClaudeResponseWithReasoning(content string, reasoning ClaudeReasoning
 		blocks = append(blocks, ClaudeContentBlock{
 			Type:      "thinking",
 			Thinking:  reasoning.Text,
-			Signature: resolveClaudeThinkingSignature(reasoning, includeEmptyThinkingBlock),
+			Signature: resolveClaudeThinkingSignature(reasoning, includeEmptyThinkingBlock, model),
 		})
 	}
 	for _, redacted := range reasoning.Redacted {
@@ -1357,7 +1368,7 @@ func KiroToClaudeResponseWithReasoning(content string, reasoning ClaudeReasoning
 	stopReason := resolveClaudeStopReason(len(toolUses), false, "")
 
 	response := &ClaudeResponse{
-		ID:          "msg_" + uuid.New().String(),
+		ID:          newClaudeMessageID(),
 		Type:        "message",
 		Role:        "assistant",
 		Content:     blocks,
@@ -1689,11 +1700,33 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 
 	// 转换工具
 	kiroTools, toolNameMap := convertOpenAIToolsWithNameMap(filterOpenAIToolsForChoice(req.Tools, toolChoice))
+	// Bedrock requires a toolConfig whenever toolUse/toolResult blocks are
+	// present. OpenAI-compatible clients commonly omit `tools` on the follow-up
+	// tool-result request, so flatten the result instead of sending a malformed
+	// structured Kiro message.
+	if keepCurrentToolResults && len(kiroTools) == 0 {
+		keepCurrentToolResults = false
+		history = sanitizeKiroHistory(history, nil)
+		if len(currentToolResults) > 0 && !toolResultsFolded {
+			finalContent = joinHistoryText(finalContent, buildToolResultsContinuation(currentToolResults))
+			toolResultsFolded = true
+		}
+	}
 
 	// 构建 payload
 	payload := &KiroPayload{}
 	payload.ToolNameMap = toolNameMap
 	payload.StopSequences = append([]string(nil), stopSequences...)
+	payload.StructuredOutput = req.ResponseFormat != nil &&
+		(strings.EqualFold(strings.TrimSpace(req.ResponseFormat.Type), "json_object") ||
+			strings.EqualFold(strings.TrimSpace(req.ResponseFormat.Type), "json_schema"))
+	if payload.StructuredOutput {
+		payload.StructuredOutputType = req.ResponseFormat.Type
+		if req.ResponseFormat.JSONSchema != nil {
+			payload.StructuredOutputSchema = append(json.RawMessage(nil), req.ResponseFormat.JSONSchema.Schema...)
+		}
+	}
+	payload.ToolChoiceMode = toolChoice.Mode
 	payload.ConversationState.ChatTriggerType = "MANUAL"
 	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstOpenAIConversationAnchor(nonSystemMessages))
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
@@ -1726,8 +1759,6 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		}
 	}
 	payload.AdditionalModelRequestFields = buildOpenAIAdditionalModelRequestFields(req, modelID, thinking)
-
-	truncatePayloadToLimit(payload, systemPrompt != "")
 
 	return payload
 }
@@ -2029,6 +2060,8 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 	// "Tool results" turn, so removing the hollow assistant turn loses no
 	// information and avoids seeding mimicable empty/"." turns.
 	cleaned := history[:0:0]
+	previousUserContent := ""
+	previousUserHadImages := false
 	for i := range history {
 		msg := history[i]
 		if msg.AssistantResponseMessage != nil && len(msg.AssistantResponseMessage.ToolUses) == 0 {
@@ -2037,157 +2070,43 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 				continue // drop hollow assistant turn
 			}
 		}
-		// Collapse runs of consecutive identical user "Tool results" turns. A
-		// client stuck in a retry loop (e.g. the same tool error 100+ times)
-		// sends many identical tool results; once the hollow assistant turns
-		// between them are dropped they become adjacent duplicates that waste
-		// context and form a repetitive pattern. Keep one copy of each run.
+		// Removing hollow assistant tool-call turns can leave adjacent user
+		// messages (for example, the original request followed by its tool
+		// result). Kiro history is turn-oriented; keep the role alternation by
+		// merging adjacent user entries after first collapsing exact retries.
 		if msg.UserInputMessage != nil && len(cleaned) > 0 {
-			last := cleaned[len(cleaned)-1]
-			if last.UserInputMessage != nil &&
-				strings.TrimSpace(last.UserInputMessage.Content) == strings.TrimSpace(msg.UserInputMessage.Content) &&
-				strings.TrimSpace(msg.UserInputMessage.Content) != "" &&
-				len(msg.UserInputMessage.Images) == 0 {
-				continue // skip duplicate consecutive user turn
+			last := &cleaned[len(cleaned)-1]
+			if last.UserInputMessage != nil {
+				currentContent := strings.TrimSpace(msg.UserInputMessage.Content)
+				if previousUserContent == currentContent && currentContent != "" &&
+					!previousUserHadImages && len(msg.UserInputMessage.Images) == 0 {
+					continue // collapse an identical retry without duplicating its output
+				}
+				last.UserInputMessage.Content = joinHistoryText(
+					last.UserInputMessage.Content,
+					msg.UserInputMessage.Content,
+				)
+				if len(msg.UserInputMessage.Images) > 0 {
+					last.UserInputMessage.Images = append(last.UserInputMessage.Images, msg.UserInputMessage.Images...)
+				}
+				previousUserContent = currentContent
+				previousUserHadImages = len(msg.UserInputMessage.Images) > 0
+				continue
 			}
 		}
 		cleaned = append(cleaned, msg)
+		if msg.UserInputMessage != nil {
+			previousUserContent = strings.TrimSpace(msg.UserInputMessage.Content)
+			previousUserHadImages = len(msg.UserInputMessage.Images) > 0
+		} else {
+			previousUserContent = ""
+			previousUserHadImages = false
+		}
 	}
 
 	// Dropping hollow assistant turns can leave history starting with an
 	// assistant message; re-trim so it begins with a user turn.
 	return trimLeadingAssistantHistory(cleaned)
-}
-
-// truncatePayloadToLimit drops the oldest conversation history turns until the
-// serialized payload fits within maxPayloadBytes. It preserves, in order:
-//   - the system priming pair (if present) at the front of history,
-//   - the most recent turns (at least minRecentHistoryTurns, and always the
-//     active tool turn that pairs with the current message),
-//   - the current message itself.
-//
-// A single placeholder note (truncationPlaceholder) is inserted where older
-// turns were removed so the model is aware context was elided. hasPriming
-// indicates whether history begins with the 2-entry system priming pair.
-func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
-	if payload == nil {
-		return
-	}
-	if payloadByteSize(payload) <= maxPayloadBytes {
-		return
-	}
-
-	history := payload.ConversationState.History
-	primingCount := 0
-	if hasPriming && len(history) >= 2 {
-		primingCount = 2
-	}
-
-	priming := history[:primingCount]
-	conversation := history[primingCount:]
-
-	// Compute the fixed overhead (everything except the trimmable conversation):
-	// priming, current message, inference config, profileArn, etc. We estimate by
-	// measuring the payload with an empty conversation tail, then add a budget for
-	// the placeholder and retained tail turns.
-	placeholderEntry := KiroHistoryMessage{
-		UserInputMessage: &KiroUserInputMessage{
-			Content: truncationPlaceholder,
-			ModelID: currentMessageModelID(payload),
-			Origin:  "AI_EDITOR",
-		},
-	}
-
-	// Precompute byte size of each conversation entry once (O(n)).
-	entrySizes := make([]int, len(conversation))
-	for i := range conversation {
-		entrySizes[i] = historyEntryByteSize(conversation[i])
-	}
-
-	// Base size: payload with priming only (no conversation), plus placeholder.
-	payload.ConversationState.History = priming
-	baseSize := payloadByteSize(payload) + historyEntryByteSize(placeholderEntry)
-
-	// Keep the largest suffix of the conversation that fits, but never fewer than
-	// minRecentHistoryTurns entries (so recent context is preserved).
-	keepFrom := len(conversation)
-	running := baseSize
-	for i := len(conversation) - 1; i >= 0; i-- {
-		running += entrySizes[i]
-		kept := len(conversation) - i
-		if running > maxPayloadBytes && kept > minRecentHistoryTurns {
-			break
-		}
-		keepFrom = i
-	}
-
-	tail := conversation[keepFrom:]
-	tail = dropLeadingAssistant(tail)
-
-	rebuilt := make([]KiroHistoryMessage, 0, len(priming)+1+len(tail))
-	rebuilt = append(rebuilt, priming...)
-	if keepFrom > 0 { // older turns were dropped → note the elision
-		rebuilt = append(rebuilt, placeholderEntry)
-	}
-	rebuilt = append(rebuilt, tail...)
-	payload.ConversationState.History = rebuilt
-
-	// If still too large (current message or retained tail alone exceeds the
-	// limit), shrink the current message content as a last resort.
-	if payloadByteSize(payload) > maxPayloadBytes {
-		truncateCurrentMessage(payload)
-	}
-}
-
-// historyEntryByteSize returns the serialized size of a single history entry,
-// including the surrounding JSON array delimiter overhead (1 byte for the comma).
-func historyEntryByteSize(entry KiroHistoryMessage) int {
-	raw, err := json.Marshal(entry)
-	if err != nil {
-		return 0
-	}
-	return len(raw) + 1
-}
-
-// dropLeadingAssistant removes a leading assistant message from a history tail so
-// it does not directly follow the placeholder user turn with a broken pairing.
-func dropLeadingAssistant(tail []KiroHistoryMessage) []KiroHistoryMessage {
-	for len(tail) > 0 && tail[0].AssistantResponseMessage != nil {
-		tail = tail[1:]
-	}
-	return tail
-}
-
-// payloadByteSize returns the serialized size of the payload in bytes.
-func payloadByteSize(payload *KiroPayload) int {
-	raw, err := json.Marshal(payload)
-	if err != nil {
-		return 0
-	}
-	return len(raw)
-}
-
-func currentMessageModelID(payload *KiroPayload) string {
-	return payload.ConversationState.CurrentMessage.UserInputMessage.ModelID
-}
-
-// truncateCurrentMessage hard-truncates the current message content as a last
-// resort when even the minimal retained history plus current message exceeds the
-// limit.
-func truncateCurrentMessage(payload *KiroPayload) {
-	cur := &payload.ConversationState.CurrentMessage.UserInputMessage
-	overhead := payloadByteSize(payload) - len(cur.Content)
-	budget := maxPayloadBytes - overhead
-	if budget < 0 {
-		budget = 0
-	}
-	if len(cur.Content) > budget {
-		if budget == 0 {
-			cur.Content = minimalFallbackUserContent
-			return
-		}
-		cur.Content = cur.Content[:budget]
-	}
 }
 
 func buildToolResultsContinuation(toolResults []KiroToolResult) string {

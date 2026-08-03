@@ -4,6 +4,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -31,6 +32,8 @@ const (
 	maxKiroToolInputBytes        = 8 << 20
 	maxKiroToolAggregateBytes    = 16 << 20
 	maxKiroActiveToolUses        = 128
+	maxKiroToolJSONRetries       = 2
+	maxKiroPreResponseRetries    = 8
 )
 
 // Kiro streaming endpoint. The us-east-1 host is rewritten to the account's
@@ -242,6 +245,21 @@ type KiroPayload struct {
 	// StopSequences are enforced by the protocol adapter because Kiro's wire
 	// inferenceConfig has no corresponding field.
 	StopSequences []string `json:"-"`
+
+	// StructuredOutput marks requests whose downstream contract requires the
+	// assistant text to be a single JSON value. Kiro receives the instruction
+	// through the priming prompt; this internal marker lets the response
+	// adapter normalize the final text without changing the upstream payload.
+	StructuredOutput bool `json:"-"`
+	// StructuredOutputType and StructuredOutputSchema retain the downstream
+	// contract for non-stream validation. They never leave the proxy.
+	StructuredOutputType   string          `json:"-"`
+	StructuredOutputSchema json.RawMessage `json:"-"`
+
+	// ToolChoiceMode preserves the downstream choice semantics for response
+	// normalization. In particular, Anthropic's any/required mode expects one
+	// selected call even when Kiro proposes more than one.
+	ToolChoiceMode string `json:"-"`
 }
 
 type KiroUserInputMessage struct {
@@ -361,6 +379,51 @@ func kiroStreamProtocolErrorCode(err error) (string, bool) {
 	return protocolErr.Code, true
 }
 
+// isRetryableKiroStreamError identifies failures that are safe to retry only
+// before any client-visible response has been emitted. Kiro can terminate an
+// otherwise valid stream while an MCP/tool JSON fragment is being assembled,
+// and network/proxy layers commonly surface the same transient failure as a
+// context deadline or Client.Timeout. Callers must gate this helper with their
+// response-started flag so a retry never duplicates an Anthropic/OpenAI stream.
+func isRetryableKiroStreamError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if code, ok := kiroStreamProtocolErrorCode(err); ok {
+		return code == "upstream_tool_json_error"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "encountered an unexpected error when processing the request") ||
+		(strings.Contains(message, "kiro stream exception") && strings.Contains(message, "internal")) ||
+		(strings.Contains(message, "internal_error") && strings.Contains(message, "stream")) ||
+		(strings.Contains(message, "received from peer") && strings.Contains(message, "stream"))
+}
+
+func isKiroToolJSONError(err error) bool {
+	code, ok := kiroStreamProtocolErrorCode(err)
+	return ok && code == "upstream_tool_json_error"
+}
+
+func isKiroInputTooLongBody(body []byte) bool {
+	message := strings.ToLower(string(body))
+	return strings.Contains(message, "input is too long") ||
+		(strings.Contains(message, "request_body_invalid") && strings.Contains(message, "too long"))
+}
+
+func isKiroInputTooLongError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return isKiroInputTooLongBody([]byte(err.Error()))
+}
+
 // ==================== API Call ====================
 
 func setPayloadProfileArnForAccount(payload *KiroPayload, account *config.Account) {
@@ -434,17 +497,19 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 	// endpoint correctly for regional api_key accounts.
 	epURL := regionalizeURLForProfile(ep.URL, account, payload.ProfileArn)
 
-	reqBody, _ := json.Marshal(payload)
-	req, err := http.NewRequest("POST", epURL, bytes.NewReader(reqBody))
-	if err != nil {
-		return err
-	}
-
 	host := ""
 	if parsedURL, parseErr := url.Parse(epURL); parseErr == nil {
 		host = parsedURL.Host
 	}
 	headerValues := buildStreamingHeaderValues(account, host)
+	reqBody, marshalErr := json.Marshal(payload)
+	if marshalErr != nil {
+		return marshalErr
+	}
+	req, requestErr := http.NewRequest("POST", epURL, bytes.NewReader(reqBody))
+	if requestErr != nil {
+		return requestErr
+	}
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "*/*")
@@ -454,13 +519,13 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 	applyKiroBaseHeaders(req, account, headerValues)
 	req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
 	req.Header.Set("x-amzn-codewhisperer-optout", "true")
-	req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
+	req.Header.Set("Amz-Sdk-Request", "attempt=1; max=1")
 	req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
 
-	resp, err := GetClientForProxy(ResolveAccountProxyURL(account)).Do(req)
-	if err != nil {
-		logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, err)
-		return err
+	resp, doErr := GetClientForProxy(ResolveAccountProxyURL(account)).Do(req)
+	if doErr != nil {
+		logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, doErr)
+		return doErr
 	}
 
 	if resp.StatusCode == 429 {
@@ -472,12 +537,12 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 	if resp.StatusCode != 200 {
 		errBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		err = fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
+		err := fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
 		logger.Warnf("[KiroAPI] Endpoint %s error: %v", ep.Name, err)
 		return err
 	}
 
-	err = parseEventStream(resp.Body, callback)
+	err := parseEventStream(resp.Body, callback)
 	resp.Body.Close()
 	return err
 }
@@ -652,7 +717,7 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		}
 	}
 
-	if err := toolUses.finish(); err != nil {
+	if err := toolUses.finish(callback); err != nil {
 		return reportKiroStreamError(callback, &KiroStreamProtocolError{Code: "upstream_tool_json_error", Err: err})
 	}
 
@@ -960,23 +1025,36 @@ func (a *toolUseAccumulator) resolveID(toolUseID, name string) (string, error) {
 	return "toolu_" + uuid.New().String(), nil
 }
 
-func (a *toolUseAccumulator) finish() error {
+func (a *toolUseAccumulator) finish(callback *KiroStreamCallback) error {
 	if len(a.states) == 0 {
 		return nil
 	}
 
-	var pending *toolUseState
+	// Some Kiro endpoints omit the final stop=true fragment even though the
+	// accumulated tool input is already a complete JSON object. Accept that
+	// wire variant, but continue rejecting truncated or otherwise invalid JSON.
+	completed := make([]KiroToolUse, 0, len(a.states))
 	for _, state := range a.states {
-		if pending == nil || state.InputBuffer.Len() > pending.InputBuffer.Len() {
-			pending = state
+		toolUse, err := completeToolUse(state)
+		if err != nil {
+			return fmt.Errorf(
+				"incomplete tool use %q (%s): stream ended before complete JSON after %d input bytes: %w",
+				state.ToolUseID,
+				state.Name,
+				state.InputBuffer.Len(),
+				err,
+			)
+		}
+		completed = append(completed, toolUse)
+	}
+	for _, toolUse := range completed {
+		if callback != nil && callback.OnToolUse != nil {
+			callback.OnToolUse(toolUse)
 		}
 	}
-	return fmt.Errorf(
-		"incomplete tool use %q (%s): stream ended before stop=true after %d input bytes",
-		pending.ToolUseID,
-		pending.Name,
-		pending.InputBuffer.Len(),
-	)
+	clear(a.states)
+	a.totalInputBytes = 0
+	return nil
 }
 
 func completeToolUse(state *toolUseState) (KiroToolUse, error) {

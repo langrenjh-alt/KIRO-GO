@@ -47,6 +47,73 @@ func TestStructuredOutputInstructionRejectsInvalidOrUnknownFormats(t *testing.T)
 	}
 }
 
+func TestNormalizeStructuredOutputContentExtractsJSONValue(t *testing.T) {
+	tests := map[string]string{
+		`{"answer":42}`: `{"answer":42}`,
+		"Here is the result:\n```json\n{\"answer\":42}\n```": `{"answer":42}`,
+		`prefix [1,2,3] trailing prose`:                      `[1,2,3]`,
+	}
+	for input, want := range tests {
+		if got := normalizeStructuredOutputContent(input); got != want {
+			t.Fatalf("normalizeStructuredOutputContent(%q) = %q, want %q", input, got, want)
+		}
+	}
+	if got := normalizeStructuredOutputContent("no JSON available"); got != "no JSON available" {
+		t.Fatalf("non-JSON content was unexpectedly changed: %q", got)
+	}
+}
+
+func TestIncrementalJSONStreamPreservesChunkedJSONAndDropsNarration(t *testing.T) {
+	stream := &incrementalJSONStream{}
+	chunks := []string{
+		"Here is the result:\n```json\n",
+		`{"answer":"a } [ value","items":[1,`,
+		`{"ok":true}]}`,
+		"\n```\nThis text must be dropped.",
+	}
+
+	var output strings.Builder
+	var nonEmptyDeltas int
+	for _, chunk := range chunks {
+		if delta := stream.Push(chunk); delta != "" {
+			output.WriteString(delta)
+			nonEmptyDeltas++
+		}
+	}
+
+	want := `{"answer":"a } [ value","items":[1,{"ok":true}]}`
+	if got := output.String(); got != want {
+		t.Fatalf("streamed JSON = %q, want %q", got, want)
+	}
+	if nonEmptyDeltas != 2 || !stream.Emitted() || !stream.Complete() {
+		t.Fatalf("deltas=%d emitted=%v complete=%v", nonEmptyDeltas, stream.Emitted(), stream.Complete())
+	}
+}
+
+func TestValidateStructuredOutputContent(t *testing.T) {
+	schema := json.RawMessage(`{
+		"type":"object",
+		"properties":{"answer":{"type":"integer"}},
+		"required":["answer"],
+		"additionalProperties":false
+	}`)
+	if err := validateStructuredOutputContent(`{"answer":42}`, "json_schema", schema); err != nil {
+		t.Fatalf("valid structured output rejected: %v", err)
+	}
+	for _, invalid := range []string{
+		`{"answer":"42"}`,
+		`{"answer":42,"extra":true}`,
+		`{"other":42}`,
+	} {
+		if err := validateStructuredOutputContent(invalid, "json_schema", schema); err == nil {
+			t.Fatalf("invalid structured output accepted: %s", invalid)
+		}
+	}
+	if err := validateStructuredOutputContent(`[]`, "json_object", nil); err == nil {
+		t.Fatal("json_object accepted an array")
+	}
+}
+
 func TestOpenAIResponseFormatUnmarshalAndInstruction(t *testing.T) {
 	var request OpenAIRequest
 	if err := json.Unmarshal([]byte(`{

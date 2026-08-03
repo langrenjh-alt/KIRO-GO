@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestHasWebSearchToolFindsSupportedNativeToolInMixedList(t *testing.T) {
@@ -63,18 +64,6 @@ func TestNativeWebSearchDeclarationDetectsMixedAndUnknownVersions(t *testing.T) 
 }
 
 func TestHandleClaudeMessagesRejectsUnsupportedWebSearchBeforeMCP(t *testing.T) {
-	longDomain := strings.Repeat("a", 240) + ".example.com"
-	largeTool := ClaudeTool{
-		Name:           "web_search",
-		Type:           "web_search_20260318",
-		AllowedDomains: make([]string, webSearchMaxDomains),
-		BlockedDomains: make([]string, webSearchMaxDomains),
-	}
-	for i := range largeTool.AllowedDomains {
-		largeTool.AllowedDomains[i] = longDomain
-		largeTool.BlockedDomains[i] = longDomain
-	}
-
 	tests := []struct {
 		name    string
 		content string
@@ -84,11 +73,6 @@ func TestHandleClaudeMessagesRejectsUnsupportedWebSearchBeforeMCP(t *testing.T) 
 			name:    "unknown version",
 			content: webSearchQueryPrefix + "release notes",
 			tools:   []ClaudeTool{{Name: "web_search", Type: "web_search_20990101"}},
-		},
-		{
-			name:    "combined query too large",
-			content: webSearchQueryPrefix + strings.Repeat("q", webSearchMaxQueryRunes),
-			tools:   []ClaudeTool{largeTool},
 		},
 	}
 
@@ -159,13 +143,46 @@ func TestExtractSearchQueryRejectsLatestUserWithoutText(t *testing.T) {
 	}
 }
 
-func TestExtractSearchQueryRejectsGenericAnthropicPrompt(t *testing.T) {
+func TestExtractSearchQuerySkipsTrailingToolResultTurn(t *testing.T) {
+	req := &ClaudeRequest{Messages: []ClaudeMessage{
+		{Role: "user", Content: "Perform a web search for the query: current query"},
+		{Role: "assistant", Content: "searching"},
+		{Role: "user", Content: []interface{}{
+			map[string]interface{}{"type": "tool_result", "tool_use_id": "toolu_search"},
+		}},
+	}}
+	query, err := extractSearchQuery(req)
+	if err != nil || query != "current query" {
+		t.Fatalf("query=%q err=%v, want current query", query, err)
+	}
+}
+
+func TestExtractSearchQueryAcceptsGenericAnthropicPrompt(t *testing.T) {
 	req := &ClaudeRequest{Messages: []ClaudeMessage{{
 		Role:    "user",
 		Content: "Research this topic and decide whether to search the web.",
 	}}}
-	if _, err := extractSearchQuery(req); err == nil || !strings.Contains(err.Error(), "Claude Code") {
-		t.Fatalf("generic native web-search request must be rejected explicitly, got %v", err)
+	query, err := extractSearchQuery(req)
+	if err != nil || query != "Research this topic and decide whether to search the web." {
+		t.Fatalf("generic native web-search query = %q, err=%v", query, err)
+	}
+}
+
+func TestExtractSearchQueryUsesLastPrefixAndTruncatesLongContext(t *testing.T) {
+	want := "current query"
+	req := &ClaudeRequest{Messages: []ClaudeMessage{{
+		Role:    "user",
+		Content: strings.Repeat("上下文", webSearchMaxQueryRunes) + "\n" + webSearchQueryPrefix + want,
+	}}}
+	query, err := extractSearchQuery(req)
+	if err != nil || query != want {
+		t.Fatalf("prefixed long query = %q, err=%v", query, err)
+	}
+
+	plainTail := strings.Repeat("q", webSearchMaxQueryRunes+10)
+	query, err = extractSearchQuery(&ClaudeRequest{Messages: []ClaudeMessage{{Role: "user", Content: plainTail}}})
+	if err != nil || utf8.RuneCountInString(query) != webSearchMaxQueryRunes || query != plainTail[10:] {
+		t.Fatalf("plain long query length=%d err=%v", utf8.RuneCountInString(query), err)
 	}
 }
 
@@ -298,6 +315,83 @@ func TestCallMCPWebSearchRejectsProviderErrorsAndInvalidSuccess(t *testing.T) {
 				t.Fatalf("status = %d, want 502", upstreamErr.StatusCode)
 			}
 		})
+	}
+}
+
+func TestCallMCPWebSearchClassifiesJSONRPCFailures(t *testing.T) {
+	tests := []struct {
+		name      string
+		code      int
+		retryable bool
+	}{
+		{name: "invalid params", code: jsonRPCInvalidParams, retryable: false},
+		{name: "method not found", code: jsonRPCMethodNotFound, retryable: false},
+		{name: "provider transient", code: -32000, retryable: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":"x","error":{"code":%d,"message":"sensitive provider detail"}}`, test.code)
+			}))
+			defer server.Close()
+
+			_, err := callMCPWebSearchWithOptions(context.Background(), nil, "private query", webSearchMCPCallOptions{
+				Endpoint: server.URL,
+				Client:   server.Client(),
+			})
+			var upstreamErr *webSearchMCPError
+			if !errors.As(err, &upstreamErr) || upstreamErr.RPCCode == nil || *upstreamErr.RPCCode != test.code {
+				t.Fatalf("unexpected error: %#v", err)
+			}
+			if got := shouldRetryWebSearchFailure(err); got != test.retryable {
+				t.Fatalf("retryable = %v, want %v", got, test.retryable)
+			}
+			if strings.Contains(err.Error(), "private query") || strings.Contains(err.Error(), "sensitive provider detail") {
+				t.Fatalf("error leaks request or provider content: %v", err)
+			}
+		})
+	}
+}
+
+func TestCallMCPWebSearchRetriesInvalidParamsWithCompactedQuery(t *testing.T) {
+	originalQuery := strings.Repeat("\u6d4b", 1800) + "\x00\n latest release"
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		var request webSearchMCPRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if calls == 1 {
+			if request.Params.Arguments.Query != strings.TrimSpace(originalQuery) {
+				t.Fatalf("first query was changed before rejection")
+			}
+			_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":"x","error":{"code":-32602,"message":"sensitive invalid params detail"}}`)
+			return
+		}
+		if got := len(request.Params.Arguments.Query); got > webSearchMCPRetryMaxBytes {
+			t.Fatalf("compatibility query bytes = %d, want <= %d", got, webSearchMCPRetryMaxBytes)
+		}
+		if strings.ContainsRune(request.Params.Arguments.Query, '\x00') {
+			t.Fatal("compatibility query retained a control character")
+		}
+		_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":"x","result":{"isError":false,"content":[{"type":"text","text":"{\"results\":[{\"title\":\"Release\",\"url\":\"https://example.com/release\"}]}"}]}}`)
+	}))
+	defer server.Close()
+
+	result, err := callMCPWebSearchWithOptions(context.Background(), nil, originalQuery, webSearchMCPCallOptions{
+		Endpoint: server.URL,
+		Client:   server.Client(),
+	})
+	if err != nil {
+		t.Fatalf("callMCPWebSearchWithOptions returned an error: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("MCP calls = %d, want 2", calls)
+	}
+	if result.Query != strings.TrimSpace(originalQuery) {
+		t.Fatal("client-visible query did not preserve the original value")
 	}
 }
 
@@ -536,8 +630,14 @@ func TestCombinedWebSearchQueryHasOutboundLimit(t *testing.T) {
 		t.Fatalf("individual domain filters should be valid: %v", err)
 	}
 	query := buildWebSearchMCPQuery(strings.Repeat("q", webSearchMaxQueryRunes), tool)
-	if len([]rune(query)) <= webSearchMaxUpstreamRunes {
-		t.Fatalf("test setup did not exceed the outbound limit: %d", len([]rune(query)))
+	if got := utf8.RuneCountInString(query); got > webSearchMaxUpstreamRunes {
+		t.Fatalf("outbound query length = %d, want <= %d", got, webSearchMaxUpstreamRunes)
+	}
+	if strings.Contains(query, "site:") {
+		t.Fatalf("oversized domain clauses must be dropped before MCP call: %q", query)
+	}
+	if query != strings.Repeat("q", webSearchMaxQueryRunes) {
+		t.Fatalf("user query was not preserved: length=%d", utf8.RuneCountInString(query))
 	}
 }
 
@@ -673,6 +773,61 @@ func TestHandleClaudeMessagesRoutesWebSearchAndRecordsUsage(t *testing.T) {
 	logs := h.getRequestLogs()
 	if len(logs) != 1 || logs[0].Status != "success" || logs[0].Tokens != totalTokens {
 		t.Fatalf("unexpected request logs: %#v", logs)
+	}
+}
+
+func TestExecuteWebSearchRetriesRPCRejectionOnAlternateAccount(t *testing.T) {
+	if err := config.Init(t.TempDir() + "/config.json"); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	for _, id := range []string{"websearch-rpc-account-a", "websearch-rpc-account-b"} {
+		if err := config.AddAccount(config.Account{
+			ID:          id,
+			Enabled:     true,
+			AccessToken: "access-token",
+			ProfileArn:  "arn:aws:codewhisperer:us-east-1:1:profile/" + id,
+		}); err != nil {
+			t.Fatalf("add account %s: %v", id, err)
+		}
+	}
+
+	pool := accountpool.GetPool()
+	pool.Reload()
+	h := &Handler{pool: pool}
+	var calls int
+	var firstAccountID string
+	execution, err := h.executeWebSearch(
+		context.Background(),
+		"release notes",
+		"release notes",
+		ClaudeTool{},
+		func(_ context.Context, account *config.Account, query string) (*webSearchResultSet, error) {
+			calls++
+			if calls == 1 {
+				firstAccountID = account.ID
+				code := jsonRPCInvalidParams
+				return nil, &webSearchMCPError{
+					StatusCode: http.StatusBadGateway,
+					RPCCode:    &code,
+					Message:    "web search MCP upstream rejected the request",
+				}
+			}
+			result := testWebSearchResultSet()
+			result.Query = query
+			return result, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("executeWebSearch returned an error: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("MCP calls = %d, want 2", calls)
+	}
+	if execution == nil || execution.Account == nil || execution.Account.ID == firstAccountID {
+		t.Fatalf("alternate account was not used: first=%q execution=%#v", firstAccountID, execution)
+	}
+	if got := pool.AvailableCount(); got != 2 {
+		t.Fatalf("RPC rejection cooled down a chat-capable account: available=%d", got)
 	}
 }
 

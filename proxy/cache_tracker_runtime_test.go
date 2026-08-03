@@ -461,6 +461,62 @@ func TestPromptCacheMaxRatioOnlyCapsCacheRead(t *testing.T) {
 	}
 }
 
+func TestPromptCacheReadDoesNotExceedModelContextWindow(t *testing.T) {
+	if err := config.Init(t.TempDir() + "/config.json"); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.UpdatePromptCacheMaxRatio(1); err != nil {
+		t.Fatalf("set ratio: %v", err)
+	}
+
+	for _, tc := range []struct {
+		model string
+		limit int
+	}{
+		{model: "claude-sonnet-4.5", limit: 200_000},
+		{model: "claude-opus-4.8", limit: 1_000_000},
+	} {
+		t.Run(tc.model, func(t *testing.T) {
+			tracker := newPromptCacheTrackerWithCapacity(time.Hour, 16)
+			fingerprint := [32]byte{byte(tc.limit / 100_000)}
+			profile := &promptCacheProfile{
+				Model:            tc.model,
+				TotalInputTokens: tc.limit * 2,
+				Breakpoints: []promptCacheBreakpoint{{
+					Fingerprint:      fingerprint,
+					CumulativeTokens: tc.limit * 2,
+					TTL:              time.Hour,
+				}},
+			}
+			tracker.Update("account", profile)
+			if got := tracker.Compute("account", profile).CacheReadInputTokens; got != tc.limit {
+				t.Fatalf("cache_read=%d, want model-window cap %d", got, tc.limit)
+			}
+		})
+	}
+}
+
+func TestSimulatedFunctionCacheReadDoesNotExceedModelContextWindow(t *testing.T) {
+	tracker := newPromptCacheTrackerWithCapacity(time.Hour, 16)
+	profile := &promptCacheProfile{
+		Model:                      "claude-opus-4.8",
+		TotalInputTokens:           2_000_000,
+		SimulatedFunctionCache:     true,
+		SimulatedHitRatePercent:    100,
+		SimulatedMaxReadPercent:    100,
+		SimulatedMinCacheableToken: 0,
+		Breakpoints: []promptCacheBreakpoint{{
+			Fingerprint:      [32]byte{9},
+			CumulativeTokens: 1_750_000,
+			TTL:              time.Hour,
+		}},
+	}
+	tracker.Update("account", profile)
+	if got := tracker.Compute("account", profile).CacheReadInputTokens; got != 1_000_000 {
+		t.Fatalf("cache_read=%d, want model-window cap 1000000", got)
+	}
+}
+
 func TestPromptCacheSetMaxEntriesShrinksImmediatelyByLRU(t *testing.T) {
 	tracker := newPromptCacheTrackerWithCapacity(time.Hour, 4)
 	now := time.Now()

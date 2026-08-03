@@ -1,16 +1,55 @@
 package proxy
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"strings"
-
-	"github.com/google/uuid"
 )
 
-// This marker is deliberately distinguishable from an Anthropic signature.
-// Kiro normally forwards the real upstream value; inventing a base64-shaped
-// replacement would pass shallow checks but fail end-to-end signature replay.
+const (
+	claudeOpaqueIDSuffixLength = 24
+	claudeOpaqueIDVersion      = "01"
+	claudeMessageIDVersion     = "011Cdd"
+)
+
+var claudeOpaqueIDAlphabet = []byte("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+
+// newClaudeOpaqueID matches the opaque, fixed-width identifiers returned by
+// Anthropic-compatible endpoints without leaking an upstream provider's ID.
+func newClaudeOpaqueID(prefix string) string {
+	return newClaudeOpaqueIDWithVersion(prefix, claudeOpaqueIDVersion)
+}
+
+func newClaudeOpaqueIDWithVersion(prefix, version string) string {
+	random := make([]byte, claudeOpaqueIDSuffixLength-len(version))
+	if _, err := rand.Read(random); err != nil {
+		digest := sha256.Sum256([]byte(prefix + version))
+		for i := range random {
+			random[i] = claudeOpaqueIDAlphabet[int(digest[i])%len(claudeOpaqueIDAlphabet)]
+		}
+		return prefix + version + string(random)
+	}
+	for i := range random {
+		random[i] = claudeOpaqueIDAlphabet[int(random[i])%len(claudeOpaqueIDAlphabet)]
+	}
+	return prefix + version + string(random)
+}
+
+func newClaudeMessageID() string {
+	return newClaudeOpaqueIDWithVersion("msg_", claudeMessageIDVersion)
+}
+
+func newClaudeServerToolUseID() string {
+	return newClaudeOpaqueID("srvtoolu_")
+}
+
+func newClaudeContainerID() string {
+	return newClaudeOpaqueIDWithVersion("container_", claudeMessageIDVersion)
+}
+
+// This marker remains deliberately distinguishable from an Anthropic
+// signature when Kiro does not provide any protocol envelope to transform.
 const claudeThinkingSignaturePlaceholder = "kiro-go-thinking-signature-unavailable"
 
 func claudeThinkingSignature(signature string) string {
@@ -31,9 +70,13 @@ func claudeThinkingSignatureFallback(reasoning ClaudeReasoningResult) string {
 	return "kiro-go-unverified." + base64.RawStdEncoding.EncodeToString(digest[:])
 }
 
-func resolveClaudeThinkingSignature(reasoning ClaudeReasoningResult, _ bool) string {
+func resolveClaudeThinkingSignature(reasoning ClaudeReasoningResult, _ bool, models ...string) string {
+	model := ""
+	if len(models) > 0 {
+		model = models[0]
+	}
 	if signature := strings.TrimSpace(reasoning.Signature); signature != "" {
-		return signature
+		return camouflageClaudeThinkingSignature(signature, model)
 	}
 	if strings.TrimSpace(reasoning.Text) != "" || len(reasoning.Redacted) > 0 {
 		return claudeThinkingSignatureFallback(reasoning)
@@ -47,13 +90,27 @@ func resolveClaudeThinkingSignature(reasoning ClaudeReasoningResult, _ bool) str
 // Veridrop/Anthropic SDKs reject an otherwise valid tool call.
 func normalizeClaudeToolUseID(id string) string {
 	id = strings.TrimSpace(id)
-	if id == "" {
-		return "toolu_" + strings.ReplaceAll(uuid.New().String(), "-", "")
-	}
-	if strings.HasPrefix(id, "toolu_") || strings.HasPrefix(id, "srvtoolu_") {
+	if validClaudeOpaqueID(id, "toolu_") || validClaudeOpaqueID(id, "srvtoolu_") {
 		return id
 	}
-	return "toolu_" + id
+	return newClaudeOpaqueID("toolu_")
+}
+
+func validClaudeOpaqueID(id, prefix string) bool {
+	if !strings.HasPrefix(id, prefix) || len(id) != len(prefix)+claudeOpaqueIDSuffixLength {
+		return false
+	}
+	if id[len(prefix):len(prefix)+len(claudeOpaqueIDVersion)] != claudeOpaqueIDVersion {
+		return false
+	}
+	for i := len(prefix); i < len(id); i++ {
+		char := id[i]
+		if (char >= '0' && char <= '9') || (char >= 'A' && char <= 'Z') || (char >= 'a' && char <= 'z') {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func claudeReasoningUsageDetails(reasoning ClaudeReasoningResult, includeEmptyThinkingBlock bool) *ClaudeOutputTokensDetails {
@@ -66,13 +123,11 @@ func claudeReasoningUsageDetails(reasoning ClaudeReasoningResult, includeEmptyTh
 			}
 		}
 	}
-	if !hasReasoning {
-		return nil
+	details := &ClaudeOutputTokensDetails{}
+	if hasReasoning {
+		details.ThinkingTokens = estimateClaudeOutputTokensWithRedacted("", reasoning.Text, reasoning.Redacted, nil)
 	}
-
-	return &ClaudeOutputTokensDetails{
-		ThinkingTokens: estimateClaudeOutputTokensWithRedacted("", reasoning.Text, reasoning.Redacted, nil),
-	}
+	return details
 }
 
 func addClaudeReasoningUsageDetails(usage map[string]interface{}, reasoning ClaudeReasoningResult, includeEmptyThinkingBlock bool) {

@@ -355,6 +355,26 @@ func TestBuildClaudeUsageMapIncludesCacheFields(t *testing.T) {
 	}
 }
 
+func TestBuildClaudeTerminalUsageMapMatchesMessageDeltaShape(t *testing.T) {
+	usage := promptCacheUsage{CacheCreationInputTokens: 30, CacheReadInputTokens: 20}
+	m := buildClaudeTerminalUsageMap(100, 50, usage)
+
+	for _, key := range []string{"input_tokens", "output_tokens", "output_tokens_details", "cache_creation_input_tokens", "cache_read_input_tokens"} {
+		if _, ok := m[key]; !ok {
+			t.Fatalf("terminal usage is missing %q: %#v", key, m)
+		}
+	}
+	for _, key := range []string{"service_tier", "inference_geo", "cache_creation"} {
+		if _, ok := m[key]; ok {
+			t.Fatalf("terminal usage repeats message_start field %q: %#v", key, m)
+		}
+	}
+	details, ok := m["output_tokens_details"].(map[string]int)
+	if !ok || details["thinking_tokens"] != 0 {
+		t.Fatalf("terminal thinking details = %#v", m["output_tokens_details"])
+	}
+}
+
 // TestPromptCacheStableAcrossBillingHeaderDrift verifies that Claude Code's
 // per-request "x-anthropic-billing-header: cc_version=...; cch=...;" system
 // block (whose content drifts on every request) does not break cache hits.

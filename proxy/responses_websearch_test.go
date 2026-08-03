@@ -83,6 +83,27 @@ func TestResponsesWebSearchToolChoiceSelectsBuiltInTool(t *testing.T) {
 	}
 }
 
+func TestExtractResponsesWebSearchQueryTruncatesLongInput(t *testing.T) {
+	input := strings.Repeat("q", webSearchMaxQueryRunes+10)
+	query, err := extractResponsesWebSearchQuery([]OpenAIMessage{{Role: "user", Content: input}})
+	if err != nil || len([]rune(query)) != webSearchMaxQueryRunes || query != input[10:] {
+		t.Fatalf("query length=%d err=%v", len([]rune(query)), err)
+	}
+}
+
+func TestExtractResponsesWebSearchQuerySkipsTrailingToolResultTurn(t *testing.T) {
+	messages := []OpenAIMessage{
+		{Role: "user", Content: "release notes for Kiro"},
+		{Role: "user", Content: []interface{}{
+			map[string]interface{}{"type": "function_call_output", "output": "search result"},
+		}},
+	}
+	query, err := extractResponsesWebSearchQuery(messages)
+	if err != nil || query != "release notes for Kiro" {
+		t.Fatalf("query=%q err=%v, want release notes for Kiro", query, err)
+	}
+}
+
 func TestResponsesWebSearchStreamEmitsExecutionEvents(t *testing.T) {
 	result := testWebSearchResultSet()
 	response, _ := buildResponsesWebSearchObject(

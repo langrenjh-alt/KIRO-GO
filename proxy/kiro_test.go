@@ -2,20 +2,95 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
 	"kiro-go/config"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
 	"time"
 )
 
-func TestParseEventStreamRejectsPendingToolUseOnEOF(t *testing.T) {
+func TestIsRetryableKiroStreamError(t *testing.T) {
+	transient := []error{
+		context.DeadlineExceeded,
+		&url.Error{Op: "read", URL: "https://q.example", Err: context.DeadlineExceeded},
+		errors.New("Kiro stream exception InternalServerException: Encountered an unexpected error when processing the request, please try again."),
+		errors.New("read Kiro event stream prelude: stream error: stream ID 11241; INTERNAL_ERROR; received from peer"),
+		&KiroStreamProtocolError{Code: "upstream_tool_json_error", Err: errors.New("unexpected EOF")},
+	}
+	for _, err := range transient {
+		if !isRetryableKiroStreamError(err) {
+			t.Fatalf("expected transient Kiro stream error to be retryable: %v", err)
+		}
+	}
+	if isRetryableKiroStreamError(errors.New("Kiro stream exception ValidationException: invalid tool")) {
+		t.Fatal("permanent validation exception must not be classified as transient")
+	}
+}
+
+func TestCallKiroAPIReturnsInputTooLongWithoutRetry(t *testing.T) {
+	if err := config.Init(t.TempDir() + "/config.json"); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read request body: %v", err)
+		}
+		if len(body) < 700*1024 {
+			t.Fatalf("test payload was not oversized: %d", len(body))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"message":"Input is too long.","reason":"REQUEST_BODY_INVALID"}`))
+	}))
+	defer server.Close()
+
+	oldEndpoints := kiroEndpoints
+	kiroEndpoints = []kiroEndpoint{{URL: server.URL, Origin: "AI_EDITOR", Name: "test"}}
+	defer func() { kiroEndpoints = oldEndpoints }()
+	oldClient := kiroHttpStore.Load()
+	kiroHttpStore.Store(&http.Client{Timeout: time.Second, Transport: &http.Transport{}})
+	defer kiroHttpStore.Store(oldClient)
+
+	payload := &KiroPayload{}
+	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
+		Content: "final question",
+		ModelID: "claude-sonnet-4.5",
+		Origin:  "AI_EDITOR",
+	}
+	for i := 0; i < 100; i++ {
+		payload.ConversationState.History = append(payload.ConversationState.History, KiroHistoryMessage{
+			UserInputMessage: &KiroUserInputMessage{
+				Content: strings.Repeat("history ", 1100),
+				ModelID: "claude-sonnet-4.5",
+				Origin:  "AI_EDITOR",
+			},
+		})
+	}
+	err := CallKiroAPI(&config.Account{ID: "input-too-long-test", AccessToken: "token", ProfileArn: "arn:aws:codewhisperer:profile/input-too-long-test"}, payload, nil)
+	if err == nil || !isKiroInputTooLongError(err) {
+		t.Fatalf("CallKiroAPI error=%v, want input-too-long error", err)
+	}
+	if requests != 1 {
+		t.Fatalf("requests=%d, want exactly one upstream attempt", requests)
+	}
+	if len(payload.ConversationState.History) != 100 {
+		t.Fatalf("history entries=%d, want original 100", len(payload.ConversationState.History))
+	}
+}
+
+func TestParseEventStreamCompletesValidPendingToolUseOnEOF(t *testing.T) {
 	stream := bytes.NewReader(awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
 		"toolUseId": "toolu_1",
 		"name":      "mcpIdaProMcpStatus",
@@ -36,17 +111,39 @@ func TestParseEventStreamRejectsPendingToolUseOnEOF(t *testing.T) {
 			callbackErr = err
 		},
 	})
-	if err == nil || !strings.Contains(err.Error(), "stream ended before stop=true") {
-		t.Fatalf("expected incomplete tool use error, got %v", err)
+	if err != nil {
+		t.Fatalf("expected valid pending tool JSON to complete at EOF, got %v", err)
 	}
-	if callbackErr == nil || callbackErr.Error() != err.Error() {
-		t.Fatalf("expected OnError to receive parse error, got %v", callbackErr)
+	if callbackErr != nil {
+		t.Fatalf("unexpected callback error: %v", callbackErr)
 	}
-	if completed {
-		t.Fatalf("completion callback must not run after an incomplete tool use")
+	if !completed {
+		t.Fatal("completion callback did not run")
 	}
-	if len(toolUses) != 0 {
-		t.Fatalf("incomplete tool use must not be emitted, got %#v", toolUses)
+	if len(toolUses) != 1 || toolUses[0].ToolUseID != "toolu_1" || toolUses[0].Name != "mcpIdaProMcpStatus" || toolUses[0].Input["server"] != "ida-pro-mcp" {
+		t.Fatalf("completed tool use = %#v", toolUses)
+	}
+}
+
+func TestParseEventStreamRejectsTruncatedPendingToolUseOnEOF(t *testing.T) {
+	stream := bytes.NewReader(awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+		"toolUseId": "toolu_truncated",
+		"name":      "write",
+		"input":     `{"path":"file.txt","content":`,
+	}))
+	var callbackErr error
+	var completed bool
+	var toolUses []KiroToolUse
+	err := parseEventStream(stream, &KiroStreamCallback{
+		OnToolUse:  func(toolUse KiroToolUse) { toolUses = append(toolUses, toolUse) },
+		OnComplete: func(_, _ int) { completed = true },
+		OnError:    func(err error) { callbackErr = err },
+	})
+	if err == nil || !strings.Contains(err.Error(), "stream ended before complete JSON") {
+		t.Fatalf("expected truncated tool JSON error, got %v", err)
+	}
+	if callbackErr == nil || callbackErr.Error() != err.Error() || completed || len(toolUses) != 0 {
+		t.Fatalf("callbackErr=%v completed=%v toolUses=%#v", callbackErr, completed, toolUses)
 	}
 }
 

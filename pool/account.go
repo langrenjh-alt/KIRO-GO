@@ -26,6 +26,14 @@ type accountStatsUpdate struct {
 	lastUsed     int64
 }
 
+// RuntimeAccountState describes whether an account is currently part of the
+// dispatch pool and can accept a request. It intentionally mirrors the
+// aggregate AvailableCount criteria without model-specific routing.
+type RuntimeAccountState struct {
+	Available bool
+	Reason    string
+}
+
 // AccountPool 账号池
 type AccountPool struct {
 	mu            sync.RWMutex
@@ -164,6 +172,23 @@ func (p *AccountPool) AcquireByIDForModel(id, model string, excluded map[string]
 		return copyAccount(acc), false
 	}
 	return nil, false
+}
+
+// AcquireForTest leases a specific configured account for an explicit admin
+// test. It intentionally bypasses routing cooldowns, quota gates, and cached
+// model filters so an operator can verify the account itself. The concurrency
+// limit remains enforced to avoid disrupting live traffic.
+func (p *AccountPool) AcquireForTest(account *config.Account) (*config.Account, bool) {
+	if account == nil {
+		return nil, false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.isConcurrencyFullLocked(account) {
+		return nil, true
+	}
+	p.inFlight[account.ID]++
+	return copyAccount(account), false
 }
 
 // Release decrements the in-flight counter for an account acquired by Acquire*.
@@ -695,15 +720,53 @@ func (p *AccountPool) AvailableCount() int {
 			continue
 		}
 		seen[acc.ID] = true
-		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
-			continue
+		if p.runtimeStateLocked(&acc, now).Available {
+			count++
 		}
-		if p.isConcurrencyFullLocked(&acc) {
-			continue
-		}
-		count++
 	}
 	return count
+}
+
+func (p *AccountPool) runtimeStateLocked(account *config.Account, now time.Time) RuntimeAccountState {
+	if cooldown, ok := p.cooldowns[account.ID]; ok && now.Before(cooldown) {
+		return RuntimeAccountState{Reason: "cooldown"}
+	}
+	if p.isConcurrencyFullLocked(account) {
+		return RuntimeAccountState{Reason: "concurrency_full"}
+	}
+	return RuntimeAccountState{Available: true}
+}
+
+// RuntimeStates returns one state per unique account ID. Accounts omitted
+// from the in-memory pool are not returned; callers can distinguish those
+// records from disabled or quota-blocked configuration entries.
+func (p *AccountPool) RuntimeStates() map[string]RuntimeAccountState {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	now := time.Now()
+	states := make(map[string]RuntimeAccountState)
+	for _, account := range p.accounts {
+		if _, seen := states[account.ID]; seen {
+			continue
+		}
+		states[account.ID] = p.runtimeStateLocked(&account, now)
+	}
+	return states
+}
+
+// RefillEligibleCount returns durable capacity for external refill controllers.
+// Transient cooldowns and concurrency leases do not mean another account must
+// be purchased; disabled and quota-blocked accounts are excluded by Reload.
+func (p *AccountPool) RefillEligibleCount() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	seen := make(map[string]bool)
+	for _, acc := range p.accounts {
+		seen[acc.ID] = true
+	}
+	return len(seen)
 }
 
 // UpdateStats 更新账号统计

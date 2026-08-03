@@ -34,17 +34,30 @@ func TestResolveClaudeThinkingSignaturePrefersNative(t *testing.T) {
 }
 
 func TestNormalizeClaudeToolUseID(t *testing.T) {
-	for input, want := range map[string]string{
-		"toolu_native": "toolu_native",
-		"srvtoolu_1":   "srvtoolu_1",
-		"call_legacy":  "toolu_call_legacy",
-	} {
-		if got := normalizeClaudeToolUseID(input); got != want {
-			t.Fatalf("normalizeClaudeToolUseID(%q) = %q, want %q", input, got, want)
+	validToolID := "toolu_01JgjyB9BRR1X4FcMGMTb3v3"
+	validServerID := "srvtoolu_01FtQZXasVcFZsdrrrU1eC9Q"
+	for _, id := range []string{validToolID, validServerID} {
+		if got := normalizeClaudeToolUseID(id); got != id {
+			t.Fatalf("normalizeClaudeToolUseID(%q) = %q", id, got)
 		}
 	}
-	if got := normalizeClaudeToolUseID(""); !strings.HasPrefix(got, "toolu_") || len(got) <= len("toolu_") {
-		t.Fatalf("generated id = %q", got)
+	for _, upstreamID := range []string{"", "toolu_native", "srvtoolu_1", "call_legacy", "toolu_bdrk_provider"} {
+		got := normalizeClaudeToolUseID(upstreamID)
+		if !validClaudeOpaqueID(got, "toolu_") || got == upstreamID {
+			t.Fatalf("normalizeClaudeToolUseID(%q) = %q", upstreamID, got)
+		}
+	}
+}
+
+func TestClaudeOpaqueIDsMatchProtocolShape(t *testing.T) {
+	if id := newClaudeMessageID(); !strings.HasPrefix(id, "msg_"+claudeMessageIDVersion) || len(id) != len("msg_")+claudeOpaqueIDSuffixLength {
+		t.Fatalf("generated message id = %q", id)
+	}
+	if id := newClaudeContainerID(); !strings.HasPrefix(id, "container_"+claudeMessageIDVersion) || len(id) != len("container_")+claudeOpaqueIDSuffixLength {
+		t.Fatalf("generated container id = %q", id)
+	}
+	if id := newClaudeServerToolUseID(); !validClaudeOpaqueID(id, "srvtoolu_") {
+		t.Fatalf("generated server tool id = %q", id)
 	}
 }
 
@@ -54,7 +67,7 @@ func TestKiroToClaudeResponseNormalizesToolUseID(t *testing.T) {
 		Name:      "get_weather",
 		Input:     map[string]interface{}{"city": "Tokyo", "unit": "celsius"},
 	}}, 10, 10, "claude-sonnet-4-6")
-	if len(resp.Content) != 1 || resp.Content[0].ID != "toolu_call_legacy" || resp.StopReason != "tool_use" {
+	if len(resp.Content) != 1 || !validClaudeOpaqueID(resp.Content[0].ID, "toolu_") || resp.Content[0].ID == "call_legacy" || resp.StopReason != "tool_use" {
 		t.Fatalf("response tool contract = %#v, stop_reason=%q", resp.Content, resp.StopReason)
 	}
 }
@@ -131,7 +144,30 @@ func TestClaudeOutputTokenEstimateCountsRedactedThinking(t *testing.T) {
 	}
 }
 
-func TestClaudeStreamTagThinkingOnlyEmitsFallbackText(t *testing.T) {
+func TestClaudeOpaqueIDsUseNativeVersionedShape(t *testing.T) {
+	for _, tc := range []struct {
+		prefix string
+		id     string
+	}{
+		{prefix: "toolu_", id: normalizeClaudeToolUseID("legacy-call")},
+		{prefix: "srvtoolu_", id: newClaudeServerToolUseID()},
+	} {
+		if !validClaudeOpaqueID(tc.id, tc.prefix) {
+			t.Fatalf("ID %q does not match native %s shape", tc.id, tc.prefix)
+		}
+		if !strings.HasPrefix(strings.TrimPrefix(tc.id, tc.prefix), claudeOpaqueIDVersion) {
+			t.Fatalf("ID %q is missing native version prefix %q", tc.id, claudeOpaqueIDVersion)
+		}
+	}
+	if id := newClaudeMessageID(); !strings.HasPrefix(id, "msg_"+claudeMessageIDVersion) {
+		t.Fatalf("message ID %q is missing native version prefix %q", id, claudeMessageIDVersion)
+	}
+	if validClaudeOpaqueID("msg_zz1234567890123456789012", "msg_") {
+		t.Fatal("accepted an unversioned message ID")
+	}
+}
+
+func TestClaudeStreamTagThinkingOnlyDoesNotInjectFallbackText(t *testing.T) {
 	h := newResponseContractHandler(t, awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
 		"content": "<thinking>private reasoning</thinking>",
 	}))
@@ -169,7 +205,7 @@ func TestClaudeStreamTagThinkingOnlyEmitsFallbackText(t *testing.T) {
 			stopReason, _ = delta["stop_reason"].(string)
 		}
 	}
-	if visibleText != " " || stopReason != "max_tokens" {
+	if visibleText != "" || stopReason != "max_tokens" {
 		t.Fatalf("visible text=%q stop_reason=%q\n%s", visibleText, stopReason, rec.Body.String())
 	}
 }

@@ -24,13 +24,15 @@ func extractResponsesWebSearchQuery(messages []OpenAIMessage) (string, error) {
 		if !strings.EqualFold(strings.TrimSpace(messages[i].Role), "user") {
 			continue
 		}
-		query := strings.TrimSpace(extractOpenAIMessageText(messages[i].Content))
-		query = strings.TrimSpace(strings.TrimPrefix(query, webSearchQueryPrefix))
-		if query == "" {
-			return "", errors.New("latest user message does not contain a web search query")
+		if isPureWebSearchToolResultContent(messages[i].Content) {
+			continue
 		}
-		if len(query) > webSearchMaxQueryRunes*utf8.UTFMax || utf8.RuneCountInString(query) > webSearchMaxQueryRunes {
-			return "", fmt.Errorf("web search query exceeds %d characters", webSearchMaxQueryRunes)
+		query := normalizeWebSearchQuery(extractOpenAIMessageText(messages[i].Content))
+		if query == "" {
+			if isWebSearchContinuationContent(messages[i].Content) {
+				continue
+			}
+			return "", errors.New("latest user message does not contain a web search query")
 		}
 		return query, nil
 	}

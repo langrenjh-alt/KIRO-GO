@@ -6,12 +6,10 @@ import (
 	"testing"
 )
 
-// TestClaudeToKiroTruncatesOversizedHistory builds a conversation whose history
-// far exceeds the upstream input limit and verifies the converted payload is
-// trimmed below maxPayloadBytes, that a truncation placeholder is inserted, and
-// that the current message is preserved.
-func TestClaudeToKiroTruncatesOversizedHistory(t *testing.T) {
-	// ~2KB chunk repeated across many turns to blow past the byte limit.
+// TestClaudeToKiroPreservesOversizedHistory verifies that the adapter leaves
+// context-limit enforcement to Kiro instead of silently dropping client input.
+func TestClaudeToKiroPreservesOversizedHistory(t *testing.T) {
+	// ~2KB chunk repeated across many turns to exceed the former 900 KiB cap.
 	big := strings.Repeat("lorem ipsum dolor sit amet ", 80) // ~2.1KB
 
 	msgs := []ClaudeMessage{
@@ -37,8 +35,8 @@ func TestClaudeToKiroTruncatesOversizedHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal failed: %v", err)
 	}
-	if len(raw) > maxPayloadBytes {
-		t.Fatalf("payload size %d exceeds limit %d after truncation", len(raw), maxPayloadBytes)
+	if len(raw) <= 900*1024 {
+		t.Fatalf("test payload size %d did not exceed the former 900 KiB cap", len(raw))
 	}
 
 	// The current message must be preserved.
@@ -47,16 +45,18 @@ func TestClaudeToKiroTruncatesOversizedHistory(t *testing.T) {
 		t.Fatalf("current message lost after truncation, got %q", cur.Content[:min(80, len(cur.Content))])
 	}
 
-	// A truncation placeholder must be present in history.
-	foundPlaceholder := false
+	if got, want := len(payload.ConversationState.History), len(msgs)+1; got != want {
+		t.Fatalf("history entries=%d, want %d; input was dropped", got, want)
+	}
+	foundFirstUser := false
 	for _, h := range payload.ConversationState.History {
-		if h.UserInputMessage != nil && strings.Contains(h.UserInputMessage.Content, "truncated to fit") {
-			foundPlaceholder = true
+		if h.UserInputMessage != nil && h.UserInputMessage.Content == "start the long task" {
+			foundFirstUser = true
 			break
 		}
 	}
-	if !foundPlaceholder {
-		t.Fatalf("expected a truncation placeholder in history")
+	if !foundFirstUser {
+		t.Fatal("oldest user turn was not preserved")
 	}
 
 	// System priming should still be at the front.
@@ -69,9 +69,7 @@ func TestClaudeToKiroTruncatesOversizedHistory(t *testing.T) {
 	}
 }
 
-// TestClaudeToKiroSmallPayloadNotTruncated ensures normal-sized conversations
-// are left untouched (no placeholder inserted).
-func TestClaudeToKiroSmallPayloadNotTruncated(t *testing.T) {
+func TestClaudeToKiroPreservesSmallPayload(t *testing.T) {
 	req := &ClaudeRequest{
 		Model:  "claude-opus-4.8",
 		System: "You are helpful.",
@@ -82,10 +80,8 @@ func TestClaudeToKiroSmallPayloadNotTruncated(t *testing.T) {
 		},
 	}
 	payload := ClaudeToKiro(req, false)
-	for _, h := range payload.ConversationState.History {
-		if h.UserInputMessage != nil && strings.Contains(h.UserInputMessage.Content, "truncated to fit") {
-			t.Fatalf("small payload should not be truncated")
-		}
+	if got, want := len(payload.ConversationState.History), 4; got != want {
+		t.Fatalf("history entries=%d, want %d", got, want)
 	}
 }
 

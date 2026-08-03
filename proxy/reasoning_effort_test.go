@@ -173,6 +173,19 @@ func TestClaudeToKiroReasoningEffort(t *testing.T) {
 }
 
 func TestClaudeThinkingPromptMatchesRequestedMode(t *testing.T) {
+	t.Run("enabled preserves a small positive client budget", func(t *testing.T) {
+		req := &ClaudeRequest{
+			Model:    "claude-opus-4.8",
+			Thinking: &ClaudeThinkingConfig{Type: "enabled", BudgetTokens: 100},
+		}
+		got := claudeThinkingPrompt(req, true)
+		want := "<thinking_mode>enabled</thinking_mode>\n<max_thinking_length>100</max_thinking_length>"
+		if got != want {
+			t.Fatalf("enabled prompt = %q, want %q", got, want)
+		}
+		assertPayloadEffort(t, ClaudeToKiro(req, true), "low")
+	})
+
 	t.Run("adaptive uses normalized effort", func(t *testing.T) {
 		req := &ClaudeRequest{
 			Model:        "claude-opus-4.6",

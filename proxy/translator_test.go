@@ -369,8 +369,8 @@ func TestKiroToClaudeResponsePreservesSignatureOnlyThinking(t *testing.T) {
 	}
 
 	plain := KiroToClaudeResponse("answer", "", false, nil, 1, 1, "claude-opus-4.8")
-	if plain.Usage.OutputTokensDetails != nil {
-		t.Fatalf("plain response unexpectedly contains thinking details: %#v", plain.Usage.OutputTokensDetails)
+	if plain.Usage.OutputTokensDetails == nil || plain.Usage.OutputTokensDetails.ThinkingTokens != 0 {
+		t.Fatalf("plain response thinking details = %#v", plain.Usage.OutputTokensDetails)
 	}
 }
 
@@ -589,6 +589,7 @@ func TestClaudeToolResultImageAttachedToCurrentMessage(t *testing.T) {
 	const imgData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
 	req := &ClaudeRequest{
 		Model: "claude-opus-4.8",
+		Tools: []ClaudeTool{{Name: "read", Description: "read a file", InputSchema: map[string]interface{}{"type": "object"}}},
 		Messages: []ClaudeMessage{
 			{Role: "user", Content: "read this image"},
 			{

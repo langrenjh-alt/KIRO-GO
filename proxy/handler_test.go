@@ -136,6 +136,23 @@ func TestClaudeThinkingBudgetMayMeetOrExceedMaxTokens(t *testing.T) {
 	}
 }
 
+func TestClaudeThinkingBudgetAcceptsPositiveProtocolBoundaryValues(t *testing.T) {
+	for _, budgetTokens := range []int{1, 100, 1023} {
+		req := &ClaudeRequest{
+			Model:     "claude-opus-4.8",
+			MaxTokens: 2048,
+			Thinking: &ClaudeThinkingConfig{
+				Type:         "enabled",
+				BudgetTokens: budgetTokens,
+			},
+			Messages: []ClaudeMessage{{Role: "user", Content: "test"}},
+		}
+		if msg := validateClaudeRequestShape(req); msg != "" {
+			t.Fatalf("budget_tokens=%d rejected: %s", budgetTokens, msg)
+		}
+	}
+}
+
 func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) {
 	cfgFile := t.TempDir() + "/config.json"
 	if err := config.Init(cfgFile); err != nil {
@@ -688,10 +705,10 @@ func TestValidateClaudeThinkingConfig(t *testing.T) {
 			expectError: true,
 		},
 		{
-			name:        "enabled requires at least 1024 budget tokens",
-			thinking:    &ClaudeThinkingConfig{Type: "enabled", BudgetTokens: 512},
+			name:        "enabled accepts a positive budget below legacy minimum",
+			thinking:    &ClaudeThinkingConfig{Type: "enabled", BudgetTokens: 100},
 			maxTokens:   4096,
-			expectError: true,
+			expectError: false,
 		},
 		{
 			name:        "enabled rejects max tokens zero",
@@ -1028,7 +1045,7 @@ func TestPromptCacheProvidedHeaderKeyWorksWithoutAuthContext(t *testing.T) {
 }
 
 func TestReanchorClaudeCacheUsageUsesFinalUpstreamInput(t *testing.T) {
-	profile := &promptCacheProfile{TotalInputTokens: 2000}
+	profile := &promptCacheProfile{Model: "claude-opus-5", TotalInputTokens: 2000}
 	estimated := promptCacheUsage{
 		CacheCreationInputTokens:   500,
 		CacheReadInputTokens:       1000,
@@ -1041,6 +1058,26 @@ func TestReanchorClaudeCacheUsageUsesFinalUpstreamInput(t *testing.T) {
 	}
 	if total := billedClaudeInputTokens(1000, got) + got.CacheCreationInputTokens + got.CacheReadInputTokens; total != 1000 {
 		t.Fatalf("reanchored token split total = %d, want 1000", total)
+	}
+}
+
+func TestClaudeUsageTotalDoesNotExceedModelContextWindow(t *testing.T) {
+	const estimatedTotal = 1_029_554
+	profile := &promptCacheProfile{Model: "claude-opus-5", TotalInputTokens: estimatedTotal}
+	estimated := promptCacheUsage{
+		CacheCreationInputTokens:   595,
+		CacheReadInputTokens:       926_600,
+		CacheCreation5mInputTokens: 595,
+	}
+
+	inputTokens := clampClaudeInputTokensToModelWindow(profile.Model, estimatedTotal)
+	usage := reanchorClaudeCacheUsage(profile, estimated, inputTokens)
+	total := billedClaudeInputTokens(inputTokens, usage) + usage.CacheCreationInputTokens + usage.CacheReadInputTokens
+	if total != 1_000_000 {
+		t.Fatalf("reported input total=%d, want 1000000; usage=%+v", total, usage)
+	}
+	if inputTokens != 1_000_000 {
+		t.Fatalf("input token basis=%d, want 1000000", inputTokens)
 	}
 }
 

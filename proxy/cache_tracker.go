@@ -658,12 +658,12 @@ func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfi
 	}
 	cache5m, cache1h := computePromptCacheTTLBreakdown(profile, rawMatchedTokens)
 	cache5m, cache1h = clampCacheBreakdownToCreation(cache5m, cache1h, creation)
-	return promptCacheUsage{
+	return clampCacheReadToModelWindow(promptCacheUsage{
 		CacheCreationInputTokens:   creation,
 		CacheReadInputTokens:       cacheRead,
 		CacheCreation5mInputTokens: cache5m,
 		CacheCreation1hInputTokens: cache1h,
-	}
+	}, profile.Model)
 }
 
 func (t *promptCacheTracker) computeSimulatedFunctionCache(profile *promptCacheProfile) (usage promptCacheUsage) {
@@ -706,7 +706,15 @@ func (t *promptCacheTracker) computeSimulatedFunctionCache(profile *promptCacheP
 	if cacheTokens > maxRead {
 		cacheTokens = maxRead
 	}
-	return promptCacheUsage{CacheReadInputTokens: cacheTokens}
+	return clampCacheReadToModelWindow(promptCacheUsage{CacheReadInputTokens: cacheTokens}, profile.Model)
+}
+
+func clampCacheReadToModelWindow(usage promptCacheUsage, model string) promptCacheUsage {
+	limit := getContextWindowSize(model)
+	if limit > 0 && usage.CacheReadInputTokens > limit {
+		usage.CacheReadInputTokens = limit
+	}
+	return usage
 }
 
 func (t *promptCacheTracker) updateSimulatedFunctionCache(profile *promptCacheProfile) {
@@ -1411,6 +1419,16 @@ func buildClaudeUsageMap(inputTokens, outputTokens int, usage promptCacheUsage, 
 		"ephemeral_1h_input_tokens": usage.CacheCreation1hInputTokens,
 	}
 	return result
+}
+
+func buildClaudeTerminalUsageMap(inputTokens, outputTokens int, usage promptCacheUsage) map[string]interface{} {
+	return map[string]interface{}{
+		"input_tokens":                billedClaudeInputTokens(inputTokens, usage),
+		"output_tokens":               outputTokens,
+		"output_tokens_details":       map[string]int{"thinking_tokens": 0},
+		"cache_creation_input_tokens": usage.CacheCreationInputTokens,
+		"cache_read_input_tokens":     usage.CacheReadInputTokens,
+	}
 }
 
 func canonicalizeCacheValue(value interface{}) string {

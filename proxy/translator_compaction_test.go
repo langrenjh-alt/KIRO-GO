@@ -131,3 +131,62 @@ func TestClaudeToKiroKeepsActiveToolTurnStructured(t *testing.T) {
 		t.Fatalf("expected current tool result to answer t9, got %q", cur.UserInputMessageContext.ToolResults[0].ToolUseID)
 	}
 }
+
+// TestClaudeToKiroFlattensActiveToolResultWithoutToolConfig covers clients
+// that omit `tools` on the follow-up tool-result request. Bedrock rejects a
+// structured toolResult without the matching toolConfig, so the result must
+// become ordinary user text while preserving its output.
+func TestClaudeToKiroFlattensActiveToolResultWithoutToolConfig(t *testing.T) {
+	req := &ClaudeRequest{
+		Model: "claude-opus-4.8",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "run ls"},
+			{Role: "assistant", Content: []interface{}{
+				map[string]interface{}{"type": "tool_use", "id": "t-no-schema", "name": "exec_command", "input": map[string]interface{}{"cmd": "ls"}},
+			}},
+			{Role: "user", Content: []interface{}{
+				map[string]interface{}{"type": "tool_result", "tool_use_id": "t-no-schema", "content": "file1 file2"},
+			}},
+		},
+	}
+
+	payload := ClaudeToKiro(req, false)
+	cur := payload.ConversationState.CurrentMessage.UserInputMessage
+	if cur.UserInputMessageContext != nil && len(cur.UserInputMessageContext.ToolResults) > 0 {
+		t.Fatalf("tool result must not be sent without toolConfig: %#v", cur.UserInputMessageContext.ToolResults)
+	}
+	if !strings.Contains(cur.Content, "file1 file2") {
+		t.Fatalf("flattened tool output missing from current content: %q", cur.Content)
+	}
+	for i, item := range payload.ConversationState.History {
+		if item.AssistantResponseMessage != nil && len(item.AssistantResponseMessage.ToolUses) > 0 {
+			t.Fatalf("history[%d] retained toolUse without toolConfig: %#v", i, item.AssistantResponseMessage.ToolUses)
+		}
+	}
+}
+
+func TestOpenAIToKiroFlattensActiveToolResultWithoutToolConfig(t *testing.T) {
+	req := &OpenAIRequest{
+		Model: "claude-opus-4.8",
+		Messages: []OpenAIMessage{
+			{Role: "user", Content: "run ls"},
+			{Role: "assistant", ToolCalls: []ToolCall{{
+				ID: "call-no-schema", Type: "function",
+				Function: struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				}{Name: "exec_command", Arguments: `{"cmd":"ls"}`},
+			}}},
+			{Role: "tool", ToolCallID: "call-no-schema", Content: "file1 file2"},
+		},
+	}
+
+	payload := OpenAIToKiro(req, false)
+	cur := payload.ConversationState.CurrentMessage.UserInputMessage
+	if cur.UserInputMessageContext != nil && len(cur.UserInputMessageContext.ToolResults) > 0 {
+		t.Fatalf("tool result must not be sent without toolConfig: %#v", cur.UserInputMessageContext.ToolResults)
+	}
+	if !strings.Contains(cur.Content, "file1 file2") {
+		t.Fatalf("flattened tool output missing from current content: %q", cur.Content)
+	}
+}

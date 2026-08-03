@@ -70,6 +70,78 @@ func TestResponseContractClaudeModelEcho(t *testing.T) {
 			if message["model"] != requestedModel {
 				t.Fatalf("stream model = %#v, want %q", message["model"], requestedModel)
 			}
+			if _, exists := message["context_management"]; exists {
+				t.Fatalf("message_start must not contain terminal context_management: %#v", message)
+			}
+		})
+	}
+}
+
+func TestResponseContractRequiredToolChoiceSuppressesNarrationAndExtraCalls(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%v", stream), func(t *testing.T) {
+			h := newResponseContractHandler(t,
+				awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+					"content": "I'll call the available tools now.",
+				}),
+				awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+					"toolUseId": "toolu_bdrk_first", "name": "first_tool", "input": `{"value":1}`, "stop": true,
+				}),
+				awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+					"toolUseId": "toolu_bdrk_second", "name": "second_tool", "input": `{"value":2}`, "stop": true,
+				}),
+			)
+			body := fmt.Sprintf(`{
+				"model":"claude-opus-4-8",
+				"max_tokens":128,
+				"stream":%v,
+				"messages":[{"role":"user","content":"Call one tool."}],
+				"tools":[
+					{"name":"first_tool","description":"first","input_schema":{"type":"object"}},
+					{"name":"second_tool","description":"second","input_schema":{"type":"object"}}
+				],
+				"tool_choice":{"type":"any"}
+			}`, stream)
+			rec := httptest.NewRecorder()
+			h.handleClaudeMessagesInternal(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body)))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+
+			if !stream {
+				var response ClaudeResponse
+				if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+					t.Fatal(err)
+				}
+				if len(response.Content) != 1 || response.Content[0].Type != "tool_use" || response.Content[0].Name != "first_tool" {
+					t.Fatalf("content=%#v", response.Content)
+				}
+				if !validClaudeOpaqueID(response.Content[0].ID, "toolu_") || response.StopReason != "tool_use" {
+					t.Fatalf("tool id=%q stop=%q", response.Content[0].ID, response.StopReason)
+				}
+				return
+			}
+
+			events := decodeResponseContractSSE(t, rec.Body.String())
+			var toolBlocks int
+			for _, event := range events {
+				if event.Name != "content_block_start" {
+					continue
+				}
+				block := responseContractMap(t, event.Data["content_block"], "content_block")
+				if block["type"] == "text" {
+					t.Fatalf("tool turn leaked narration: %s", rec.Body.String())
+				}
+				if block["type"] == "tool_use" {
+					toolBlocks++
+					if block["name"] != "first_tool" || !validClaudeOpaqueID(fmt.Sprint(block["id"]), "toolu_") {
+						t.Fatalf("tool block=%#v", block)
+					}
+				}
+			}
+			if toolBlocks != 1 {
+				t.Fatalf("tool blocks=%d body=%s", toolBlocks, rec.Body.String())
+			}
 		})
 	}
 }
@@ -335,6 +407,9 @@ func TestResponseContractWebSearchModelEchoAndCitationSSE(t *testing.T) {
 	if message["model"] != requestedModel {
 		t.Fatalf("stream model = %#v, want %q", message["model"], requestedModel)
 	}
+	if _, exists := message["context_management"]; exists {
+		t.Fatalf("web search message_start must not contain terminal context_management: %#v", message)
+	}
 
 	_, summary, _ := buildWebSearchContent(result)
 	wantOrder := []string{
@@ -388,6 +463,11 @@ func TestResponseContractWebSearchModelEchoAndCitationSSE(t *testing.T) {
 	encryptedIndex := fmt.Sprint(citation["encrypted_index"])
 	if encryptedIndex == "" || encryptedIndex == *result.Results[0].Snippet {
 		t.Fatalf("citation encrypted_index must be opaque: %#v", citation)
+	}
+	terminal := events[len(events)-2].Data
+	contextManagement := responseContractMap(t, terminal["context_management"], "message_delta.context_management")
+	if _, ok := contextManagement["applied_edits"].([]interface{}); !ok {
+		t.Fatalf("message_delta applied_edits missing: %#v", terminal)
 	}
 }
 

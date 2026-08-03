@@ -143,7 +143,7 @@ func (h *Handler) handleAdvisorRequest(
 		cacheProfile = h.promptCache.BuildClaudeProfile(executorEffectiveReq, executorEstimate, isolationSeed)
 	}
 	executorPayload := ClaudeToKiro(&executorReq, thinking)
-	toolUseID := "srvtoolu_" + strings.ReplaceAll(generateOutputItemID("advisor"), "advisor_", "")
+	toolUseID := newClaudeServerToolUseID()
 	serverBlocks := []ClaudeContentBlock{
 		{Type: "server_tool_use", ID: toolUseID, Name: advisorToolName, Input: map[string]interface{}{}},
 		{
@@ -176,7 +176,6 @@ func (h *Handler) handleAdvisorRequest(
 	cacheUsage := promptCacheUsage{}
 	if h.promptCache != nil && executorResult.Account != nil {
 		cacheUsage = h.promptCache.Compute(executorResult.Account.ID, cacheProfile)
-		cacheUsage = reanchorClaudeCacheUsage(cacheProfile, cacheUsage, executorResult.InputTokens)
 		h.promptCache.Update(executorResult.Account.ID, cacheProfile)
 	}
 
@@ -206,7 +205,15 @@ func (h *Handler) handleAdvisorRequest(
 		}
 	}
 
-	totalInputTokens := advisorResult.InputTokens + executorResult.InputTokens
+	totalInputTokens := clampClaudeInputTokensToModelWindow(
+		req.Model,
+		advisorResult.InputTokens+executorResult.InputTokens,
+	)
+	cacheUsage = reanchorClaudeCacheUsage(
+		cacheProfile,
+		cacheUsage,
+		minInt(executorResult.InputTokens, totalInputTokens),
+	)
 	totalOutputTokens := advisorResult.OutputTokens + estimateClaudeOutputTokensWithRedacted(
 		finalContent, reasoning.Text, reasoning.Redacted, executorResult.ToolUses,
 	)
@@ -230,9 +237,7 @@ func (h *Handler) handleAdvisorRequest(
 		Ephemeral5mInputTokens: cacheUsage.CacheCreation5mInputTokens,
 		Ephemeral1hInputTokens: cacheUsage.CacheCreation1hInputTokens,
 	}
-	if thinking {
-		resp.Usage.OutputTokensDetails = claudeReasoningUsageDetails(reasoning, includeEmptyThinkingBlock)
-	}
+	resp.Usage.OutputTokensDetails = claudeReasoningUsageDetails(reasoning, includeEmptyThinkingBlock)
 
 	totalCredits := advisorResult.Credits + executorResult.Credits
 	h.recordSuccessForApiKeyWithCache(apiKeyID, totalInputTokens, totalOutputTokens, totalCredits, cacheUsage)
@@ -382,6 +387,9 @@ func (h *Handler) callClaudeBuffered(
 		if err := call(account, payload, callback); err != nil {
 			h.releaseAccount(account)
 			lastErr = err
+			if isKiroInputTooLongError(err) {
+				return nil, err
+			}
 			if _, protocolErr := kiroStreamProtocolErrorCode(err); protocolErr {
 				return nil, err
 			}
@@ -405,7 +413,7 @@ func (h *Handler) callClaudeBuffered(
 		if realInputTokens > 0 {
 			result.InputTokens = realInputTokens
 		} else if result.InputTokens <= 0 {
-			result.InputTokens = max(1, estimatedInputTokens)
+			result.InputTokens = max(1, clampClaudeInputTokensToModelWindow(model, estimatedInputTokens))
 		}
 		result.OutputTokens = estimateClaudeOutputTokensWithRedacted(
 			result.Content, result.Reasoning.Text, result.Reasoning.Redacted, result.ToolUses,
@@ -422,6 +430,10 @@ func (h *Handler) callClaudeBuffered(
 
 func (h *Handler) handleAdvisorFailure(w http.ResponseWriter, model string, err error) {
 	h.recordFailureWithDetails("claude", model, "", err)
+	if isKiroInputTooLongError(err) {
+		h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
 	if code, protocolErr := kiroStreamProtocolErrorCode(err); protocolErr {
 		h.sendClaudeError(w, http.StatusBadGateway, code, err.Error())
 		return

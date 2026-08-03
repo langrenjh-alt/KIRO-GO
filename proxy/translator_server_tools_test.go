@@ -107,7 +107,8 @@ func TestHandleAdvisorRequestExecutesAdvisorAndExecutorWithMixedTools(t *testing
 		"tools":[
 			{"name":"Read","description":"Read a file","input_schema":{"type":"object"}},
 			{"type":"advisor_20260301","name":"advisor","model":"claude-opus-4-8"}
-		]
+		],
+		"tool_choice":{"type":"auto"}
 	}`
 	recorder := httptest.NewRecorder()
 	h.handleClaudeMessagesInternal(
@@ -142,6 +143,57 @@ func TestHandleAdvisorRequestExecutesAdvisorAndExecutorWithMixedTools(t *testing
 	}
 	if response.Content[2].Type != "text" || !strings.Contains(response.Content[2].Text, "Implemented") {
 		t.Fatalf("executor response block = %#v", response.Content[2])
+	}
+}
+
+func TestForcedAdvisorRemainsClientExecutableToolUse(t *testing.T) {
+	var calls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		var payload KiroPayload
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode Kiro payload: %v", err)
+		}
+		ctx := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+		if ctx == nil || len(ctx.Tools) != 1 || ctx.Tools[0].ToolSpecification.Name != advisorToolName {
+			t.Fatalf("forced advisor was not forwarded as a client tool: %#v", ctx)
+		}
+		_, _ = w.Write(awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+			"toolUseId": "kiro-advisor", "name": advisorToolName, "input": `{}`, "stop": true,
+		}))
+	}))
+	defer upstream.Close()
+	t.Cleanup(swapKiroEndpointsForTest(t, upstream))
+	h, cleanup := setupResponsesTestHandler(t)
+	t.Cleanup(cleanup)
+	body := `{
+		"model":"claude-opus-4-8",
+		"max_tokens":512,
+		"messages":[{"role":"user","content":"Use the advisor."}],
+		"tools":[{"type":"advisor_20260301","name":"advisor","model":"claude-opus-4-8","max_tokens":256}],
+		"tool_choice":{"type":"tool","name":"advisor"}
+	}`
+	recorder := httptest.NewRecorder()
+	h.handleClaudeMessagesInternal(
+		recorder,
+		httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body)),
+	)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if calls != 1 {
+		t.Fatalf("upstream calls=%d, want one client-tool generation", calls)
+	}
+	var response ClaudeResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(response.Content) != 1 || response.Content[0].Type != "tool_use" || response.Content[0].Name != advisorToolName {
+		t.Fatalf("content=%#v", response.Content)
+	}
+	if !validClaudeOpaqueID(response.Content[0].ID, "toolu_") || response.StopReason != "tool_use" {
+		t.Fatalf("tool id=%q stop_reason=%q", response.Content[0].ID, response.StopReason)
 	}
 }
 

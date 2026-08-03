@@ -438,6 +438,52 @@ func TestRefreshAccountInfoDoesNotBanApiKeyOnUsageLimit403(t *testing.T) {
 	}
 }
 
+func TestRefreshAccountInfoBansTemporarilySuspendedAccount(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Init(configPath); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+	account := config.Account{
+		ID:          "apikey-suspended-1",
+		AuthMethod:  "api_key",
+		KiroApiKey:  "ksk_suspended_key_value",
+		AccessToken: "ksk_suspended_key_value",
+		Region:      "us-east-1",
+		Enabled:     true,
+	}
+	if err := config.AddAccount(account); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+
+	kiroRestHttpStore.Store(&http.Client{
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusForbidden,
+				Body: io.NopCloser(strings.NewReader(
+					`{"message":"Your User ID temporarily is suspended due to unusual activity. Please contact support.","reason":null}`,
+				)),
+				Header: make(http.Header),
+			}, nil
+		}),
+	})
+	t.Cleanup(func() { InitKiroHttpClient("") })
+
+	requestAccount := account
+	if _, err := RefreshAccountInfo(&requestAccount); err == nil || !isSuspensionErrorMessage(err.Error()) {
+		t.Fatalf("expected suspension error to propagate, got %v", err)
+	}
+
+	accounts := config.GetAccounts()
+	if len(accounts) != 1 {
+		t.Fatalf("expected one account, got %d", len(accounts))
+	}
+	updated := accounts[0]
+	if updated.Enabled || updated.BanStatus != "BANNED" || updated.BanReason == "" || updated.BanTime <= 0 {
+		t.Fatalf("suspended account was not persisted as banned: enabled=%v status=%q reason=%q time=%d",
+			updated.Enabled, updated.BanStatus, updated.BanReason, updated.BanTime)
+	}
+}
+
 func clearProfileArnResolutionCooldowns() {
 	profileArnResolutionCooldowns.Range(func(key, _ interface{}) bool {
 		profileArnResolutionCooldowns.Delete(key)

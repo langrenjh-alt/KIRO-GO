@@ -93,14 +93,105 @@ func TestCollapsesConsecutiveIdenticalToolResults(t *testing.T) {
 
 	payload := OpenAIToKiro(&OpenAIRequest{Model: "claude-opus-4.8", Messages: msgs}, false)
 
-	count := 0
+	var combined strings.Builder
 	for _, h := range payload.ConversationState.History {
-		if h.UserInputMessage != nil && strings.Contains(h.UserInputMessage.Content, "SAME_ERROR_OUTPUT") {
-			count++
+		if h.UserInputMessage != nil {
+			combined.WriteString(h.UserInputMessage.Content)
+			combined.WriteByte('\n')
 		}
 	}
+	count := strings.Count(combined.String(), "SAME_ERROR_OUTPUT")
 	if count != 1 {
-		t.Fatalf("expected 5 identical tool-result turns collapsed to 1, got %d", count)
+		t.Fatalf("expected 5 identical tool results collapsed to 1 occurrence, got %d in %q", count, combined.String())
+	}
+}
+
+// TestMergesUserTurnsAfterToolHistoryScrub ensures that removing historical
+// assistant toolUses does not leave an invalid run of consecutive user turns.
+// The tool output remains in the merged user content, while the assistant-side
+// invocation syntax stays absent so the model cannot imitate it.
+func TestMergesUserTurnsAfterToolHistoryScrub(t *testing.T) {
+	msgs := []OpenAIMessage{{Role: "user", Content: "start"}}
+	for i := 0; i < 3; i++ {
+		id := fmt.Sprintf("call_%d", i)
+		msgs = append(msgs,
+			OpenAIMessage{Role: "assistant", ToolCalls: []ToolCall{
+				newPollToolCall(id, "exec_command", fmt.Sprintf(`{"cmd":"step %d"}`, i)),
+			}},
+			OpenAIMessage{Role: "tool", ToolCallID: id, Content: fmt.Sprintf("OUTPUT_%d", i)},
+			OpenAIMessage{Role: "user", Content: fmt.Sprintf("continue %d", i)},
+		)
+	}
+	msgs = append(msgs, OpenAIMessage{Role: "user", Content: "final"})
+
+	payload := OpenAIToKiro(&OpenAIRequest{Model: "claude-opus-4.8", Messages: msgs}, false)
+	history := payload.ConversationState.History
+	for i := 1; i < len(history); i++ {
+		if history[i-1].UserInputMessage != nil && history[i].UserInputMessage != nil {
+			t.Fatalf("history contains consecutive user turns at %d/%d: %#v / %#v", i-1, i, history[i-1], history[i])
+		}
+	}
+
+	var merged strings.Builder
+	for _, h := range history {
+		if h.UserInputMessage != nil {
+			merged.WriteString(h.UserInputMessage.Content)
+			merged.WriteByte('\n')
+		}
+	}
+	for i := 0; i < 3; i++ {
+		if !strings.Contains(merged.String(), fmt.Sprintf("OUTPUT_%d", i)) {
+			t.Fatalf("merged history lost OUTPUT_%d: %q", i, merged.String())
+		}
+	}
+	for _, h := range history {
+		if a := h.AssistantResponseMessage; a != nil && len(a.ToolUses) > 0 {
+			t.Fatalf("historical assistant retained structured toolUses: %#v", a.ToolUses)
+		}
+	}
+}
+
+func TestClaudeMergesUserTurnsAfterToolHistoryScrub(t *testing.T) {
+	msgs := []ClaudeMessage{{Role: "user", Content: "start"}}
+	for i := 0; i < 3; i++ {
+		id := fmt.Sprintf("toolu_%d", i)
+		msgs = append(msgs,
+			ClaudeMessage{Role: "assistant", Content: []interface{}{
+				map[string]interface{}{
+					"type": "tool_use", "id": id, "name": "exec_command",
+					"input": map[string]interface{}{"cmd": fmt.Sprintf("step %d", i)},
+				},
+			}},
+			ClaudeMessage{Role: "user", Content: []interface{}{
+				map[string]interface{}{
+					"type": "tool_result", "tool_use_id": id,
+					"content": fmt.Sprintf("CLAUDE_OUTPUT_%d", i),
+				},
+			}},
+			ClaudeMessage{Role: "user", Content: fmt.Sprintf("continue %d", i)},
+		)
+	}
+	msgs = append(msgs, ClaudeMessage{Role: "user", Content: "final"})
+
+	payload := ClaudeToKiro(&ClaudeRequest{Model: "claude-opus-4.8", Messages: msgs}, false)
+	history := payload.ConversationState.History
+	var merged strings.Builder
+	for i, h := range history {
+		if i > 0 && history[i-1].UserInputMessage != nil && h.UserInputMessage != nil {
+			t.Fatalf("history contains consecutive user turns at %d/%d", i-1, i)
+		}
+		if h.UserInputMessage != nil {
+			merged.WriteString(h.UserInputMessage.Content)
+			merged.WriteByte('\n')
+		}
+		if a := h.AssistantResponseMessage; a != nil && len(a.ToolUses) > 0 {
+			t.Fatalf("historical assistant retained structured toolUses: %#v", a.ToolUses)
+		}
+	}
+	for i := 0; i < 3; i++ {
+		if !strings.Contains(merged.String(), fmt.Sprintf("CLAUDE_OUTPUT_%d", i)) {
+			t.Fatalf("merged Claude history lost output %d: %q", i, merged.String())
+		}
 	}
 }
 

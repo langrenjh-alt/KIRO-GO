@@ -3,7 +3,11 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
 	"strings"
+
+	jsonschema "github.com/santhosh-tekuri/jsonschema/v5"
 )
 
 const jsonObjectOutputInstruction = `<structured_output>
@@ -118,6 +122,166 @@ Return exactly one valid JSON value that matches the JSON Schema below. Do not i
 	default:
 		return ""
 	}
+}
+
+// normalizeStructuredOutputContent removes common model narration around a
+// structured response while preserving the JSON value byte-for-byte. Kiro is
+// prompted to emit JSON, but an occasional leading sentence or Markdown fence
+// would otherwise violate the Anthropic/OpenAI structured-output contract.
+func normalizeStructuredOutputContent(content string) string {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return ""
+	}
+	if strings.HasPrefix(trimmed, "```") {
+		if newline := strings.IndexByte(trimmed, '\n'); newline >= 0 {
+			trimmed = strings.TrimSpace(trimmed[newline+1:])
+		}
+		if strings.HasSuffix(trimmed, "```") {
+			trimmed = strings.TrimSpace(strings.TrimSuffix(trimmed, "```"))
+		}
+	}
+	if json.Valid([]byte(trimmed)) {
+		return trimmed
+	}
+
+	for index := 0; index < len(trimmed); index++ {
+		if trimmed[index] != '{' && trimmed[index] != '[' {
+			continue
+		}
+		decoder := json.NewDecoder(strings.NewReader(trimmed[index:]))
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil || !json.Valid(value) {
+			continue
+		}
+		return string(value)
+	}
+	return trimmed
+}
+
+// incrementalJSONStream drops prose and Markdown before a top-level object or
+// array, then forwards bytes until that JSON value closes. It deliberately does
+// not claim schema validation: once a delta is sent it cannot be retracted.
+type incrementalJSONStream struct {
+	started  bool
+	complete bool
+	inString bool
+	escaped  bool
+	depth    int
+	emitted  bool
+}
+
+func (s *incrementalJSONStream) Push(chunk string) string {
+	if s == nil || chunk == "" || s.complete {
+		return ""
+	}
+
+	outputStart := 0
+	if !s.started {
+		outputStart = -1
+	}
+	for i := 0; i < len(chunk); i++ {
+		ch := chunk[i]
+		if !s.started {
+			if ch != '{' && ch != '[' {
+				continue
+			}
+			s.started = true
+			s.depth = 1
+			outputStart = i
+			continue
+		}
+
+		if s.inString {
+			if s.escaped {
+				s.escaped = false
+				continue
+			}
+			switch ch {
+			case '\\':
+				s.escaped = true
+			case '"':
+				s.inString = false
+			}
+			continue
+		}
+
+		switch ch {
+		case '"':
+			s.inString = true
+		case '{', '[':
+			s.depth++
+		case '}', ']':
+			s.depth--
+			if s.depth == 0 {
+				s.complete = true
+				if outputStart >= 0 {
+					out := chunk[outputStart : i+1]
+					s.emitted = s.emitted || out != ""
+					return out
+				}
+				return ""
+			}
+		}
+	}
+
+	if outputStart < 0 {
+		return ""
+	}
+	out := chunk[outputStart:]
+	s.emitted = s.emitted || out != ""
+	return out
+}
+
+func (s *incrementalJSONStream) Emitted() bool {
+	return s != nil && s.emitted
+}
+
+func (s *incrementalJSONStream) Complete() bool {
+	return s != nil && s.complete
+}
+
+func validateStructuredOutputContent(content, formatType string, schemaBytes json.RawMessage) error {
+	decoder := json.NewDecoder(strings.NewReader(content))
+	decoder.UseNumber()
+	var value interface{}
+	if err := decoder.Decode(&value); err != nil {
+		return fmt.Errorf("invalid JSON: %w", err)
+	}
+	var extra interface{}
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("multiple JSON values")
+		}
+		return fmt.Errorf("trailing JSON data: %w", err)
+	}
+
+	switch strings.ToLower(strings.TrimSpace(formatType)) {
+	case "json_object":
+		if _, ok := value.(map[string]interface{}); !ok {
+			return fmt.Errorf("expected a JSON object")
+		}
+	case "json_schema":
+		if len(bytes.TrimSpace(schemaBytes)) == 0 {
+			return fmt.Errorf("missing JSON Schema")
+		}
+		compiler := jsonschema.NewCompiler()
+		compiler.LoadURL = func(url string) (io.ReadCloser, error) {
+			return nil, fmt.Errorf("external JSON Schema reference is disabled: %s", url)
+		}
+		const schemaURL = "mem://kirogo/structured-output.json"
+		if err := compiler.AddResource(schemaURL, bytes.NewReader(schemaBytes)); err != nil {
+			return fmt.Errorf("load JSON Schema: %w", err)
+		}
+		compiled, err := compiler.Compile(schemaURL)
+		if err != nil {
+			return fmt.Errorf("compile JSON Schema: %w", err)
+		}
+		if err := compiled.Validate(value); err != nil {
+			return fmt.Errorf("JSON Schema mismatch: %w", err)
+		}
+	}
+	return nil
 }
 
 func compactJSONObject(raw json.RawMessage) ([]byte, bool) {

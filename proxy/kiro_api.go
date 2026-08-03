@@ -549,7 +549,7 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 	if err != nil {
 		// 检测封禁状态
 		errMsg := err.Error()
-		if strings.Contains(errMsg, "TEMPORARILY_SUSPENDED") {
+		if isSuspensionErrorMessage(errMsg) {
 			// 账户被暂时封禁，自动禁用并标记封禁状态
 			logger.Warnf("[RefreshAccountInfo] Account %s is temporarily suspended: %v", accountEmailForLog(account), err)
 

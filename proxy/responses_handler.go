@@ -224,6 +224,11 @@ func (h *Handler) handleResponsesNonStream(
 		h.releaseAccount(account)
 		if err != nil {
 			lastErr = err
+			if isKiroInputTooLongError(err) {
+				h.recordFailureWithDetails("responses", model, account.ID, err)
+				h.sendOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+				return
+			}
 			if code, protocolErr := kiroStreamProtocolErrorCode(err); protocolErr {
 				h.recordFailureWithDetails("responses", model, account.ID, err)
 				h.sendOpenAIError(w, http.StatusBadGateway, code, err.Error())
@@ -741,6 +746,18 @@ func (h *Handler) handleResponsesStream(
 		err := CallKiroAPI(account, payload, callback)
 		h.releaseAccount(account)
 		if err != nil {
+			if isKiroInputTooLongError(err) {
+				send("response.failed", map[string]interface{}{
+					"type": "response.failed",
+					"response": map[string]interface{}{
+						"id":     respID,
+						"status": "failed",
+						"error":  map[string]string{"type": "invalid_request_error", "message": err.Error()},
+					},
+				})
+				h.recordFailureWithDetails("responses", model, account.ID, err)
+				return
+			}
 			if code, protocolErr := kiroStreamProtocolErrorCode(err); protocolErr {
 				send("response.failed", map[string]interface{}{
 					"type": "response.failed",

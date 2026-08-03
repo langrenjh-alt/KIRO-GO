@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
@@ -25,9 +26,11 @@ const (
 	webSearchToolName          = "web_search"
 	webSearchMCPBaseURL        = "https://q.us-east-1.amazonaws.com/mcp"
 	webSearchMCPMaxResponse    = int64(4 << 20)
+	webSearchMCPRetryMaxBytes  = 1536
+	webSearchRPCAccountRetries = 2
 	webSearchSummaryChunkRunes = 100
 	webSearchMaxQueryRunes     = 2048
-	webSearchMaxUpstreamRunes  = 4096
+	webSearchMaxUpstreamRunes  = 2048
 	webSearchMaxDomains        = 20
 	webSearchMaxDomainRunes    = 253
 	webSearchMaxResults        = 20
@@ -113,6 +116,13 @@ type webSearchMCPResponseError struct {
 	Code    *int   `json:"code"`
 	Message string `json:"message"`
 }
+
+const (
+	jsonRPCParseError     = -32700
+	jsonRPCInvalidRequest = -32600
+	jsonRPCMethodNotFound = -32601
+	jsonRPCInvalidParams  = -32602
+)
 
 type webSearchMCPResponseResult struct {
 	Content []webSearchMCPContent `json:"content"`
@@ -312,6 +322,7 @@ func (h *Handler) executeWebSearch(
 	excluded := make(map[string]bool)
 	retryCounts := make(map[string]int)
 	retrySameID := ""
+	rpcRejections := 0
 	var lastErr error
 
 	for attempt := 0; attempt < h.maxAccountAttempts(); attempt++ {
@@ -327,6 +338,11 @@ func (h *Handler) executeWebSearch(
 		account, allFull := h.acquireAccountForModel("", excluded, retrySameID)
 		retrySameID = ""
 		if account == nil {
+			// Preserve the useful JSON-RPC failure when no compatible alternate
+			// account is available instead of replacing it with a generic pool error.
+			if rpcRejections > 0 && lastErr != nil {
+				break
+			}
 			if h.startExpiredAccountRefreshes("", excluded) {
 				lastErr = errAccountRefreshInProgress
 			} else if allFull {
@@ -365,6 +381,16 @@ func (h *Handler) executeWebSearch(
 		h.releaseAccount(account)
 		if err != nil {
 			lastErr = err
+			if isPermanentWebSearchRPCErrorCode(err) {
+				rpcRejections++
+				if rpcRejections < webSearchRPCAccountRetries {
+					// Some profiles expose chat but not the regional MCP tool. Try one
+					// alternate account without cooling down the account for normal chat.
+					excluded[account.ID] = true
+					continue
+				}
+				break
+			}
 			if isRateLimitError(err) {
 				decision := h.applyRateLimitPolicy(account, retryCounts, excluded)
 				if decision.Return429 {
@@ -430,7 +456,13 @@ func shouldRetryWebSearchFailure(err error) bool {
 		return false
 	}
 	var upstream *webSearchMCPError
-	if !errors.As(err, &upstream) || upstream.StatusCode == 0 {
+	if !errors.As(err, &upstream) {
+		return true
+	}
+	if isPermanentWebSearchRPCError(upstream.RPCCode) {
+		return false
+	}
+	if upstream.StatusCode == 0 {
 		return true
 	}
 	if upstream.StatusCode >= 400 && upstream.StatusCode < 500 {
@@ -443,6 +475,23 @@ func shouldRetryWebSearchFailure(err error) bool {
 		}
 	}
 	return true
+}
+
+func isPermanentWebSearchRPCError(code *int) bool {
+	if code == nil {
+		return false
+	}
+	switch *code {
+	case jsonRPCParseError, jsonRPCInvalidRequest, jsonRPCMethodNotFound, jsonRPCInvalidParams:
+		return true
+	default:
+		return false
+	}
+}
+
+func isPermanentWebSearchRPCErrorCode(err error) bool {
+	var upstream *webSearchMCPError
+	return errors.As(err, &upstream) && isPermanentWebSearchRPCError(upstream.RPCCode)
 }
 
 func isWebSearchTimeout(err error) bool {
@@ -521,21 +570,94 @@ func extractSearchQuery(req *ClaudeRequest) (string, error) {
 			continue
 		}
 
-		text := strings.TrimSpace(extractWebSearchText(req.Messages[i].Content))
-		if !strings.HasPrefix(text, webSearchQueryPrefix) {
-			return "", fmt.Errorf("native web search is supported only for Claude Code WebSearch requests")
+		if isPureWebSearchToolResultContent(req.Messages[i].Content) {
+			// A follow-up tool-result turn has no user query of its own. Keep
+			// looking for the search request that produced it.
+			continue
 		}
-		text = strings.TrimSpace(strings.TrimPrefix(text, webSearchQueryPrefix))
+		text := normalizeWebSearchQuery(extractWebSearchText(req.Messages[i].Content))
 		if text == "" {
+			if isWebSearchContinuationContent(req.Messages[i].Content) {
+				// Tool-result turns can be appended after the user's search
+				// request. They carry no query themselves, so continue to the
+				// previous user turn instead of rejecting a valid search.
+				continue
+			}
 			return "", fmt.Errorf("latest user message does not contain a web search query")
-		}
-		if len(text) > webSearchMaxQueryRunes*utf8.UTFMax || utf8.RuneCountInString(text) > webSearchMaxQueryRunes {
-			return "", fmt.Errorf("web search query exceeds %d characters", webSearchMaxQueryRunes)
 		}
 		return text, nil
 	}
 
 	return "", fmt.Errorf("web search request does not contain a user message")
+}
+
+func isPureWebSearchToolResultContent(content interface{}) bool {
+	switch value := content.(type) {
+	case map[string]interface{}:
+		typ, _ := value["type"].(string)
+		typ = strings.ToLower(strings.TrimSpace(typ))
+		return typ == "tool_result" || typ == "function_call_output" || typ == "function_call"
+	case []interface{}:
+		if len(value) == 0 {
+			return false
+		}
+		for _, item := range value {
+			if !isPureWebSearchToolResultContent(item) {
+				return false
+			}
+		}
+		return true
+	case []ClaudeContentBlock:
+		if len(value) == 0 {
+			return false
+		}
+		for _, block := range value {
+			if block.Type != "tool_result" && block.Type != "tool_use" {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func isWebSearchContinuationContent(content interface{}) bool {
+	switch value := content.(type) {
+	case []interface{}:
+		for _, item := range value {
+			if isWebSearchContinuationContent(item) {
+				return true
+			}
+		}
+	case []ClaudeContentBlock:
+		for _, block := range value {
+			if block.Type == "tool_result" || block.Type == "tool_use" {
+				return true
+			}
+		}
+	case map[string]interface{}:
+		typ, _ := value["type"].(string)
+		switch strings.ToLower(strings.TrimSpace(typ)) {
+		case "tool_result", "tool_use", "function_call_output", "function_call":
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeWebSearchQuery(value string) string {
+	value = strings.TrimSpace(value)
+	if marker := strings.LastIndex(value, webSearchQueryPrefix); marker >= 0 {
+		value = strings.TrimSpace(value[marker+len(webSearchQueryPrefix):])
+	}
+	runes := []rune(value)
+	if len(runes) > webSearchMaxQueryRunes {
+		// Long agent turns often contain context followed by the actual request.
+		// Keep the tail instead of rejecting the whole request at the adapter.
+		value = strings.TrimSpace(string(runes[len(runes)-webSearchMaxQueryRunes:]))
+	}
+	return value
 }
 
 func extractWebSearchText(content interface{}) string {
@@ -600,6 +722,7 @@ func validateWebSearchToolOptions(tool ClaudeTool) error {
 }
 
 func buildWebSearchMCPQuery(query string, tool ClaudeTool) string {
+	query = truncateWebSearchQuery(strings.TrimSpace(query), webSearchMaxUpstreamRunes)
 	allowed := normalizeWebSearchDomains(tool.AllowedDomains)
 	blocked := normalizeWebSearchDomains(tool.BlockedDomains)
 	parts := make([]string, 0, 2+len(blocked))
@@ -614,7 +737,25 @@ func buildWebSearchMCPQuery(query string, tool ClaudeTool) string {
 	for _, domain := range blocked {
 		parts = append(parts, "-site:"+domain)
 	}
-	return strings.Join(parts, " ")
+	return fitWebSearchMCPQuery(strings.Join(parts, " "), query)
+}
+
+func fitWebSearchMCPQuery(candidate, fallback string) string {
+	if utf8.RuneCountInString(candidate) <= webSearchMaxUpstreamRunes {
+		return candidate
+	}
+	// Domain clauses are advisory because the returned URLs are filtered again
+	// locally. Preserve the user's query when the combined MCP argument would
+	// exceed Kiro's 2048-character limit.
+	return truncateWebSearchQuery(fallback, webSearchMaxUpstreamRunes)
+}
+
+func truncateWebSearchQuery(value string, maxRunes int) string {
+	runes := []rune(value)
+	if len(runes) <= maxRunes {
+		return value
+	}
+	return strings.TrimSpace(string(runes[len(runes)-maxRunes:]))
 }
 
 func filterWebSearchResults(results []webSearchResult, tool ClaudeTool) []webSearchResult {
@@ -701,7 +842,7 @@ func webSearchHostMatchesAny(host string, domains []string) bool {
 
 func newWebSearchMCPRequest(query string) (string, webSearchMCPRequest) {
 	randomID := strings.ReplaceAll(uuid.NewString(), "-", "")
-	toolUseID := "srvtoolu_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	toolUseID := newClaudeServerToolUseID()
 	requestID := fmt.Sprintf(
 		"web_search_tooluse_%s_%d_%s",
 		randomID[:22],
@@ -729,6 +870,23 @@ func callMCPWebSearchWithOptions(
 	account *config.Account,
 	query string,
 	options webSearchMCPCallOptions,
+) (*webSearchResultSet, error) {
+	originalQuery := strings.TrimSpace(query)
+	result, err := callMCPWebSearchWithOptionsInternal(ctx, account, originalQuery, options, true)
+	if result != nil {
+		// A compatibility retry may compact only the upstream query. The
+		// client-visible server_tool_use must continue to echo the original query.
+		result.Query = originalQuery
+	}
+	return result, err
+}
+
+func callMCPWebSearchWithOptionsInternal(
+	ctx context.Context,
+	account *config.Account,
+	query string,
+	options webSearchMCPCallOptions,
+	allowQueryCompatibilityRetry bool,
 ) (*webSearchResultSet, error) {
 	query = strings.TrimSpace(query)
 	if query == "" {
@@ -813,10 +971,23 @@ func callMCPWebSearchWithOptions(
 		}
 	}
 	if mcpResponse.Error != nil {
+		if allowQueryCompatibilityRetry && mcpResponse.Error.Code != nil && *mcpResponse.Error.Code == jsonRPCInvalidParams {
+			compatQuery := compactWebSearchQueryForMCPRetry(query)
+			if compatQuery != "" && compatQuery != query {
+				// The response has already been consumed. Close it before issuing the
+				// one bounded compatibility retry so the transport can reuse the socket.
+				_ = resp.Body.Close()
+				return callMCPWebSearchWithOptionsInternal(ctx, account, compatQuery, options, false)
+			}
+		}
+		message := "web search MCP upstream returned a JSON-RPC error"
+		if isPermanentWebSearchRPCError(mcpResponse.Error.Code) {
+			message = "web search MCP upstream rejected the request"
+		}
 		return nil, &webSearchMCPError{
 			StatusCode: http.StatusBadGateway,
 			RPCCode:    mcpResponse.Error.Code,
-			Message:    "web search MCP upstream returned a JSON-RPC error",
+			Message:    message,
 		}
 	}
 
@@ -827,6 +998,33 @@ func callMCPWebSearchWithOptions(
 	result.ToolUseID = toolUseID
 	result.Query = query
 	return result, nil
+}
+
+func compactWebSearchQueryForMCPRetry(query string) string {
+	var builder strings.Builder
+	builder.Grow(minInt(len(query), webSearchMCPRetryMaxBytes))
+	lastWasSpace := false
+	for _, char := range strings.TrimSpace(query) {
+		if unicode.IsControl(char) || unicode.IsSpace(char) {
+			if !lastWasSpace {
+				builder.WriteByte(' ')
+				lastWasSpace = true
+			}
+			continue
+		}
+		builder.WriteRune(char)
+		lastWasSpace = false
+	}
+
+	compacted := strings.TrimSpace(builder.String())
+	if len(compacted) <= webSearchMCPRetryMaxBytes {
+		return compacted
+	}
+	start := len(compacted) - webSearchMCPRetryMaxBytes
+	for start < len(compacted) && !utf8.RuneStart(compacted[start]) {
+		start++
+	}
+	return strings.TrimSpace(compacted[start:])
 }
 
 func readWebSearchMCPBody(reader io.Reader, maxBytes int64) ([]byte, error) {
@@ -963,8 +1161,9 @@ func writeWebSearchResponse(
 
 func buildWebSearchContent(result *webSearchResultSet) ([]interface{}, string, int) {
 	summary := generateWebSearchSummary(result)
-	searchResults := buildWebSearchResultContent(result.Results)
-	citations := buildWebSearchCitations(result.Results)
+	sessionID := uuid.NewString()
+	searchResults := buildWebSearchResultContentForSession(result.Results, sessionID)
+	citations := buildWebSearchCitationsForSession(result.Results, sessionID)
 	content := []interface{}{
 		map[string]interface{}{
 			"id":    result.ToolUseID,
@@ -991,6 +1190,10 @@ func buildWebSearchContent(result *webSearchResultSet) ([]interface{}, string, i
 }
 
 func buildWebSearchResultContent(results []webSearchResult) []map[string]interface{} {
+	return buildWebSearchResultContentForSession(results, uuid.NewString())
+}
+
+func buildWebSearchResultContentForSession(results []webSearchResult, sessionID string) []map[string]interface{} {
 	content := make([]map[string]interface{}, 0, len(results))
 	for _, result := range results {
 		snippet := ""
@@ -1005,7 +1208,7 @@ func buildWebSearchResultContent(results []webSearchResult) []map[string]interfa
 			"type":              "web_search_result",
 			"title":             result.Title,
 			"url":               result.URL,
-			"encrypted_content": opaqueWebSearchValue(result.URL, result.Title, snippet),
+			"encrypted_content": opaqueWebSearchValue(claudeProtocolEnvelopeWebSearchContent, sessionID, result.URL, result.Title, snippet),
 			"page_age":          pageAge,
 		})
 	}
@@ -1013,6 +1216,10 @@ func buildWebSearchResultContent(results []webSearchResult) []map[string]interfa
 }
 
 func buildWebSearchCitations(results []webSearchResult) []map[string]interface{} {
+	return buildWebSearchCitationsForSession(results, uuid.NewString())
+}
+
+func buildWebSearchCitationsForSession(results []webSearchResult, sessionID string) []map[string]interface{} {
 	citations := make([]map[string]interface{}, 0, len(results))
 	for _, result := range results {
 		citedText := ""
@@ -1023,15 +1230,19 @@ func buildWebSearchCitations(results []webSearchResult) []map[string]interface{}
 			"type":            "web_search_result_location",
 			"url":             result.URL,
 			"title":           result.Title,
-			"encrypted_index": opaqueWebSearchValue(result.URL, result.Title),
+			"encrypted_index": opaqueWebSearchValue(claudeProtocolEnvelopeWebSearchIndex, sessionID, result.URL, result.Title),
 			"cited_text":      citedText,
 		})
 	}
 	return citations
 }
 
-func opaqueWebSearchValue(parts ...string) string {
-	digest := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
+func opaqueWebSearchValue(kind uint64, sessionID string, parts ...string) string {
+	material := strings.Join(parts, "\x00")
+	if protocolCamouflageEnabled() {
+		return buildClaudeWebSearchEnvelope(sessionID, kind, material)
+	}
+	digest := sha256.Sum256([]byte(material))
 	return base64.RawStdEncoding.EncodeToString(digest[:])
 }
 
@@ -1071,6 +1282,7 @@ func buildWebSearchUsage(inputTokens, outputTokens int) map[string]interface{} {
 	return map[string]interface{}{
 		"input_tokens":                inputTokens,
 		"output_tokens":               outputTokens,
+		"output_tokens_details":       map[string]int{"thinking_tokens": 0},
 		"cache_creation_input_tokens": 0,
 		"cache_read_input_tokens":     0,
 		"cache_creation": map[string]interface{}{
@@ -1096,6 +1308,7 @@ func renderWebSearchSSE(
 	var body bytes.Buffer
 	messageStartUsage := buildWebSearchUsage(inputTokens, 0)
 	delete(messageStartUsage, "server_tool_use")
+	delete(messageStartUsage, "output_tokens_details")
 	if err := appendWebSearchSSEEvent(&body, "message_start", map[string]interface{}{
 		"type": "message_start",
 		"message": map[string]interface{}{
@@ -1108,9 +1321,6 @@ func renderWebSearchSSE(
 			"stop_sequence": nil,
 			"stop_details":  nil,
 			"usage":         messageStartUsage,
-			"context_management": map[string]interface{}{
-				"applied_edits": []interface{}{},
-			},
 		},
 	}); err != nil {
 		return nil, err
@@ -1183,11 +1393,15 @@ func renderWebSearchSSE(
 			"stop_sequence": nil,
 			"stop_details":  nil,
 		},
+		"context_management": map[string]interface{}{
+			"applied_edits": []interface{}{},
+		},
 		"usage": map[string]interface{}{
 			"input_tokens":                inputTokens,
 			"cache_creation_input_tokens": 0,
 			"cache_read_input_tokens":     0,
 			"output_tokens":               outputTokens,
+			"output_tokens_details":       map[string]int{"thinking_tokens": 0},
 			"server_tool_use": map[string]interface{}{
 				"web_search_requests": 1,
 				"web_fetch_requests":  0,
@@ -1299,6 +1513,5 @@ func chunkWebSearchText(value string, maxRunes int) []string {
 }
 
 func newWebSearchMessageID() string {
-	raw := strings.ReplaceAll(uuid.NewString(), "-", "")
-	return "msg_" + raw[:24]
+	return newClaudeMessageID()
 }
