@@ -54,6 +54,7 @@ func estimateClaudeRequestInputTokens(req *ClaudeRequest) int {
 	total := estimateClaudeValueTokens(req.System)
 	if choice, err := resolveToolChoice(req.ToolChoice); err == nil {
 		total += estimateApproxTokens(toolChoiceInstruction(choice))
+		total += estimateApproxTokens(claudeAgentToolProtocolInstruction(req, choice))
 	}
 	if req.OutputConfig != nil {
 		total += estimateApproxTokens(claudeStructuredOutputInstruction(req.OutputConfig.Format))
@@ -174,6 +175,7 @@ func estimateOpenAIRequestInputTokens(req *OpenAIRequest) int {
 	total += estimateApproxTokens(openAIStructuredOutputInstruction(req.ResponseFormat))
 	if choice, err := resolveToolChoice(req.ToolChoice); err == nil {
 		total += estimateApproxTokens(toolChoiceInstruction(choice))
+		total += estimateApproxTokens(openAIAgentToolProtocolInstruction(req, choice))
 	}
 	if stopSequences, err := resolveOpenAIStopSequences(req.Stop); err == nil {
 		total += estimateApproxTokens(stopSequencesInstruction(stopSequences))

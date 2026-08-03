@@ -11,6 +11,10 @@ type resolvedToolChoice struct {
 	Name string
 }
 
+const agentToolProtocol = `<agent_tool_protocol>
+If the task can be completed without a tool, answer the user directly. If you need to inspect, search, run, edit, or write anything before answering, emit the corresponding real structured tool call in this response. Never end a response with only narration or a promise about an action you have not performed. Never invent a tool result.
+</agent_tool_protocol>`
+
 func resolveToolChoice(value interface{}) (resolvedToolChoice, error) {
 	if value == nil {
 		return resolvedToolChoice{Mode: "auto"}, nil
@@ -104,6 +108,158 @@ func toolChoiceInstruction(choice resolvedToolChoice) string {
 	default:
 		return ""
 	}
+}
+
+func claudeAgentToolProtocolInstruction(req *ClaudeRequest, choice resolvedToolChoice) string {
+	if req == nil {
+		return ""
+	}
+
+	toolNames := make([]string, 0, len(req.Tools))
+	for _, tool := range req.Tools {
+		toolNames = append(toolNames, tool.Name)
+	}
+	return codingAgentToolProtocolInstruction(
+		choice,
+		isCodingAgentSystemPrompt(extractSystemPrompt(req.System)),
+		toolNames,
+	)
+}
+
+func openAIAgentToolProtocolInstruction(req *OpenAIRequest, choice resolvedToolChoice) string {
+	if req == nil {
+		return ""
+	}
+
+	var systemPrompt string
+	for _, msg := range req.Messages {
+		if msg.Role == "system" {
+			systemPrompt = appendSystemInstruction(systemPrompt, extractOpenAIMessageText(msg.Content))
+		}
+	}
+
+	toolNames := make([]string, 0, len(req.Tools))
+	for _, tool := range req.Tools {
+		toolNames = append(toolNames, openAIToolName(tool))
+	}
+	return codingAgentToolProtocolInstruction(choice, isCodingAgentSystemPrompt(systemPrompt), toolNames)
+}
+
+func codingAgentToolProtocolInstruction(choice resolvedToolChoice, recognizedHarness bool, toolNames []string) string {
+	if choice.Mode != "auto" || len(toolNames) == 0 {
+		return ""
+	}
+
+	matchedTools := 0
+	hasExecutionOrMutation := false
+	for _, name := range toolNames {
+		capability := codingAgentToolCapability(name)
+		if capability == 0 {
+			continue
+		}
+		matchedTools++
+		if capability&(codingAgentToolExecute|codingAgentToolMutate) != 0 {
+			hasExecutionOrMutation = true
+		}
+	}
+
+	// A known coding harness needs only one recognizable agent tool. For an
+	// unknown client, require either a shell/edit tool or multiple inspection
+	// tools so ordinary single-tool API requests keep their original prompt.
+	if matchedTools == 0 || (!recognizedHarness && !hasExecutionOrMutation && matchedTools < 2) {
+		return ""
+	}
+	return agentToolProtocol
+}
+
+const (
+	codingAgentToolInspect = 1 << iota
+	codingAgentToolExecute
+	codingAgentToolMutate
+)
+
+func codingAgentToolCapability(name string) int {
+	normalized := normalizeAgentToolName(name)
+	if normalized == "" {
+		return 0
+	}
+	parts := strings.FieldsFunc(strings.ToLower(strings.TrimSpace(name)), func(r rune) bool {
+		return !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'))
+	})
+	lastPart := ""
+	if len(parts) > 0 {
+		lastPart = normalizeAgentToolName(parts[len(parts)-1])
+	}
+
+	for _, exact := range []string{"read", "glob", "grep", "search"} {
+		if normalized == exact || lastPart == exact {
+			return codingAgentToolInspect
+		}
+	}
+	for _, suffix := range []string{
+		"readfile", "readfiles", "searchfiles",
+		"findfiles", "listfiles", "listdirectory", "listdir", "viewfile",
+	} {
+		if strings.HasSuffix(normalized, suffix) {
+			return codingAgentToolInspect
+		}
+	}
+	for _, exact := range []string{"bash", "shell", "exec", "terminal"} {
+		if normalized == exact || lastPart == exact {
+			return codingAgentToolExecute
+		}
+	}
+	for _, suffix := range []string{
+		"shellcommand", "execcommand", "executecommand", "runcommand",
+	} {
+		if strings.HasSuffix(normalized, suffix) {
+			return codingAgentToolExecute
+		}
+	}
+	for _, exact := range []string{"write", "edit", "patch"} {
+		if normalized == exact || lastPart == exact {
+			return codingAgentToolMutate
+		}
+	}
+	for _, suffix := range []string{
+		"writefile", "editfile", "applypatch", "replacefile", "createfile",
+		"notebookedit", "strreplaceeditor",
+	} {
+		if strings.HasSuffix(normalized, suffix) {
+			return codingAgentToolMutate
+		}
+	}
+	return 0
+}
+
+func normalizeAgentToolName(name string) string {
+	var normalized strings.Builder
+	for _, r := range strings.ToLower(strings.TrimSpace(name)) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			normalized.WriteRune(r)
+		}
+	}
+	return normalized.String()
+}
+
+func isCodingAgentSystemPrompt(prompt string) bool {
+	if isClaudeCodeSystemPrompt(prompt) {
+		return true
+	}
+
+	lower := strings.ToLower(prompt)
+	markers := []string{
+		"you are codex, a coding agent",
+		"you are a coding agent",
+		"you are an ai coding agent",
+		"you are a software engineering agent",
+	}
+	for _, marker := range markers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func filterClaudeToolsForChoice(tools []ClaudeTool, choice resolvedToolChoice) []ClaudeTool {

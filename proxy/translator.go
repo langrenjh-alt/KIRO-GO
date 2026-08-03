@@ -247,6 +247,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	systemPrompt := buildClaudeSystemPrompt(req, thinking)
 	toolChoice, _ := resolveToolChoice(req.ToolChoice)
 	systemPrompt = appendSystemInstruction(systemPrompt, toolChoiceInstruction(toolChoice))
+	systemPrompt = appendSystemInstruction(systemPrompt, claudeAgentToolProtocolInstruction(req, toolChoice))
 	if req.OutputConfig != nil {
 		systemPrompt = appendSystemInstruction(systemPrompt, claudeStructuredOutputInstruction(req.OutputConfig.Format))
 	}
@@ -1551,6 +1552,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	systemPrompt = appendSystemInstruction(systemPrompt, openAIStructuredOutputInstruction(req.ResponseFormat))
 	toolChoice, _ := resolveToolChoice(req.ToolChoice)
 	systemPrompt = appendSystemInstruction(systemPrompt, toolChoiceInstruction(toolChoice))
+	systemPrompt = appendSystemInstruction(systemPrompt, openAIAgentToolProtocolInstruction(req, toolChoice))
 	stopSequences, _ := resolveOpenAIStopSequences(req.Stop)
 	systemPrompt = appendSystemInstruction(systemPrompt, stopSequencesInstruction(stopSequences))
 
