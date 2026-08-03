@@ -168,8 +168,10 @@ func (h *Handler) handleResponsesNonStream(
 	retrySameID := ""
 	var lastErr error
 	reqStart := time.Now()
+	preResponseRetryCount := 0
 
-	for attempt := 0; attempt < h.maxAccountAttempts(); attempt++ {
+	attemptLimit := h.maxAccountAttempts()
+	for attempt := 0; attempt < attemptLimit; attempt++ {
 		account, allFull := h.acquireAccountForModel(model, excluded, retrySameID)
 		retrySameID = ""
 		if account == nil {
@@ -198,17 +200,28 @@ func (h *Handler) handleResponsesNonStream(
 		var realInputTokens int
 		var upstreamStopReason string
 		var contextWindowExceeded bool
+		var suppressedReasoningObserved bool
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
 				if isThinking {
 					if !thinking {
+						suppressedReasoningObserved = true
 						return
 					}
 					reasoningContent += text
 					return
 				}
 				content += text
+			},
+			OnReasoning: func(event KiroReasoningContentEvent) {
+				if !thinking {
+					if event.Text != "" || event.Signature != "" || event.RedactedContent != "" {
+						suppressedReasoningObserved = true
+					}
+					return
+				}
+				reasoningContent += event.Text
 			},
 			OnToolUse:    func(tu KiroToolUse) { toolUses = append(toolUses, tu) },
 			OnComplete:   func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
@@ -222,7 +235,17 @@ func (h *Handler) handleResponsesNonStream(
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		call := h.kiroCaller
+		if call == nil {
+			call = CallKiroAPI
+		}
+		err := call(account, payload, callback)
+		if err == nil {
+			visibleContent, _ := extractThinkingFromContent(content)
+			if hiddenReasoningOnlyResponse(thinking, suppressedReasoningObserved, visibleContent, len(toolUses), upstreamStopReason) {
+				err = newUpstreamIncompleteResponseError()
+			}
+		}
 		h.releaseAccount(account)
 		if err != nil {
 			if isDownstreamRequestCanceled(payload, err) {
@@ -233,6 +256,17 @@ func (h *Handler) handleResponsesNonStream(
 				h.recordFailureWithDetails("responses", model, account.ID, err)
 				h.sendOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 				return
+			}
+			if isUpstreamIncompleteResponseError(err) {
+				retried, retryErr := h.retryKiroPreResponse(payload, account, &preResponseRetryCount, excluded, &retrySameID)
+				if retryErr != nil {
+					return
+				}
+				if retried {
+					attemptLimit++
+					logger.Warnf("[KiroAPI] retrying Responses non-stream after reasoning-only response account_id=%s retry=%d/%d", account.ID, preResponseRetryCount, maxKiroPreResponseRetries)
+					continue
+				}
 			}
 			if code, protocolErr := kiroStreamProtocolErrorCode(err); protocolErr {
 				h.recordFailureWithDetails("responses", model, account.ID, err)
@@ -473,9 +507,12 @@ func (h *Handler) handleResponsesStream(
 	retrySameID := ""
 	var lastErr error
 	responseStarted := false
+	responseInProgressSent := false
 	reqStart := time.Now()
+	preResponseRetryCount := 0
 
-	for attempt := 0; attempt < h.maxAccountAttempts(); attempt++ {
+	attemptLimit := h.maxAccountAttempts()
+	for attempt := 0; attempt < attemptLimit; attempt++ {
 		account, allFull := h.acquireAccountForModel(model, excluded, retrySameID)
 		retrySameID = ""
 		if account == nil {
@@ -497,24 +534,28 @@ func (h *Handler) handleResponsesStream(
 			continue
 		}
 
-		send("response.in_progress", map[string]interface{}{
-			"type":     "response.in_progress",
-			"response": initial,
-		})
+		if !responseInProgressSent {
+			send("response.in_progress", map[string]interface{}{
+				"type":     "response.in_progress",
+				"response": initial,
+			})
+			responseInProgressSent = true
+		}
 
 		var (
-			fullText              strings.Builder
-			messageText           strings.Builder
-			reasoningText         strings.Builder
-			fullReasoningText     strings.Builder
-			toolUses              []KiroToolUse
-			streamOutput          []ResponseOutputItem
-			inputTokens           int
-			outputTokens          int
-			credits               float64
-			realInputTokens       int
-			upstreamStopReason    string
-			contextWindowExceeded bool
+			fullText                    strings.Builder
+			messageText                 strings.Builder
+			reasoningText               strings.Builder
+			fullReasoningText           strings.Builder
+			toolUses                    []KiroToolUse
+			streamOutput                []ResponseOutputItem
+			inputTokens                 int
+			outputTokens                int
+			credits                     float64
+			realInputTokens             int
+			upstreamStopReason          string
+			contextWindowExceeded       bool
+			suppressedReasoningObserved bool
 		)
 
 		messageItemID := ""
@@ -678,6 +719,7 @@ func (h *Handler) handleResponsesStream(
 				}
 				if isThinking {
 					if !thinking {
+						suppressedReasoningObserved = true
 						return
 					}
 					ensureReasoningStarted()
@@ -702,6 +744,28 @@ func (h *Handler) handleResponsesStream(
 					"output_index":  outputIndex,
 					"content_index": contentIndex,
 					"delta":         text,
+				})
+				responseStarted = true
+			},
+			OnReasoning: func(event KiroReasoningContentEvent) {
+				if !thinking {
+					if event.Text != "" || event.Signature != "" || event.RedactedContent != "" {
+						suppressedReasoningObserved = true
+					}
+					return
+				}
+				if event.Text == "" {
+					return
+				}
+				ensureReasoningStarted()
+				reasoningText.WriteString(event.Text)
+				fullReasoningText.WriteString(event.Text)
+				send("response.reasoning_summary_text.delta", map[string]interface{}{
+					"type":          "response.reasoning_summary_text.delta",
+					"item_id":       reasoningItemID,
+					"output_index":  outputIndex,
+					"summary_index": 0,
+					"delta":         event.Text,
 				})
 				responseStarted = true
 			},
@@ -764,7 +828,17 @@ func (h *Handler) handleResponsesStream(
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		call := h.kiroCaller
+		if call == nil {
+			call = CallKiroAPI
+		}
+		err := call(account, payload, callback)
+		if err == nil {
+			visibleContent, _ := extractThinkingFromContent(fullText.String())
+			if hiddenReasoningOnlyResponse(thinking, suppressedReasoningObserved, visibleContent, len(toolUses), upstreamStopReason) {
+				err = newUpstreamIncompleteResponseError()
+			}
+		}
 		h.releaseAccount(account)
 		if err != nil {
 			if isDownstreamRequestCanceled(payload, err) {
@@ -781,6 +855,17 @@ func (h *Handler) handleResponsesStream(
 				})
 				h.recordFailureWithDetails("responses", model, account.ID, err)
 				return
+			}
+			if !responseStarted && isUpstreamIncompleteResponseError(err) {
+				retried, retryErr := h.retryKiroPreResponse(payload, account, &preResponseRetryCount, excluded, &retrySameID)
+				if retryErr != nil {
+					return
+				}
+				if retried {
+					attemptLimit++
+					logger.Warnf("[KiroAPI] retrying Responses stream after reasoning-only response account_id=%s retry=%d/%d", account.ID, preResponseRetryCount, maxKiroPreResponseRetries)
+					continue
+				}
 			}
 			if code, protocolErr := kiroStreamProtocolErrorCode(err); protocolErr {
 				send("response.failed", map[string]interface{}{

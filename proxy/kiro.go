@@ -409,6 +409,10 @@ type KiroStreamProtocolError struct {
 	Err  error
 }
 
+const upstreamIncompleteResponseCode = "upstream_incomplete_response"
+
+var errUpstreamIncompleteResponse = errors.New("upstream returned reasoning without a final response")
+
 type KiroHTTPError struct {
 	StatusCode int
 	Endpoint   string
@@ -444,6 +448,33 @@ func kiroStreamProtocolErrorCode(err error) (string, bool) {
 	return protocolErr.Code, true
 }
 
+func newUpstreamIncompleteResponseError() error {
+	return &KiroStreamProtocolError{
+		Code: upstreamIncompleteResponseCode,
+		Err:  errUpstreamIncompleteResponse,
+	}
+}
+
+func isUpstreamIncompleteResponseError(err error) bool {
+	if errors.Is(err, errUpstreamIncompleteResponse) {
+		return true
+	}
+	code, ok := kiroStreamProtocolErrorCode(err)
+	return ok && code == upstreamIncompleteResponseCode
+}
+
+// hiddenReasoningOnlyResponse identifies the Opus failure mode where Kiro
+// emits native reasoning but ends before producing an answer or tool call.
+// A terminal stop reason is respected so legitimate max-token completions are
+// not retried indefinitely.
+func hiddenReasoningOnlyResponse(thinking, reasoningObserved bool, visibleContent string, toolCount int, stopReason string) bool {
+	return !thinking &&
+		reasoningObserved &&
+		strings.TrimSpace(visibleContent) == "" &&
+		toolCount == 0 &&
+		strings.TrimSpace(stopReason) == ""
+}
+
 // isRetryableKiroStreamError identifies failures that are safe to retry only
 // before any client-visible response has been emitted. Kiro can terminate an
 // otherwise valid stream while an MCP/tool JSON fragment is being assembled,
@@ -455,7 +486,7 @@ func isRetryableKiroStreamError(err error) bool {
 		return false
 	}
 	if code, ok := kiroStreamProtocolErrorCode(err); ok {
-		return code == "upstream_tool_json_error"
+		return code == "upstream_tool_json_error" || code == upstreamIncompleteResponseCode
 	}
 	if isKiroTransportError(err) {
 		return true

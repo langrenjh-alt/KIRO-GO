@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"kiro-go/config"
+	"kiro-go/logger"
 )
 
 const (
@@ -327,8 +328,10 @@ func (h *Handler) callClaudeBuffered(
 	retryCounts := make(map[string]int)
 	retrySameID := ""
 	var lastErr error
+	preResponseRetryCount := 0
 
-	for attempt := 0; attempt < h.maxAccountAttempts(); attempt++ {
+	attemptLimit := h.maxAccountAttempts()
+	for attempt := 0; attempt < attemptLimit; attempt++ {
 		account, allFull := h.acquireAccountForModel(model, excluded, retrySameID)
 		retrySameID = ""
 		if account == nil {
@@ -354,11 +357,14 @@ func (h *Handler) callClaudeBuffered(
 		var content strings.Builder
 		var reasoning strings.Builder
 		var realInputTokens int
+		var suppressedReasoningObserved bool
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
 				if isThinking {
 					if thinking {
 						reasoning.WriteString(text)
+					} else if text != "" {
+						suppressedReasoningObserved = true
 					}
 					return
 				}
@@ -374,6 +380,9 @@ func (h *Handler) callClaudeBuffered(
 						result.Reasoning.Redacted = append(result.Reasoning.Redacted, event.RedactedContent)
 					}
 					return
+				}
+				if event.Text != "" || event.Signature != "" || event.RedactedContent != "" {
+					suppressedReasoningObserved = true
 				}
 			},
 			OnToolUse: func(toolUse KiroToolUse) {
@@ -396,7 +405,20 @@ func (h *Handler) callClaudeBuffered(
 				}
 			},
 		}
-		if err := call(account, payload, callback); err != nil {
+		err := call(account, payload, callback)
+		if err == nil {
+			visibleContent, _ := extractThinkingFromContent(content.String())
+			if hiddenReasoningOnlyResponse(
+				thinking,
+				suppressedReasoningObserved,
+				visibleContent,
+				len(result.ToolUses),
+				result.UpstreamStopReason,
+			) {
+				err = newUpstreamIncompleteResponseError()
+			}
+		}
+		if err != nil {
 			h.releaseAccount(account)
 			if isDownstreamRequestCanceled(payload, err) {
 				return nil, err
@@ -404,6 +426,17 @@ func (h *Handler) callClaudeBuffered(
 			lastErr = err
 			if isKiroInputTooLongError(err) {
 				return nil, err
+			}
+			if isUpstreamIncompleteResponseError(err) {
+				retried, retryErr := h.retryKiroPreResponse(payload, account, &preResponseRetryCount, excluded, &retrySameID)
+				if retryErr != nil {
+					return nil, retryErr
+				}
+				if retried {
+					attemptLimit++
+					logger.Warnf("[KiroAPI] retrying buffered Claude call after reasoning-only response account_id=%s retry=%d/%d", account.ID, preResponseRetryCount, maxKiroPreResponseRetries)
+					continue
+				}
 			}
 			if _, protocolErr := kiroStreamProtocolErrorCode(err); protocolErr {
 				return nil, err

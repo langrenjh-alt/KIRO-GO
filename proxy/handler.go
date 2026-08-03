@@ -1199,6 +1199,7 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 		activeBlockType := ""
 		thinkingBlockEmitted := false
 		hiddenThinkingObserved := false
+		suppressedReasoningObserved := false
 		visibleOutputProduced := prelude != nil && len(prelude.Blocks) > 0
 
 		closeActiveBlock := func() {
@@ -1588,6 +1589,7 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 				}
 				if isThinking {
 					if !thinking {
+						suppressedReasoningObserved = true
 						return
 					}
 					rawThinkingBuilder.WriteString(text)
@@ -1601,6 +1603,9 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 			},
 			OnReasoning: func(event KiroReasoningContentEvent) {
 				if !thinking {
+					if event.Text != "" || event.Signature != "" || event.RedactedContent != "" {
+						suppressedReasoningObserved = true
+					}
 					return
 				}
 				if thinkingFormat == "thinking" && event.Signature != "" {
@@ -1688,6 +1693,18 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 			call = CallKiroAPI
 		}
 		err := call(account, payload, callback)
+		if err == nil {
+			visibleContent, _ := extractThinkingFromContent(rawContentBuilder.String())
+			if hiddenReasoningOnlyResponse(
+				thinking,
+				suppressedReasoningObserved || hiddenThinkingObserved,
+				visibleContent,
+				len(toolUses),
+				upstreamStopReason,
+			) {
+				err = newUpstreamIncompleteResponseError()
+			}
+		}
 		h.releaseAccount(account)
 		if err != nil {
 			if isDownstreamRequestCanceled(payload, err) {
@@ -1721,7 +1738,8 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 					logger.Warnf("[KiroAPI] retrying Claude stream after truncated tool JSON account_id=%s retry=%d/%d: %v", account.ID, toolJSONRetryCounts[account.ID], maxKiroToolJSONRetries, err)
 					continue
 				}
-				if !messageStarted && isRetryableKiroStreamError(err) {
+				canRetry := !messageStarted || (isUpstreamIncompleteResponseError(err) && !visibleOutputProduced)
+				if canRetry && isRetryableKiroStreamError(err) {
 					retried, retryErr := h.retryKiroPreResponse(payload, account, &preResponseRetryCount, excluded, &retrySameID)
 					if retryErr != nil {
 						return
@@ -2199,6 +2217,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		var credits float64
 		var contextWindowExceeded bool
 		var upstreamStopReason string
+		var suppressedReasoningObserved bool
 		var matchedStopSequence string
 		updateStopSequenceState := func() {
 			if matchedStopSequence != "" {
@@ -2212,6 +2231,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			OnText: func(text string, isThinking bool) {
 				if isThinking {
 					if !thinking {
+						suppressedReasoningObserved = true
 						return
 					}
 					thinkingContent += text
@@ -2222,6 +2242,9 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			},
 			OnReasoning: func(event KiroReasoningContentEvent) {
 				if !thinking {
+					if event.Text != "" || event.Signature != "" || event.RedactedContent != "" {
+						suppressedReasoningObserved = true
+					}
 					return
 				}
 				thinkingContent += event.Text
@@ -2260,6 +2283,12 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			call = CallKiroAPI
 		}
 		err := call(account, payload, callback)
+		if err == nil {
+			visibleContent, _ := extractThinkingFromContent(content)
+			if hiddenReasoningOnlyResponse(thinking, suppressedReasoningObserved, visibleContent, len(toolUses), upstreamStopReason) {
+				err = newUpstreamIncompleteResponseError()
+			}
+		}
 		h.releaseAccount(account)
 		if err != nil {
 			if isDownstreamRequestCanceled(payload, err) {
@@ -2581,6 +2610,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		var eventThinkingOpen bool
 		var upstreamStopReason string
 		var contextWindowExceeded bool
+		var suppressedReasoningObserved bool
 		responseStarted := false
 		assistantRoleSent := false
 		stopFilter := newStopSequenceFilter(payload.StopSequences)
@@ -2841,6 +2871,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				}
 				if isThinking {
 					if !thinking {
+						suppressedReasoningObserved = true
 						return
 					}
 					rawReasoningBuilder.WriteString(text)
@@ -2915,6 +2946,12 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			call = CallKiroAPI
 		}
 		err := call(account, payload, callback)
+		if err == nil {
+			visibleContent, _ := extractThinkingFromContent(rawContentBuilder.String())
+			if hiddenReasoningOnlyResponse(thinking, suppressedReasoningObserved, visibleContent, len(toolCalls), upstreamStopReason) {
+				err = newUpstreamIncompleteResponseError()
+			}
+		}
 		h.releaseAccount(account)
 		if err != nil {
 			if isDownstreamRequestCanceled(payload, err) {
@@ -3138,6 +3175,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		var realInputTokens int
 		var upstreamStopReason string
 		var contextWindowExceeded bool
+		var suppressedReasoningObserved bool
 		var matchedStopSequence string
 		updateStopSequenceState := func() {
 			if matchedStopSequence != "" {
@@ -3154,6 +3192,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 				}
 				if isThinking {
 					if !thinking {
+						suppressedReasoningObserved = true
 						return
 					}
 					reasoningContent += text
@@ -3183,6 +3222,12 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			call = CallKiroAPI
 		}
 		err := call(account, payload, callback)
+		if err == nil {
+			visibleContent, _ := extractThinkingFromContent(content)
+			if hiddenReasoningOnlyResponse(thinking, suppressedReasoningObserved, visibleContent, len(toolUses), upstreamStopReason) {
+				err = newUpstreamIncompleteResponseError()
+			}
+		}
 		h.releaseAccount(account)
 		if err != nil {
 			if isDownstreamRequestCanceled(payload, err) {
