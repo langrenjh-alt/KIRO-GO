@@ -53,7 +53,7 @@
   without changing active-stream content or protocol metadata.
 - Kept successful empty upstream turns as valid empty Claude messages instead
   of converting them into `empty_visible_output` gateway errors or account
-  cooldowns; treated non-thinking reasoning events consistently as visible text.
+  cooldowns; suppressed reasoning events when thinking output is not enabled.
 - Kept Claude usage and prompt-cache metadata anchored to client-visible input
   tokens instead of Kiro's hidden editor context; added Anthropic request IDs
   and accepted standard native `web_search_*` queries alongside Claude Code.

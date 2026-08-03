@@ -345,8 +345,10 @@ func (h *Handler) callClaudeBuffered(
 		var realInputTokens int
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
-				if isThinking && thinking {
-					reasoning.WriteString(text)
+				if isThinking {
+					if thinking {
+						reasoning.WriteString(text)
+					}
 					return
 				}
 				content.WriteString(text)
@@ -362,7 +364,6 @@ func (h *Handler) callClaudeBuffered(
 					}
 					return
 				}
-				content.WriteString(event.Text)
 			},
 			OnToolUse: func(toolUse KiroToolUse) {
 				result.ToolUses = append(result.ToolUses, toolUse)

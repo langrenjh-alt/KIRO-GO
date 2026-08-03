@@ -115,6 +115,29 @@ func TestOpenAIChatStreamContract(t *testing.T) {
 	}
 }
 
+func TestOpenAIChatSuppressesReasoningWhenThinkingIsDisabled(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%v", stream), func(t *testing.T) {
+			h := newOpenAIChatContractHandler(t,
+				awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{"text": "private reasoning"}),
+				awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "final answer"}),
+			)
+			body := fmt.Sprintf(`{"model":"claude-opus-5","messages":[{"role":"user","content":"test"}],"stream":%v}`, stream)
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+			rec := httptest.NewRecorder()
+
+			h.handleOpenAIChat(rec, req)
+
+			if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "final answer") {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			if strings.Contains(rec.Body.String(), "private reasoning") {
+				t.Fatalf("reasoning leaked into non-thinking response: %s", rec.Body.String())
+			}
+		})
+	}
+}
+
 func TestOpenAIChatStreamFlushesShortDeltaBeforeUpstreamCompletes(t *testing.T) {
 	h, cleanup := setupResponsesTestHandler(t)
 	t.Cleanup(cleanup)

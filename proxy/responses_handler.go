@@ -199,14 +199,13 @@ func (h *Handler) handleResponsesNonStream(
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
 				if isThinking {
-					if thinking {
-						reasoningContent += text
-					} else {
-						content += text
+					if !thinking {
+						return
 					}
-				} else {
-					content += text
+					reasoningContent += text
+					return
 				}
+				content += text
 			},
 			OnToolUse:    func(tu KiroToolUse) { toolUses = append(toolUses, tu) },
 			OnComplete:   func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
@@ -661,7 +660,10 @@ func (h *Handler) handleResponsesStream(
 				if text == "" {
 					return
 				}
-				if isThinking && thinking {
+				if isThinking {
+					if !thinking {
+						return
+					}
 					ensureReasoningStarted()
 					reasoningText.WriteString(text)
 					fullReasoningText.WriteString(text)

@@ -1593,14 +1593,9 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 			},
 			OnReasoning: func(event KiroReasoningContentEvent) {
 				if !thinking {
-					if event.Text != "" {
-						rawContentBuilder.WriteString(event.Text)
-						flushPendingSignatureBlock()
-						processClaudeText(event.Text, false, false)
-					}
 					return
 				}
-				if thinking && thinkingFormat == "thinking" && event.Signature != "" {
+				if thinkingFormat == "thinking" && event.Signature != "" {
 					pendingThinkingSignature = event.Signature
 					reasoningSignature = event.Signature
 				}
@@ -1608,7 +1603,7 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 					rawThinkingBuilder.WriteString(event.Text)
 					processClaudeText(event.Text, true, false)
 				}
-				if thinking && event.RedactedContent != "" {
+				if event.RedactedContent != "" {
 					redactedThinking = append(redactedThinking, event.RedactedContent)
 				}
 				emitRedactedThinking(event.RedactedContent)
@@ -2176,29 +2171,25 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
 				if isThinking {
-					if thinking {
-						thinkingContent += text
-					} else {
-						content += text
-						updateStopSequenceState()
+					if !thinking {
+						return
 					}
-				} else {
-					content += text
-					updateStopSequenceState()
+					thinkingContent += text
+					return
 				}
+				content += text
+				updateStopSequenceState()
 			},
 			OnReasoning: func(event KiroReasoningContentEvent) {
-				if thinking {
-					thinkingContent += event.Text
-					if event.Signature != "" {
-						thinkingSignature = event.Signature
-					}
-					if event.RedactedContent != "" {
-						redactedThinking = append(redactedThinking, event.RedactedContent)
-					}
-				} else {
-					content += event.Text
-					updateStopSequenceState()
+				if !thinking {
+					return
+				}
+				thinkingContent += event.Text
+				if event.Signature != "" {
+					thinkingSignature = event.Signature
+				}
+				if event.RedactedContent != "" {
+					redactedThinking = append(redactedThinking, event.RedactedContent)
 				}
 			},
 			OnToolUse: func(tu KiroToolUse) {
@@ -2774,7 +2765,10 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				if text == "" || stopFilter.Matched() != "" {
 					return
 				}
-				if isThinking && thinking {
+				if isThinking {
+					if !thinking {
+						return
+					}
 					rawReasoningBuilder.WriteString(text)
 				} else {
 					rawContentBuilder.WriteString(text)
@@ -3028,16 +3022,14 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 					return
 				}
 				if isThinking {
-					if thinking {
-						reasoningContent += text
-					} else {
-						content += text
-						updateStopSequenceState()
+					if !thinking {
+						return
 					}
-				} else {
-					content += text
-					updateStopSequenceState()
+					reasoningContent += text
+					return
 				}
+				content += text
+				updateStopSequenceState()
 			},
 			OnToolUse: func(tu KiroToolUse) {
 				if matchedStopSequence == "" {

@@ -152,13 +152,14 @@ func emptyVisibleOutputPayload() *KiroPayload {
 	return payload
 }
 
-func TestClaudeStreamTreatsReasoningEventAsTextWhenThinkingIsDisabled(t *testing.T) {
+func TestClaudeStreamSuppressesReasoningEventWhenThinkingIsDisabled(t *testing.T) {
 	var accountIDs []string
 	var calls int
 	h := newEmptyVisibleOutputTestHandler(t, 2, func(account *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
 		calls++
 		accountIDs = append(accountIDs, account.ID)
-		callback.OnReasoning(KiroReasoningContentEvent{Text: "visible answer"})
+		callback.OnReasoning(KiroReasoningContentEvent{Text: "private reasoning"})
+		callback.OnText("final answer", false)
 		callback.OnComplete(10, 4)
 		return nil
 	})
@@ -191,8 +192,44 @@ func TestClaudeStreamTreatsReasoningEventAsTextWhenThinkingIsDisabled(t *testing
 			messageStops++
 		}
 	}
-	if visibleText != "visible answer" || outputTokens <= 0 || messageStops != 1 {
+	if visibleText != "final answer" || strings.Contains(rec.Body.String(), "private reasoning") || outputTokens <= 0 || messageStops != 1 {
 		t.Fatalf("visible=%q output_tokens=%v message_stops=%d\n%s", visibleText, outputTokens, messageStops, rec.Body.String())
+	}
+}
+
+func TestClaudeNonStreamSuppressesReasoningEventWhenThinkingIsDisabled(t *testing.T) {
+	h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
+		callback.OnReasoning(KiroReasoningContentEvent{Text: "private reasoning"})
+		callback.OnText("final answer", false)
+		callback.OnComplete(10, 4)
+		return nil
+	})
+	rec := httptest.NewRecorder()
+
+	h.handleClaudeNonStream(rec, emptyVisibleOutputPayload(), "claude-opus-5", "claude-opus-5", false, claudeThinkingResponseOptions{}, 5, nil, "")
+
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "final answer") {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "private reasoning") {
+		t.Fatalf("reasoning leaked into non-thinking response: %s", rec.Body.String())
+	}
+}
+
+func TestClaudeBufferedCallSuppressesReasoningWhenThinkingIsDisabled(t *testing.T) {
+	h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
+		callback.OnReasoning(KiroReasoningContentEvent{Text: "private reasoning"})
+		callback.OnText("final answer", false)
+		callback.OnComplete(10, 4)
+		return nil
+	})
+
+	result, err := h.callClaudeBuffered("claude-opus-5", emptyVisibleOutputPayload(), false, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Content != "final answer" || result.Reasoning.Text != "" {
+		t.Fatalf("content=%q reasoning=%q", result.Content, result.Reasoning.Text)
 	}
 }
 

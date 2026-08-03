@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"kiro-go/config"
 	accountpool "kiro-go/pool"
@@ -518,5 +519,38 @@ func TestResponsesStreamReasoningIDsMatchTerminalOutput(t *testing.T) {
 		if !strings.Contains(rec.Body.String(), expected) {
 			t.Fatalf("missing %s\n%s", expected, rec.Body.String())
 		}
+	}
+}
+
+func TestResponsesSuppressesReasoningWhenThinkingIsDisabled(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%v", stream), func(t *testing.T) {
+			h, cleanup := setupResponsesTestHandler(t)
+			defer cleanup()
+			frames := [][]byte{
+				awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{"text": "private reasoning"}),
+				awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "final answer"}),
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				for _, frame := range frames {
+					_, _ = w.Write(frame)
+				}
+			}))
+			defer server.Close()
+			defer swapKiroEndpointsForTest(t, server)()
+
+			body := fmt.Sprintf(`{"model":"claude-opus-5","input":"test","stream":%v,"store":false}`, stream)
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+			rec := httptest.NewRecorder()
+
+			h.handleOpenAIResponses(rec, req)
+
+			if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "final answer") {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			if strings.Contains(rec.Body.String(), "private reasoning") {
+				t.Fatalf("reasoning leaked into non-thinking response: %s", rec.Body.String())
+			}
+		})
 	}
 }
