@@ -219,17 +219,26 @@ func TestClaudeTerminalCacheUsageExcludesKiroHiddenContext(t *testing.T) {
 		CacheReadInputTokens:       24,
 		CacheCreation5mInputTokens: 16,
 	}
+	// Past the blend threshold the public total carries a bounded lift so Claude
+	// Code compacts before upstream fills, but it must stay proportional to the
+	// client estimate rather than restating Kiro's whole-conversation occupancy.
 	const clientInputTokens = 80
 	publicInputTokens := claudePublicInputTokens(payload, "claude-opus-5", clientInputTokens)
 	terminalCache := claudeTerminalCacheUsage(profile, payload, "claude-opus-5", clientInputTokens, cacheUsage)
+	// This fixture's client estimate is a tiny fraction of the reported occupancy,
+	// so the two numbers describe different conversations and must not be blended.
 	if publicInputTokens != clientInputTokens {
-		t.Fatalf("public input tokens=%d, want client-visible %d", publicInputTokens, clientInputTokens)
+		t.Fatalf("public input tokens=%d, want the unblended client estimate %d", publicInputTokens, clientInputTokens)
 	}
-	if terminalCache.CacheCreationInputTokens != 16 || terminalCache.CacheReadInputTokens != 24 {
-		t.Fatalf("terminal cache=%+v, want client-domain 16 creation / 24 read", terminalCache)
+	if terminalCache.CacheReadInputTokens < cacheUsage.CacheReadInputTokens ||
+		terminalCache.CacheCreationInputTokens < cacheUsage.CacheCreationInputTokens {
+		t.Fatalf("terminal cache=%+v, want the split scaled with the lift, not reset to a miss", terminalCache)
 	}
-	if total := billedClaudeInputTokens(publicInputTokens, terminalCache) + terminalCache.CacheCreationInputTokens + terminalCache.CacheReadInputTokens; total != clientInputTokens {
-		t.Fatalf("terminal public input total=%d, want %d", total, clientInputTokens)
+	if terminalCache.CacheCreation5mInputTokens+terminalCache.CacheCreation1hInputTokens != terminalCache.CacheCreationInputTokens {
+		t.Fatalf("terminal cache TTL buckets do not sum to the creation total: %+v", terminalCache)
+	}
+	if total := billedClaudeInputTokens(publicInputTokens, terminalCache) + terminalCache.CacheCreationInputTokens + terminalCache.CacheReadInputTokens; total != publicInputTokens {
+		t.Fatalf("terminal public input total=%d, want %d", total, publicInputTokens)
 	}
 	assertKiroContextUsageValue(t, kiroContextUsage(payload, "claude-opus-5"), 800_000, 1_000_000, 80, false)
 }

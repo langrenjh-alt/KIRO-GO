@@ -2068,6 +2068,19 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 		}
 		h.releaseAccount(account)
 		if err != nil {
+			// Bill whatever this attempt already produced before deciding how to
+			// recover. Every branch below either retries or returns, so a later
+			// settlement would never see these tokens.
+			if discarded := estimateClaudeOutputTokensWithRedacted(
+				rawContentBuilder.String(), rawThinkingBuilder.String(), redactedThinking, toolUses,
+			); discarded > 0 {
+				discardedInput := clampClaudeInputTokensToModelWindow(model, estimatedInputTokens)
+				h.settleDiscardedAttempt(
+					"claude", model, account.ID, apiKeyID,
+					discardedInput, discarded, credits,
+					time.Since(reqStart).Milliseconds(),
+				)
+			}
 			if isUpstreamIncompleteResponseError(err) {
 				if eventThinkingOpen {
 					sendText("", 3)
@@ -2388,6 +2401,39 @@ func (h *Handler) recordSuccessForApiKey(apiKeyID string, inputTokens, outputTok
 	h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, credits, promptCacheUsage{})
 }
 
+// estimateOpenAIDiscardedOutput mirrors the success path's arithmetic, which
+// counts each tool call's name and arguments directly instead of going through
+// KiroToolUse.
+func estimateOpenAIDiscardedOutput(content, reasoning string, toolCalls []ToolCall) int {
+	total := estimateApproxTokens(content) + estimateApproxTokens(reasoning)
+	for _, tc := range toolCalls {
+		total += estimateApproxTokens(tc.Function.Name)
+		total += estimateApproxTokens(tc.Function.Arguments)
+	}
+	return total
+}
+
+// settleDiscardedAttempt bills an attempt whose output never reached the client:
+// a structured-output validation retry, or an agent turn that ended without a
+// marker or tool call. Kiro has already produced these tokens upstream, so
+// skipping them understates usage and lets a reasoning loop burn quota that no
+// counter or quota gate can observe. It settles inside the attempt's own loop
+// iteration, against the account that produced it, so the client-visible usage
+// of a later attempt never absorbs tokens it did not generate.
+func (h *Handler) settleDiscardedAttempt(endpoint, model, accountID, apiKeyID string, inputTokens, outputTokens int, credits float64, elapsedMs int64) {
+	if inputTokens <= 0 {
+		inputTokens = 1
+	}
+	if outputTokens < 0 {
+		outputTokens = 0
+	}
+	h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+	if h.pool != nil {
+		h.pool.UpdateStats(accountID, inputTokens+outputTokens, credits)
+	}
+	h.recordSuccessLog(endpoint, model, accountID, inputTokens+outputTokens, credits, elapsedMs)
+}
+
 func (h *Handler) recordSuccessForApiKeyWithCache(apiKeyID string, inputTokens, outputTokens int, credits float64, cacheUsage promptCacheUsage) {
 	h.statsMu.Lock()
 	h.recordSuccess(inputTokens, outputTokens, credits)
@@ -2530,8 +2576,6 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 	reqStart := time.Now()
 	structuredRetries := 0
 	preResponseRetryCount := 0
-	var retryInputTokens, retryOutputTokens int
-	var retryCredits float64
 	cacheTracker := promptCacheTrackerForProfile(h.promptCache, cacheProfile)
 	cacheUsage := promptCacheUsage{}
 	cacheComputed := false
@@ -2719,15 +2763,22 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 				finalContent, payload.StructuredOutputType, payload.StructuredOutputSchema,
 			); validationErr != nil && structuredRetries == 0 {
 				structuredRetries++
-				retryInput := estimatedInputTokens
-				if retryInput <= 0 {
-					retryInput = 1
+				// Settle the discarded attempt against the account that produced it,
+				// in this iteration. Deferring it to the successful attempt made the
+				// final turn report tokens it never generated, and lost the usage
+				// entirely whenever the retry chain ended in an error response.
+				discardedInput := clampClaudeInputTokensToModelWindow(model, estimatedInputTokens)
+				if discardedInput <= 0 {
+					discardedInput = 1
 				}
-				retryInputTokens += retryInput
-				retryOutputTokens += estimateClaudeOutputTokensWithRedacted(
+				discardedOutput := estimateClaudeOutputTokensWithRedacted(
 					finalContent, thinkingContent, redactedThinking, toolUses,
 				)
-				retryCredits += credits
+				h.settleDiscardedAttempt(
+					"claude", model, account.ID, apiKeyID,
+					discardedInput, discardedOutput, credits,
+					time.Since(reqStart).Milliseconds(),
+				)
 				retrySameID = account.ID
 				logger.Warnf(
 					"[KiroAPI] structured output validation failed endpoint=claude model=%s account_id=%s; retrying once: %v",
@@ -2778,18 +2829,17 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		cacheUsage = reanchorClaudeCacheUsage(cacheProfile, cacheUsage, inputTokens)
 		outputTokens = estimateClaudeOutputTokensWithRedacted(finalContent, rawThinkingContent, redactedThinking, toolUses)
 
-		accountedInputTokens := inputTokens + retryInputTokens
-		accountedOutputTokens := outputTokens + retryOutputTokens
-		accountedCredits := credits + retryCredits
-		h.recordSuccessForApiKeyWithCache(apiKeyID, accountedInputTokens, accountedOutputTokens, accountedCredits, cacheUsage)
+		// Each attempt settles in its own iteration, so this reports only what this
+		// attempt generated. Client-visible usage stays aligned with the response.
+		h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, credits, cacheUsage)
 		h.pool.RecordSuccess(account.ID)
 		// h.pool.RecordLatency(account.ID, float64(time.Since(reqStart).Milliseconds()))
 		// ↑ dispatch-only latency EWMA (commit fbc99b1), absent on this cache-only
 		//   branch off main. No-op here; stripped so handler compiles against main's
 		//   pool. Re-added verbatim when dispatch lands.
-		h.pool.UpdateStats(account.ID, accountedInputTokens+accountedOutputTokens, accountedCredits)
+		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		promptCacheTrackerForProfile(h.promptCache, cacheProfile).Update(account.ID, cacheProfile)
-		h.recordSuccessLog("claude", model, account.ID, accountedInputTokens+accountedOutputTokens, accountedCredits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		responseThinkingContent := rawThinkingContent
 		includeEmptyThinkingBlock := thinking && thinkingOpts.OmitDisplay && rawThinkingContent != ""
@@ -3633,6 +3683,18 @@ func (h *Handler) handleOpenAIStreamWithCache(w http.ResponseWriter, payload *Ki
 		}
 		h.releaseAccount(account)
 		if err != nil {
+			// Bill whatever this attempt already produced before deciding how to
+			// recover. Every branch below either retries or returns, so a later
+			// settlement would never see these tokens.
+			if discarded := estimateOpenAIDiscardedOutput(
+				rawContentBuilder.String(), rawReasoningBuilder.String(), toolCalls,
+			); discarded > 0 {
+				h.settleDiscardedAttempt(
+					"openai", model, account.ID, apiKeyID,
+					clampClaudeInputTokensToModelWindow(model, estimatedInputTokens), discarded, credits,
+					time.Since(reqStart).Milliseconds(),
+				)
+			}
 			if isUpstreamIncompleteResponseError(err) && eventThinkingOpen {
 				sendChunk("", 3)
 				eventThinkingOpen = false
@@ -3947,6 +4009,16 @@ func (h *Handler) handleOpenAINonStreamWithCache(w http.ResponseWriter, payload 
 		}
 		h.releaseAccount(account)
 		if err != nil {
+			// Bill whatever this attempt already produced before deciding how to
+			// recover. Every branch below either retries or returns, so a later
+			// settlement would never see these tokens.
+			if discarded := estimateOpenAIOutputTokens(content, reasoningContent, toolUses); discarded > 0 {
+				h.settleDiscardedAttempt(
+					"openai", model, account.ID, apiKeyID,
+					clampClaudeInputTokensToModelWindow(model, estimatedInputTokens), discarded, credits,
+					time.Since(reqStart).Milliseconds(),
+				)
+			}
 			if isDownstreamRequestCanceled(payload, err) {
 				return
 			}
@@ -5558,6 +5630,8 @@ func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 		"accountPriority":                  config.GetAccountPriorityConfig(),
 		"cacheMode":                        config.GetCacheMode(),
 		"functionCache":                    config.GetFunctionCacheConfig(),
+		"reasoningCap":                     config.GetReasoningCapConfig(),
+		"reasoningCapEnvFallbackMode":      reasoningCapModeFromEnvFallback(),
 	})
 }
 
@@ -5619,6 +5693,7 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		AccountPriority                  *config.AccountPriorityConfig `json:"accountPriority,omitempty"`
 		CacheMode                        *string                       `json:"cacheMode,omitempty"`
 		FunctionCache                    *config.FunctionCacheConfig   `json:"functionCache,omitempty"`
+		ReasoningCap                     *config.ReasoningCapConfig    `json:"reasoningCap,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -5644,6 +5719,13 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": "cacheMode must be native or function_simulation"})
 		return
+	}
+	if req.ReasoningCap != nil {
+		if msg := validateReasoningCapConfig(*req.ReasoningCap); msg != "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": msg})
+			return
+		}
 	}
 	if req.AccountConcurrencyRefreshSeconds != nil && (*req.AccountConcurrencyRefreshSeconds < config.MinAccountConcurrencyRefreshSeconds || *req.AccountConcurrencyRefreshSeconds > config.MaxAccountConcurrencyRefreshSeconds) {
 		w.WriteHeader(http.StatusBadRequest)
@@ -5698,6 +5780,14 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if req.ReasoningCap != nil {
+		if err := config.UpdateReasoningCapConfig(*req.ReasoningCap); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+
 	if req.CacheMode != nil || req.FunctionCache != nil {
 		if err := config.UpdateCachePolicy(req.CacheMode, req.FunctionCache); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)

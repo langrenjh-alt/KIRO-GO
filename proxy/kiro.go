@@ -546,6 +546,12 @@ type KiroStreamCallback struct {
 	// reasoning begins and before a completion marker or tool call is observed.
 	// Recovery attempts and ordinary non-agent streams leave it disabled.
 	AgentThinkingTimeout time.Duration
+	// ReasoningCapBytes bounds the reasoning a single response may emit before
+	// its first tool call or visible text. Zero disables the accounting.
+	ReasoningCapBytes int
+	// ReasoningCapMode selects between silent accounting and termination once
+	// ReasoningCapBytes is exceeded.
+	ReasoningCapMode reasoningCapMode
 	// BodyIdleTimeout limits continuous upstream silence between complete AWS
 	// Event Stream frames. Downstream keepalive writes do not reset it.
 	BodyIdleTimeout time.Duration
@@ -574,6 +580,7 @@ const (
 	upstreamResponseHeaderTimeoutCode    = "upstream_response_header_timeout"
 	upstreamBodyIdleTimeoutCode          = "upstream_body_idle_timeout"
 	upstreamGenerationTimeoutCode        = "upstream_generation_timeout"
+	upstreamReasoningCapCode             = "upstream_reasoning_cap_exceeded"
 	upstreamRecoveryTimeoutCode          = "upstream_recovery_timeout"
 	upstreamAgentContinuationTimeoutCode = "upstream_agent_continuation_timeout"
 )
@@ -660,6 +667,22 @@ func newUpstreamAgentThinkingTimeoutError(timeout time.Duration) error {
 	}
 }
 
+// newUpstreamReasoningCapError deliberately does not wrap
+// errUpstreamAgentMarkerMismatch. That classification would route a cap hit
+// into the narration-recovery chain, which pushes for immediate action and
+// drops effort to "low" — the opposite of useful when the model is stuck inside
+// reasoning. A timeout-family code lets the caller fail cleanly with the
+// context intact instead.
+func newUpstreamReasoningCapError(observed, limit int) error {
+	return &KiroStreamProtocolError{
+		Code: upstreamReasoningCapCode,
+		Err: fmt.Errorf(
+			"reasoning before the first tool call or visible text reached %d bytes, over the %d byte limit",
+			observed, limit,
+		),
+	}
+}
+
 func newUpstreamTimeoutError(code, stage string, timeout time.Duration) error {
 	return &KiroStreamProtocolError{
 		Code: code,
@@ -695,7 +718,7 @@ func isKiroTimeoutError(err error) bool {
 	switch code {
 	case upstreamResponseHeaderTimeoutCode, upstreamBodyIdleTimeoutCode,
 		upstreamGenerationTimeoutCode, upstreamRecoveryTimeoutCode,
-		upstreamAgentContinuationTimeoutCode:
+		upstreamAgentContinuationTimeoutCode, upstreamReasoningCapCode:
 		return true
 	default:
 		return false
@@ -1056,6 +1079,14 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			callback.AgentCompletionMarker = payload.AgentCompletionMarker
 		}
 		callback.AgentThinkingTimeout = initialAgentThinkingTimeout(payload)
+		// The cap applies to any client that reaches the marker protocol, so it
+		// does not depend on harness recognition or tool-name matching.
+		// Resolved per request so an admin change applies to the next generation
+		// without restarting the process.
+		if settings := resolveReasoningCapSettings(); settings.Mode != reasoningCapOff {
+			callback.ReasoningCapMode = settings.Mode
+			callback.ReasoningCapBytes = reasoningCapBytes(payload, settings)
+		}
 	}
 	callback = instrumentKiroCallbackTiming(timing, callback)
 
@@ -1340,6 +1371,11 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 	var completedToolUses int
 	var agentOutputObserved bool
 	var assistantTextObserved bool
+	// Accounted only while no tool call and no visible text have appeared, so a
+	// multi-round agent task resets it at every outward action and never
+	// accumulates across the whole task.
+	var preActionReasoningBytes int
+	var reasoningCapReported bool
 	var meteringObserved bool
 	var upstreamStopReason string
 	firstEventReported := false
@@ -1513,6 +1549,26 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 			if reasoning.Text != "" || reasoning.Signature != "" || reasoning.RedactedContent != "" {
 				agentOutputObserved = true
 				startThinkingTimer()
+				if callback.ReasoningCapBytes > 0 && callback.ReasoningCapMode != reasoningCapOff &&
+					!toolObserved && !assistantTextObserved {
+					preActionReasoningBytes += len(reasoning.Text)
+					if preActionReasoningBytes > callback.ReasoningCapBytes {
+						if callback.ReasoningCapMode == reasoningCapEnforce {
+							return reportKiroStreamError(callback, newUpstreamReasoningCapError(
+								preActionReasoningBytes, callback.ReasoningCapBytes))
+						}
+						// Observation mode records the overshoot once and keeps
+						// streaming, so a limit can be calibrated against real
+						// traffic before it terminates anything.
+						if !reasoningCapReported {
+							reasoningCapReported = true
+							logger.Warnf(
+								"[reasoning-cap] observed %d bytes before the first action, limit %d bytes",
+								preActionReasoningBytes, callback.ReasoningCapBytes,
+							)
+						}
+					}
+				}
 				if callback.OnReasoning != nil {
 					callback.OnReasoning(reasoning)
 				} else if reasoning.Text != "" && callback.OnText != nil {

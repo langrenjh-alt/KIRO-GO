@@ -27,7 +27,24 @@ const (
 	CacheModeFunctionSimulation = "function_simulation"
 
 	FunctionCacheScopeBodyFingerprint = "body_fingerprint"
+
+	ReasoningCapModeOff     = "off"
+	ReasoningCapModeObserve = "observe"
+	ReasoningCapModeEnforce = "enforce"
 )
+
+// ReasoningCapConfig bounds the reasoning an agent turn may emit before its
+// first outward action. Every zero value falls back to the proxy's built-in
+// default, so an existing config file keeps its current behaviour without
+// migration.
+type ReasoningCapConfig struct {
+	Mode        string  `json:"mode,omitempty"`        // off | observe | enforce
+	MaxTokens   int     `json:"maxTokens,omitempty"`   // 0 = built-in absolute ceiling
+	RatioLow    float64 `json:"ratioLow,omitempty"`    // 0 = built-in ratio for effort=low
+	RatioMedium float64 `json:"ratioMedium,omitempty"` // 0 = built-in ratio for effort=medium
+	RatioHigh   float64 `json:"ratioHigh,omitempty"`   // 0 = built-in ratio for effort=high
+	RatioXHigh  float64 `json:"ratioXHigh,omitempty"`  // 0 = built-in ratio for effort=xhigh/max
+}
 
 type RateLimitConfig struct {
 	Mode                   string  `json:"mode,omitempty"`
@@ -266,6 +283,57 @@ func normalizeFunctionCacheConfig(c FunctionCacheConfig) FunctionCacheConfig {
 	return c
 }
 
+// normalizeReasoningCapMode preserves an empty mode instead of collapsing it to
+// "off". The proxy needs to tell "never configured" apart from "explicitly off":
+// the admin choice wins over the environment variable, so an unset mode is what
+// lets the env var still act as the fallback.
+func normalizeReasoningCapMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "":
+		return ""
+	case ReasoningCapModeObserve, "log", "report":
+		return ReasoningCapModeObserve
+	case ReasoningCapModeEnforce, "on", "true", "1":
+		return ReasoningCapModeEnforce
+	default:
+		return ReasoningCapModeOff
+	}
+}
+
+// normalizeReasoningCapConfig keeps zero values as zero: the proxy reads them as
+// "use the built-in default" rather than "no budget", which would disable the
+// cap while the mode says it is enforcing.
+func normalizeReasoningCapConfig(c ReasoningCapConfig) ReasoningCapConfig {
+	c.Mode = normalizeReasoningCapMode(c.Mode)
+	c.MaxTokens = clampPolicyInt(c.MaxTokens, 0, 1000000)
+	c.RatioLow = clampPolicyRatio(c.RatioLow)
+	c.RatioMedium = clampPolicyRatio(c.RatioMedium)
+	c.RatioHigh = clampPolicyRatio(c.RatioHigh)
+	c.RatioXHigh = clampPolicyRatio(c.RatioXHigh)
+	return c
+}
+
+// clampPolicyRatio bounds a share-of-window ratio. The upper bound is below 1.0
+// because reasoning that fills the entire window leaves no room for the answer.
+func clampPolicyRatio(value float64) float64 {
+	if value <= 0 {
+		return 0
+	}
+	if value > 0.9 {
+		return 0.9
+	}
+	return value
+}
+
+func GetReasoningCapConfig() ReasoningCapConfig {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return normalizeReasoningCapConfig(ReasoningCapConfig{})
+	}
+	return normalizeReasoningCapConfig(cfg.ReasoningCap)
+}
+
 func clampPolicyInt(value, min, max int) int {
 	if value < min {
 		return min
@@ -341,6 +409,21 @@ func UpdateDispatchPolicies(rate *RateLimitConfig, scheduling *SchedulingConfig,
 	}
 	if err := Save(); err != nil {
 		cfg.RateLimit, cfg.Scheduling, cfg.AccountPriority = previousRate, previousScheduling, previousPriority
+		return err
+	}
+	return nil
+}
+
+func UpdateReasoningCapConfig(value ReasoningCapConfig) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg == nil {
+		return fmt.Errorf("config is not initialized")
+	}
+	previous := cfg.ReasoningCap
+	cfg.ReasoningCap = normalizeReasoningCapConfig(value)
+	if err := Save(); err != nil {
+		cfg.ReasoningCap = previous
 		return err
 	}
 	return nil

@@ -2191,6 +2191,24 @@
     $('accountPriorityEnabled').checked = priority.enabled === true;
     $('accountPriorityRules').value = JSON.stringify(Array.isArray(priority.rules) ? priority.rules : [], null, 2);
 
+    const reasoningCap = d.reasoningCap || {};
+    $('reasoningCapMode').value = reasoningCap.mode || '';
+    $('reasoningCapMaxTokens').value = String(reasoningCap.maxTokens ?? 0);
+    $('reasoningCapRatioLow').value = String(reasoningCap.ratioLow ?? 0);
+    $('reasoningCapRatioMedium').value = String(reasoningCap.ratioMedium ?? 0);
+    $('reasoningCapRatioHigh').value = String(reasoningCap.ratioHigh ?? 0);
+    $('reasoningCapRatioXHigh').value = String(reasoningCap.ratioXHigh ?? 0);
+    // This selector wins at request time. The env var only fills in while the
+    // mode is left unset, so show what it currently contributes instead of
+    // disabling the control.
+    const envFallback = $('reasoningCapEnvFallback');
+    const envMode = typeof d.reasoningCapEnvFallbackMode === 'string' ? d.reasoningCapEnvFallbackMode : '';
+    const usingEnvFallback = envMode !== '' && !reasoningCap.mode;
+    envFallback.classList.toggle('hidden', !usingEnvFallback);
+    if (usingEnvFallback) {
+      envFallback.textContent = t('settings.reasoningCapEnvFallback', envMode);
+    }
+
     const functionCache = d.functionCache || {};
     $('cacheMode').value = d.cacheMode === 'function_simulation' ? 'function_simulation' : 'native';
     $('functionCacheEnabled').checked = functionCache.enabled === true;
@@ -2479,6 +2497,28 @@
       await loadSettings();
     } catch (e) {
       toast((e && e.message) || t('common.saveFailed'), 'error');
+    }
+  }
+  async function saveReasoningCap() {
+    try {
+      const res = await api('/settings', {
+        method: 'POST', body: JSON.stringify({
+          reasoningCap: {
+            mode: $('reasoningCapMode').value,
+            maxTokens: policyNumber('reasoningCapMaxTokens', 0, 1000000),
+            ratioLow: policyNumber('reasoningCapRatioLow', 0, 0.99, false),
+            ratioMedium: policyNumber('reasoningCapRatioMedium', 0, 0.99, false),
+            ratioHigh: policyNumber('reasoningCapRatioHigh', 0, 0.99, false),
+            ratioXHigh: policyNumber('reasoningCapRatioXHigh', 0, 0.99, false)
+          }
+        })
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.success === false) throw new Error(d.error || t('common.saveFailed'));
+      toast(t('settings.reasoningCapSaved'), 'success');
+      await loadSettings();
+    } catch (e) {
+      toast((e && e.message) || t('common.saveFailed'), e && e.isValidationError ? 'warning' : 'error');
     }
   }
   async function savePromptCacheConfig() {
@@ -4171,6 +4211,7 @@
     $('saveOverUsageBtn').addEventListener('click', saveOverUsageConfig);
     $('saveAccountConcurrencyRefreshBtn').addEventListener('click', saveAccountConcurrencyRefresh);
 	$('saveDispatchPoliciesBtn').addEventListener('click', saveDispatchPolicies);
+	$('saveReasoningCapBtn').addEventListener('click', saveReasoningCap);
     $('savePromptCacheBtn').addEventListener('click', savePromptCacheConfig);
 	$('cacheMode').addEventListener('change', onCacheModeChange);
     $('saveThinkingBtn').addEventListener('click', saveThinkingConfig);

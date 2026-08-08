@@ -670,6 +670,31 @@
           <button class="btn btn-primary" id="saveDispatchPoliciesBtn" data-i18n="settings.saveDispatchPolicies"></button>
         </div>
 
+        <!-- Reasoning cap settings -->
+        <div class="card">
+          <div class="card-header"><span class="card-title" data-i18n="settings.reasoningCapSettings"></span></div>
+          <div class="form-group">
+            <label for="reasoningCapMode" data-i18n="settings.reasoningCapMode"></label>
+            <select id="reasoningCapMode">
+              <option value="" data-i18n="settings.reasoningCapModeUnset"></option>
+              <option value="off" data-i18n="settings.reasoningCapModeOff"></option>
+              <option value="observe" data-i18n="settings.reasoningCapModeObserve"></option>
+              <option value="enforce" data-i18n="settings.reasoningCapModeEnforce"></option>
+            </select>
+            <small data-i18n="settings.reasoningCapModeHint"></small>
+            <small id="reasoningCapEnvFallback" class="hidden"></small>
+          </div>
+          <div class="form-grid">
+            <div class="form-group"><label for="reasoningCapMaxTokens" data-i18n="settings.reasoningCapMaxTokens"></label><input type="number" id="reasoningCapMaxTokens" min="0" max="1000000" value="0" /></div>
+            <div class="form-group"><label for="reasoningCapRatioLow" data-i18n="settings.reasoningCapRatioLow"></label><input type="number" id="reasoningCapRatioLow" min="0" max="0.99" step="0.01" value="0" /></div>
+            <div class="form-group"><label for="reasoningCapRatioMedium" data-i18n="settings.reasoningCapRatioMedium"></label><input type="number" id="reasoningCapRatioMedium" min="0" max="0.99" step="0.01" value="0" /></div>
+            <div class="form-group"><label for="reasoningCapRatioHigh" data-i18n="settings.reasoningCapRatioHigh"></label><input type="number" id="reasoningCapRatioHigh" min="0" max="0.99" step="0.01" value="0" /></div>
+            <div class="form-group"><label for="reasoningCapRatioXHigh" data-i18n="settings.reasoningCapRatioXHigh"></label><input type="number" id="reasoningCapRatioXHigh" min="0" max="0.99" step="0.01" value="0" /></div>
+          </div>
+          <small data-i18n="settings.reasoningCapRatioHint"></small>
+          <button class="btn btn-primary" id="saveReasoningCapBtn" data-i18n="settings.saveReasoningCap"></button>
+        </div>
+
         <!-- Prompt cache settings -->
         <div class="card">
           <div class="card-header"><span class="card-title" data-i18n="settings.promptCacheSettings"></span></div>

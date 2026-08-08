@@ -63,8 +63,8 @@ func agentCompletionProtocolInstruction(marker string) string {
 	}
 	return fmt.Sprintf(`<agent_completion_protocol>
 This is a tool-enabled coding-agent turn. Complete it in exactly one of these ways:
-1. Emit a real structured tool call when inspection, execution, testing, editing, or any other external action is still needed. A concise progress sentence may precede it, and the native response order must remain reasoning, assistant text, then tool call.
-2. If the task is actually complete and no tool is needed, begin the visible final answer with the exact marker %s.
+1. Emit a real structured tool call when inspection, execution, testing, editing, or any other external action is still needed. At most one short sentence naming the action you are about to take may precede it, and the native response order must remain reasoning, assistant text, then tool call. That sentence must not state a finding, a diagnosis, a root cause, a conclusion, or a recommendation: those depend on tool results you do not have yet. Verify first, then conclude.
+2. If the task is actually complete and no tool is needed, begin the visible final answer with the exact marker %s. Conclusions and recommendations belong in this marked final answer, where the tool results that support them are already present.
 The marker is an internal protocol token, not user-facing text. Never claim that a tool action succeeded before receiving its real result. Never emit progress narration without the promised tool call, or emit the marker before the task is complete.
 </agent_completion_protocol>`, marker)
 }
@@ -74,7 +74,7 @@ func agentCompletionRetryInstruction(marker string) string {
 		return ""
 	}
 	return fmt.Sprintf(`<agent_retry>
-The previous response ended without either the completion marker or a structured tool call. This is an action-recovery attempt, not another planning pass. Do not repeat its reasoning, summarize the plan, or emit another progress sentence. If inspection, execution, editing, or writing is still needed, invoke the corresponding available tool through the native structured tool-call channel immediately as the first response event. Plain text, quoted JSON, XML, a code block, or a promise to call a tool does not count as a tool call. Only if no external action remains may you begin the visible final answer with the exact marker %s. Never claim that a search, test, edit, write, or command ran unless a real tool result is present.
+The previous response ended without either the completion marker or a structured tool call. This is an action-recovery attempt, not another planning pass. Do not repeat its reasoning, summarize the plan, or emit another progress sentence. Choose exactly one of these two: if inspection, execution, editing, or writing is still needed, invoke the corresponding available tool through the native structured tool-call channel immediately as the first response event; if the tool results already in this conversation are sufficient to answer, begin the visible final answer with the exact marker %s instead of calling another tool. Plain text, quoted JSON, XML, a code block, or a promise to call a tool does not count as a tool call. Never claim that a search, test, edit, write, or command ran unless a real tool result is present.
 </agent_retry>`, marker)
 }
 

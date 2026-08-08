@@ -270,6 +270,10 @@ type Config struct {
 	CacheMode     string              `json:"cacheMode,omitempty"`
 	FunctionCache FunctionCacheConfig `json:"functionCache,omitempty"`
 
+	// ReasoningCap bounds pre-action reasoning so a looping agent turn cannot
+	// occupy an account slot indefinitely.
+	ReasoningCap ReasoningCapConfig `json:"reasoningCap,omitempty"`
+
 	// Region defaults for accounts that omit per-account region/authRegion/apiRegion.
 	// Defaults to "us-east-1" when empty (see GetGlobalRegion* / Account.Effective*Region).
 	Region     string `json:"region,omitempty"`

@@ -12,7 +12,7 @@ type resolvedToolChoice struct {
 }
 
 const agentToolProtocol = `<agent_tool_protocol>
-If the task can be completed without a tool, answer the user directly. If you need to inspect, search, run, edit, or write anything before answering, emit the corresponding real structured tool call in this response. Never end a response with only narration or a promise about an action you have not performed. Never invent a tool result.
+If the task can be completed without a tool, answer the user directly. If you need to inspect, search, run, edit, or write anything before answering, emit the corresponding real structured tool call in this response. Any text preceding that tool call is limited to one short sentence naming the action you are about to take; do not state a finding, a diagnosis, a root cause, a conclusion, or a recommendation before the tool results that support it are present. Never end a response with only narration or a promise about an action you have not performed. Never invent a tool result.
 </agent_tool_protocol>`
 
 func resolveToolChoice(value interface{}) (resolvedToolChoice, error) {
