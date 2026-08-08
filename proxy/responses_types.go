@@ -20,6 +20,8 @@ type ResponsesRequest struct {
 	Reasoning          *ResponsesReasoningConfig `json:"reasoning,omitempty"`
 	ReasoningEffort    string                    `json:"reasoning_effort,omitempty"`
 	Text               *ResponsesTextConfig      `json:"text,omitempty"`
+
+	promptCache *openAIPromptCacheState
 }
 
 type ResponsesReasoningConfig struct {
@@ -118,6 +120,7 @@ type ResponsesUsage struct {
 	OutputTokens        int                          `json:"output_tokens"`
 	OutputTokensDetails ResponsesOutputTokensDetails `json:"output_tokens_details"`
 	TotalTokens         int                          `json:"total_tokens"`
+	KiroContextUsage    *KiroContextUsage            `json:"kiro_context_usage,omitempty"`
 }
 
 type ResponsesInputTokensDetails struct {

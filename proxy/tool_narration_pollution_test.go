@@ -61,9 +61,12 @@ func TestNoToolInvocationTextInAssistantHistory(t *testing.T) {
 			t.Fatalf("tool output %q lost from history", marker)
 		}
 	}
-	// Tool identity should be attributed on the user side.
-	if !strings.Contains(combined, "[exec_command]") {
+	// Tool identity should be attributed inside a data-only result envelope.
+	if !strings.Contains(combined, `<tool_result name="exec_command">`) {
 		t.Fatalf("expected tool results attributed to exec_command on the user side")
+	}
+	if strings.Contains(combined, "Tool results:") {
+		t.Fatalf("history retained the mimicable legacy tool-results carrier: %q", combined)
 	}
 }
 
@@ -270,5 +273,70 @@ func TestScrubsClientReplayedToolCallText(t *testing.T) {
 	}
 	if !strings.Contains(combined.String(), "Let me check.") {
 		t.Fatalf("expected surrounding assistant prose to survive scrubbing, got:\n%s", combined.String())
+	}
+}
+
+func TestScrubsClientReplayedRoleToolTranscript(t *testing.T) {
+	polluted := "Now let me check misc.js against the CSS.\n" +
+		"user Tool results:\n" +
+		"[Bash] CSS 缺失 js\\core\\ui.js:\ncls\nCSS 缺失 js\\apps\\misc.js:\nmsg-bubble msg-day\n" +
+		"assistant\n" +
+		"As expected - the Messages classes need styles. Let me add them."
+
+	cleaned := stripPollutedToolCallText(polluted)
+	for _, want := range []string{
+		"Now let me check misc.js against the CSS.",
+		"As expected - the Messages classes need styles. Let me add them.",
+	} {
+		if !strings.Contains(cleaned, want) {
+			t.Fatalf("surrounding narration %q was lost: %q", want, cleaned)
+		}
+	}
+	for _, leaked := range []string{"user Tool results:", "[Bash]", "CSS 缺失", "\nassistant\n"} {
+		if strings.Contains(cleaned, leaked) {
+			t.Fatalf("pseudo tool transcript leaked %q: %q", leaked, cleaned)
+		}
+	}
+}
+
+func TestAgentCompletionToolCommitScrubsPseudoTranscript(t *testing.T) {
+	marker := "<agent_final_0123456789abcdef>"
+	gate := newAgentCompletionGate(marker)
+	polluted := "Now let me inspect the stylesheet.\n" +
+		"user Tool results:\n[Bash] copied tool output\nassistant\n" +
+		"I found the missing styles. Let me edit them."
+	streamed := gate.Push(polluted)
+	if !strings.Contains(streamed, "Now let me inspect the stylesheet.") ||
+		!strings.Contains(streamed, "I found the missing styles. Let me edit them.") {
+		t.Fatalf("ordinary pre-tool narration did not stream: %q", streamed)
+	}
+	if strings.Contains(streamed, "Tool results:") || strings.Contains(streamed, "[Bash]") {
+		t.Fatalf("pseudo tool transcript leaked into the streamed narration: %q", streamed)
+	}
+	committed := gate.CommitPendingForTool()
+	if committed != "" {
+		t.Fatalf("already streamed narration was replayed before the tool stream: %q", committed)
+	}
+	if !strings.Contains(gate.VisibleText(), "Tool results:") {
+		t.Fatalf("terminal evidence lost the original unmarked response: %q", gate.VisibleText())
+	}
+}
+
+func TestAgentCompletionFilterOnlyScrubsWhenToolCallExists(t *testing.T) {
+	marker := "<agent_final_0123456789abcdef>"
+	payload := &KiroPayload{AgentCompletionMarker: marker}
+	sample := "A transcript example:\nuser Tool results:\nexample output\nassistant\nend of example"
+
+	final, marked := filterAgentCompletionContent(payload, marker+"\n"+sample, 0)
+	if !marked || final != sample {
+		t.Fatalf("tool-free final answer was unexpectedly rewritten: marked=%v content=%q", marked, final)
+	}
+
+	toolNarration, _ := filterAgentCompletionContent(payload, sample, 1)
+	if strings.Contains(toolNarration, "Tool results:") || strings.Contains(toolNarration, "example output") {
+		t.Fatalf("non-stream tool response retained pseudo transcript: %q", toolNarration)
+	}
+	if !strings.Contains(toolNarration, "A transcript example:") || !strings.Contains(toolNarration, "end of example") {
+		t.Fatalf("non-stream tool response lost surrounding narration: %q", toolNarration)
 	}
 }

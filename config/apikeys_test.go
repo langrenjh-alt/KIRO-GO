@@ -2,8 +2,10 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -58,6 +60,53 @@ func TestApiKeyMigrationFromLegacyField(t *testing.T) {
 	}
 	if got := len(ListApiKeys()); got != 1 {
 		t.Fatalf("expected migration to be idempotent, got %d entries", got)
+	}
+}
+
+func TestApiKeyLoadRepairsBlankAndDuplicateIDs(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.json")
+	raw := []byte(`{
+  "apiKeys": [
+    {"id":"","key":"sk-empty","enabled":true},
+    {"id":"duplicate","key":"sk-first","enabled":true},
+    {"id":" duplicate ","key":"sk-second","enabled":true}
+  ]
+}`)
+	if err := os.WriteFile(cfgFile, raw, 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if err := Init(cfgFile); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	entries := ListApiKeys()
+	if len(entries) != 3 {
+		t.Fatalf("entries=%d, want 3", len(entries))
+	}
+	seen := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		if strings.TrimSpace(entry.ID) == "" {
+			t.Fatalf("blank ID remained: %+v", entry)
+		}
+		if _, duplicate := seen[entry.ID]; duplicate {
+			t.Fatalf("duplicate ID remained: %q", entry.ID)
+		}
+		seen[entry.ID] = struct{}{}
+	}
+
+	persistedData, err := os.ReadFile(cfgFile)
+	if err != nil {
+		t.Fatalf("read persisted config: %v", err)
+	}
+	var persisted Config
+	if err := json.Unmarshal(persistedData, &persisted); err != nil {
+		t.Fatalf("decode persisted config: %v", err)
+	}
+	for i, entry := range persisted.ApiKeys {
+		if entry.ID != entries[i].ID {
+			t.Fatalf("persisted ID[%d]=%q, want %q", i, entry.ID, entries[i].ID)
+		}
 	}
 }
 
@@ -123,6 +172,14 @@ func TestApiKeyCRUD(t *testing.T) {
 
 	if _, err := AddApiKey(ApiKeyEntry{Name: "empty", Key: "", Enabled: true}); err == nil {
 		t.Fatalf("expected empty key add to fail")
+	}
+	for _, entry := range []ApiKeyEntry{
+		{Name: "negative-token", Key: "sk-negative-token", TokenLimit: -1},
+		{Name: "negative-credit", Key: "sk-negative-credit", CreditLimit: -0.01},
+	} {
+		if _, err := AddApiKey(entry); !errors.Is(err, ErrApiKeyInvalid) {
+			t.Fatalf("negative limit error = %v, want ErrApiKeyInvalid", err)
+		}
 	}
 
 	if err := UpdateApiKey(created.ID, ApiKeyEntry{
@@ -244,10 +301,10 @@ func TestResetApiKeyUsage(t *testing.T) {
 
 func TestApiKeyOverLimit(t *testing.T) {
 	tests := []struct {
-		name        string
-		entry       ApiKeyEntry
-		wantToken   bool
-		wantCredit  bool
+		name       string
+		entry      ApiKeyEntry
+		wantToken  bool
+		wantCredit bool
 	}{
 		{"unlimited", ApiKeyEntry{TokensUsed: 100, CreditsUsed: 5}, false, false},
 		{"under token limit", ApiKeyEntry{TokenLimit: 200, TokensUsed: 100}, false, false},

@@ -168,6 +168,7 @@ func TestClaudeNonStreamToolUseSuppressesNarration(t *testing.T) {
 }
 
 func TestClaudeStreamDeclaredToolDirectAnswerClosesLateTextBlock(t *testing.T) {
+	t.Setenv("KIRO_EARLY_STREAM_PRELUDE", "false")
 	h := newResponseContractHandler(t, awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
 		"content": "PONG",
 	}))

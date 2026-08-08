@@ -124,6 +124,7 @@ func TestOpenAIHandlersApplyStopAndPreserveEarlierTools(t *testing.T) {
 	chunks := decodeOpenAIChatContractStream(t, streamRec.Body.String())
 	var text string
 	var tools []string
+	seenToolIndexes := make(map[int]bool)
 	var finishReason string
 	for _, chunk := range chunks {
 		choices, _ := chunk["choices"].([]interface{})
@@ -138,8 +139,13 @@ func TestOpenAIHandlersApplyStopAndPreserveEarlierTools(t *testing.T) {
 		if rawTools, ok := delta["tool_calls"].([]interface{}); ok {
 			for _, rawTool := range rawTools {
 				tool := openAIChatContractMap(t, rawTool, "stream tool")
+				index := int(tool["index"].(float64))
+				if seenToolIndexes[index] {
+					continue
+				}
 				function := openAIChatContractMap(t, tool["function"], "stream function")
 				tools = append(tools, function["name"].(string))
+				seenToolIndexes[index] = true
 			}
 		}
 		if reason, ok := streamChoice["finish_reason"].(string); ok {

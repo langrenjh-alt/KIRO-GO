@@ -49,10 +49,13 @@ func TestNativeCodeExecutionVersions(t *testing.T) {
 func TestCodeExecutionResponseContracts(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		t.Run(fmt.Sprintf("stream=%v", stream), func(t *testing.T) {
-			h := newResponseContractHandler(t, awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
-				"toolUseId": "kiro-code", "name": codeExecutionToolName,
-				"input": `{"code":"print('contract')"}`, "stop": true,
-			}))
+			h := newResponseContractHandler(t,
+				awsEventStreamFrame(t, "contextUsageEvent", map[string]interface{}{"contextUsagePercentage": 12.5}),
+				awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+					"toolUseId": "kiro-code", "name": codeExecutionToolName,
+					"input": `{"code":"print('contract')"}`, "stop": true,
+				}),
+			)
 			body := fmt.Sprintf(`{
 				"model":"claude-opus-4-8",
 				"max_tokens":512,
@@ -61,6 +64,11 @@ func TestCodeExecutionResponseContracts(t *testing.T) {
 				"tools":[{"type":"code_execution_20250522","name":"code_execution"}],
 				"tool_choice":{"type":"auto"}
 			}`, stream)
+			var clientRequest ClaudeRequest
+			if err := json.Unmarshal([]byte(body), &clientRequest); err != nil {
+				t.Fatalf("decode client request: %v", err)
+			}
+			wantInputTokens := estimateClaudeRequestInputTokens(&clientRequest)
 			rec := httptest.NewRecorder()
 			h.handleClaudeMessagesInternal(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body)))
 			if rec.Code != http.StatusOK {
@@ -79,6 +87,10 @@ func TestCodeExecutionResponseContracts(t *testing.T) {
 				if response.StopReason != "end_turn" || response.Usage.ServerToolUse == nil {
 					t.Fatalf("stop=%q usage=%#v", response.StopReason, response.Usage)
 				}
+				if total := response.Usage.InputTokens + response.Usage.CacheCreationInputTokens + response.Usage.CacheReadInputTokens; total != wantInputTokens {
+					t.Fatalf("code execution public input=%d, want client estimate %d", total, wantInputTokens)
+				}
+				assertKiroContextUsageValue(t, response.Usage.KiroContextUsage, 125_000, 1_000_000, 12.5, false)
 				return
 			}
 
@@ -113,6 +125,11 @@ func TestCodeExecutionResponseContracts(t *testing.T) {
 			if _, ok := usage["server_tool_use"].(map[string]interface{}); !ok {
 				t.Fatalf("terminal usage=%#v", usage)
 			}
+			totalInput := int(usage["input_tokens"].(float64) + usage["cache_creation_input_tokens"].(float64) + usage["cache_read_input_tokens"].(float64))
+			if totalInput != wantInputTokens {
+				t.Fatalf("code execution terminal input=%d, want client estimate %d", totalInput, wantInputTokens)
+			}
+			assertKiroContextUsageJSON(t, usage["kiro_context_usage"], 125_000, 1_000_000, 12.5, false)
 		})
 	}
 }

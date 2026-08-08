@@ -6,8 +6,9 @@ import (
 	"testing"
 )
 
-// TestClaudeToKiroPreservesOversizedHistory verifies that the adapter leaves
-// context-limit enforcement to Kiro instead of silently dropping client input.
+// TestClaudeToKiroPreservesOversizedHistory verifies that translation itself is
+// lossless. The transport preflight applies model/raw limits immediately before
+// an upstream attempt, after every recovery mutation.
 func TestClaudeToKiroPreservesOversizedHistory(t *testing.T) {
 	// ~2KB chunk repeated across many turns to exceed the former 900 KiB cap.
 	big := strings.Repeat("lorem ipsum dolor sit amet ", 80) // ~2.1KB

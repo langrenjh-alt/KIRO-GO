@@ -47,6 +47,44 @@ func TestResponsesParallelToolCallsMerge(t *testing.T) {
 	}
 }
 
+func TestResponsesParallelToolResultStatusesReachKiro(t *testing.T) {
+	items := []json.RawMessage{
+		mustRaw(`{"type":"message","role":"user","content":[{"type":"input_text","text":"run checks"}]}`),
+		mustRaw(`{"type":"function_call","call_id":"call_ok","name":"exec_command","arguments":"{}"}`),
+		mustRaw(`{"type":"function_call","call_id":"call_error","name":"exec_command","arguments":"{}"}`),
+		mustRaw(`{"type":"function_call","call_id":"call_incomplete","name":"exec_command","arguments":"{}"}`),
+		mustRaw(`{"type":"function_call_output","call_id":"call_ok","output":"ok","status":"completed"}`),
+		mustRaw(`{"type":"function_call_output","call_id":"call_error","output":"permission denied","is_error":true}`),
+		mustRaw(`{"type":"function_call_output","call_id":"call_incomplete","output":"partial","status":"incomplete"}`),
+	}
+
+	messages, err := convertResponsesInputItems(items)
+	if err != nil {
+		t.Fatalf("convert Responses input: %v", err)
+	}
+	req := &OpenAIRequest{
+		Model:    "claude-opus-4.8",
+		Messages: messages,
+		Tools:    []OpenAITool{openAITestTool("exec_command")},
+	}
+	current := OpenAIToKiro(req, false).ConversationState.CurrentMessage.UserInputMessage
+	if current.UserInputMessageContext == nil || len(current.UserInputMessageContext.ToolResults) != 3 {
+		t.Fatalf("expected three active Responses tool results: %#v", current.UserInputMessageContext)
+	}
+	results := make(map[string]KiroToolResult, 3)
+	for _, result := range current.UserInputMessageContext.ToolResults {
+		results[result.ToolUseID] = result
+	}
+	if results["call_ok"].Status != "success" {
+		t.Fatalf("completed result status=%q", results["call_ok"].Status)
+	}
+	for _, id := range []string{"call_error", "call_incomplete"} {
+		if results[id].Status != "error" {
+			t.Fatalf("Responses failure %s was not preserved: %#v", id, results[id])
+		}
+	}
+}
+
 func mustRaw(s string) json.RawMessage {
 	return json.RawMessage(s)
 }

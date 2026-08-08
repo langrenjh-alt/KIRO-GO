@@ -673,6 +673,13 @@
         <!-- Prompt cache settings -->
         <div class="card">
           <div class="card-header"><span class="card-title" data-i18n="settings.promptCacheSettings"></span></div>
+          <div class="prompt-cache-fallback">
+            <div class="prompt-cache-section-heading">
+              <div>
+                <h3 data-i18n="cachePolicies.globalTitle"></h3>
+                <small data-i18n="cachePolicies.globalHint"></small>
+              </div>
+            </div>
           <div class="form-group">
             <label for="cacheMode" data-i18n="settings.cacheMode"></label>
             <select id="cacheMode">
@@ -716,6 +723,21 @@
             <small data-i18n="settings.functionCacheHint"></small>
           </div>
           <button class="btn btn-primary" id="savePromptCacheBtn" data-i18n="settings.savePromptCache"></button>
+          </div>
+
+          <div class="prompt-cache-policy-section">
+            <div class="prompt-cache-section-heading prompt-cache-policy-heading">
+              <div>
+                <h3 data-i18n="cachePolicies.listTitle"></h3>
+                <small data-i18n="cachePolicies.listHint"></small>
+              </div>
+              <button class="btn btn-outline btn-sm" id="addPromptCachePolicyBtn" type="button">
+                <i class="fa-solid fa-plus" aria-hidden="true"></i>
+                <span data-i18n="cachePolicies.add"></span>
+              </button>
+            </div>
+            <div id="promptCachePoliciesList" class="prompt-cache-policy-list" aria-live="polite"></div>
+          </div>
         </div>
 
         <!-- Thinking settings -->
@@ -1074,6 +1096,13 @@
           </label>
         </div>
         <div class="form-group">
+          <label for="apiKeyForm_promptCachePolicyId" data-i18n="apiKeys.cachePolicy"></label>
+          <select id="apiKeyForm_promptCachePolicyId">
+            <option value="" data-i18n="apiKeys.cachePolicyGlobal"></option>
+          </select>
+          <small data-i18n="apiKeys.cachePolicyHint"></small>
+        </div>
+        <div class="form-group">
           <label data-i18n="apiKeys.limitTokens"></label>
           <input type="number" id="apiKeyForm_tokenLimit" min="0" step="1" value="0" />
           <small data-i18n="apiKeys.limitHint"></small>
@@ -1086,6 +1115,77 @@
         <div class="modal-footer">
           <button class="btn btn-secondary" id="apiKeyModalCancelBtn" type="button" data-i18n="apiKeys.cancelBtn"></button>
           <button class="btn btn-primary" id="apiKeyModalSaveBtn" type="button" data-i18n="apiKeys.saveBtn"></button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="promptCachePolicyModal" class="modal">
+    <div class="modal-content prompt-cache-policy-modal-content">
+      <div class="modal-header">
+        <span class="modal-title" id="promptCachePolicyModalTitle" data-i18n="cachePolicies.modalTitleCreate"></span>
+        <button class="modal-close" id="promptCachePolicyModalClose" type="button" aria-label=""
+          data-i18n-aria-label="common.close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label for="promptCachePolicyForm_name" data-i18n="cachePolicies.formName"></label>
+          <input type="text" id="promptCachePolicyForm_name"
+            data-i18n-placeholder="cachePolicies.formNamePlaceholder" />
+        </div>
+        <div class="form-group">
+          <label for="promptCachePolicyForm_cacheMode" data-i18n="settings.cacheMode"></label>
+          <select id="promptCachePolicyForm_cacheMode">
+            <option value="native" data-i18n="settings.cacheModeNative"></option>
+            <option value="function_simulation" data-i18n="settings.cacheModeFunction"></option>
+          </select>
+        </div>
+        <div id="promptCachePolicyForm_nativeFields">
+          <div class="form-group">
+            <label for="promptCachePolicyForm_promptCacheMaxRatio" data-i18n="settings.promptCacheMaxRatio"></label>
+            <input type="number" id="promptCachePolicyForm_promptCacheMaxRatio" min="0.01" max="1" step="0.01" value="0.85" />
+            <small data-i18n="settings.promptCacheMaxRatioRange"></small>
+          </div>
+          <div class="form-group">
+            <label for="promptCachePolicyForm_promptCacheMaxEntries" data-i18n="settings.promptCacheMaxEntries"></label>
+            <input type="number" id="promptCachePolicyForm_promptCacheMaxEntries" min="256" max="1048576" step="256" value="131072" />
+            <small data-i18n="settings.promptCacheMaxEntriesHint"></small>
+          </div>
+          <div class="form-group">
+            <label for="promptCachePolicyForm_promptCacheTTLSeconds" data-i18n="settings.promptCacheTTL"></label>
+            <select id="promptCachePolicyForm_promptCacheTTLSeconds">
+              <option value="300" data-i18n="settings.promptCacheTTL5m"></option>
+              <option value="3600" data-i18n="settings.promptCacheTTL1h"></option>
+            </select>
+            <small data-i18n="settings.promptCacheTTLHint"></small>
+          </div>
+        </div>
+        <div id="promptCachePolicyForm_functionFields" class="hidden">
+          <div class="form-group">
+            <label class="flex items-center gap-2">
+              <span class="switch"><input type="checkbox" id="promptCachePolicyForm_functionCacheEnabled" /><span class="slider"></span></span>
+              <span data-i18n="settings.functionCacheEnabled"></span>
+            </label>
+          </div>
+          <div class="form-group">
+            <label for="promptCachePolicyForm_functionSimulatedData" data-i18n="settings.functionSimulatedData"></label>
+            <textarea id="promptCachePolicyForm_functionSimulatedData" rows="4" spellcheck="false"></textarea>
+          </div>
+          <div class="form-grid">
+            <div class="form-group"><label for="promptCachePolicyForm_functionSimulatedTokens" data-i18n="settings.functionSimulatedTokens"></label><input type="number" id="promptCachePolicyForm_functionSimulatedTokens" min="0" max="1000000" value="0" /></div>
+            <div class="form-group"><label for="promptCachePolicyForm_functionTTLSeconds" data-i18n="settings.functionTTLSeconds"></label><input type="number" id="promptCachePolicyForm_functionTTLSeconds" min="1" max="86400" value="300" /></div>
+            <div class="form-group"><label for="promptCachePolicyForm_functionTTLJitter" data-i18n="settings.functionTTLJitter"></label><input type="number" id="promptCachePolicyForm_functionTTLJitter" min="0" max="100" value="0" /></div>
+            <div class="form-group"><label for="promptCachePolicyForm_functionTokenJitter" data-i18n="settings.functionTokenJitter"></label><input type="number" id="promptCachePolicyForm_functionTokenJitter" min="0" max="100" value="0" /></div>
+            <div class="form-group"><label for="promptCachePolicyForm_functionHitRate" data-i18n="settings.functionHitRate"></label><input type="number" id="promptCachePolicyForm_functionHitRate" min="0" max="100" value="100" /></div>
+            <div class="form-group"><label for="promptCachePolicyForm_functionMaxRead" data-i18n="settings.functionMaxRead"></label><input type="number" id="promptCachePolicyForm_functionMaxRead" min="1" max="100" value="85" /></div>
+            <div class="form-group"><label for="promptCachePolicyForm_functionMinTokens" data-i18n="settings.functionMinTokens"></label><input type="number" id="promptCachePolicyForm_functionMinTokens" min="0" max="100000" value="0" /></div>
+            <div class="form-group"><label for="promptCachePolicyForm_functionFingerprintChars" data-i18n="settings.functionFingerprintChars"></label><input type="number" id="promptCachePolicyForm_functionFingerprintChars" min="0" max="12000" value="0" /></div>
+          </div>
+          <small data-i18n="settings.functionCacheHint"></small>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" id="promptCachePolicyModalCancelBtn" type="button" data-i18n="common.cancel"></button>
+          <button class="btn btn-primary" id="promptCachePolicyModalSaveBtn" type="button" data-i18n="cachePolicies.save"></button>
         </div>
       </div>
     </div>

@@ -151,6 +151,18 @@
     applyTranslations();
     renderVersionBadge();
     renderAccounts();
+    const selectedPolicyId = $('apiKeyForm_promptCachePolicyId') ? $('apiKeyForm_promptCachePolicyId').value : '';
+    renderApiKeyPolicyOptions(selectedPolicyId);
+    renderPromptCachePolicies();
+    renderApiKeys();
+    if ($('apiKeyModal').classList.contains('active')) {
+      $('apiKeyModalTitle').textContent = t(apiKeyEditingId ? 'apiKeys.modalTitleEdit' : 'apiKeys.modalTitleCreate');
+    }
+    if ($('promptCachePolicyModal').classList.contains('active')) {
+      $('promptCachePolicyModalTitle').textContent = t(
+        promptCachePolicyEditingId ? 'cachePolicies.modalTitleEdit' : 'cachePolicies.modalTitleCreate'
+      );
+    }
     renderPromptRules();
     renderLogs(logsCache);
     trafficHoverIndex = -1;
@@ -2192,7 +2204,8 @@
     $('functionMinTokens').value = String(functionCache.minTokens ?? 0);
     $('functionFingerprintChars').value = String(functionCache.inputFingerprintChars ?? 0);
     onCacheModeChange();
-    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys()]);
+    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadPromptCachePolicies()]);
+    await loadApiKeys();
     refreshCustomSelects();
   }
   async function loadThinkingConfig() {
@@ -2330,9 +2343,7 @@
     await putAccount(id, { accountLevel: $('accountLevelInput').value, maxConcurrency }, t('detail.saved'));
   }
   function onCacheModeChange() {
-    const simulated = $('cacheMode').value === 'function_simulation';
-    $('nativeCacheFields').classList.toggle('hidden', simulated);
-    $('functionCacheFields').classList.toggle('hidden', !simulated);
+    toggleCachePolicyMode('');
   }
   function policyNumber(id, min, max, integer = true) {
     const input = $(id);
@@ -2343,6 +2354,103 @@
       throw new Error(t('settings.policyValueInvalid'));
     }
     return value;
+  }
+  function getCachePolicyForm(prefix) {
+    const field = suffix => $(prefix + suffix);
+    return {
+      mode: field('cacheMode'),
+      ratio: field('promptCacheMaxRatio'),
+      entries: field('promptCacheMaxEntries'),
+      ttl: field('promptCacheTTLSeconds'),
+      nativeFields: prefix ? field('nativeFields') : $('nativeCacheFields'),
+      functionFields: prefix ? field('functionFields') : $('functionCacheFields'),
+      functionEnabled: field('functionCacheEnabled'),
+      simulatedData: field('functionSimulatedData'),
+      simulatedTokens: field('functionSimulatedTokens'),
+      functionTTL: field('functionTTLSeconds'),
+      ttlJitter: field('functionTTLJitter'),
+      tokenJitter: field('functionTokenJitter'),
+      hitRate: field('functionHitRate'),
+      maxRead: field('functionMaxRead'),
+      minTokens: field('functionMinTokens'),
+      fingerprintChars: field('functionFingerprintChars')
+    };
+  }
+  function toggleCachePolicyMode(prefix) {
+    const form = getCachePolicyForm(prefix);
+    const simulated = form.mode.value === 'function_simulation';
+    form.nativeFields.classList.toggle('hidden', simulated);
+    form.functionFields.classList.toggle('hidden', !simulated);
+  }
+  function cachePolicyValidationError(input, key) {
+    if (input) input.focus();
+    const error = new Error(t(key));
+    error.isValidationError = true;
+    throw error;
+  }
+  function cachePolicyFormNumber(input, min, max, integer = true) {
+    const value = Number(input.value);
+    const valid = Number.isFinite(value) && (!integer || Number.isInteger(value)) && value >= min && value <= max;
+    if (!valid) cachePolicyValidationError(input, 'settings.policyValueInvalid');
+    return value;
+  }
+  function readCachePolicyForm(prefix) {
+    const form = getCachePolicyForm(prefix);
+    const promptCacheMaxRatio = Number(form.ratio.value);
+    if (!Number.isFinite(promptCacheMaxRatio) || promptCacheMaxRatio < 0.01 || promptCacheMaxRatio > 1) {
+      cachePolicyValidationError(form.ratio, 'settings.promptCacheMaxRatioInvalid');
+    }
+    const promptCacheMaxEntries = Number(form.entries.value);
+    if (!Number.isInteger(promptCacheMaxEntries) || promptCacheMaxEntries < 256 || promptCacheMaxEntries > 1048576) {
+      cachePolicyValidationError(form.entries, 'settings.promptCacheMaxEntriesInvalid');
+    }
+    const promptCacheTTLSeconds = Number(form.ttl.value);
+    if (promptCacheTTLSeconds !== 300 && promptCacheTTLSeconds !== 3600) {
+      cachePolicyValidationError(form.ttl, 'settings.promptCacheTTLInvalid');
+    }
+    return {
+      cacheMode: form.mode.value === 'function_simulation' ? 'function_simulation' : 'native',
+      promptCacheMaxRatio,
+      promptCacheMaxEntries,
+      promptCacheTTLSeconds,
+      functionCache: {
+        enabled: form.functionEnabled.checked,
+        simulatedData: form.simulatedData.value,
+        simulatedTokens: cachePolicyFormNumber(form.simulatedTokens, 0, 1000000),
+        scopeMode: 'body_fingerprint',
+        ttlSeconds: cachePolicyFormNumber(form.functionTTL, 1, 86400),
+        ttlJitterPercent: cachePolicyFormNumber(form.ttlJitter, 0, 100),
+        tokenJitterPercent: cachePolicyFormNumber(form.tokenJitter, 0, 100),
+        hitRatePercent: cachePolicyFormNumber(form.hitRate, 0, 100),
+        maxCacheReadPercent: cachePolicyFormNumber(form.maxRead, 1, 100),
+        minTokens: cachePolicyFormNumber(form.minTokens, 0, 100000),
+        inputFingerprintChars: cachePolicyFormNumber(form.fingerprintChars, 0, 12000)
+      }
+    };
+  }
+  function populateCachePolicyForm(prefix, policy) {
+    const form = getCachePolicyForm(prefix);
+    const source = policy || {};
+    const functionCache = source.functionCache || {};
+    const ratio = Number(source.promptCacheMaxRatio);
+    const entries = Number(source.promptCacheMaxEntries);
+    const ttl = Number(source.promptCacheTTLSeconds);
+    form.mode.value = source.cacheMode === 'function_simulation' ? 'function_simulation' : 'native';
+    form.ratio.value = Number.isFinite(ratio) && ratio >= 0.01 && ratio <= 1 ? String(ratio) : '0.85';
+    form.entries.value = Number.isInteger(entries) && entries >= 256 && entries <= 1048576 ? String(entries) : '131072';
+    form.ttl.value = ttl === 3600 ? '3600' : '300';
+    form.functionEnabled.checked = functionCache.enabled === true;
+    form.simulatedData.value = functionCache.simulatedData || '';
+    form.simulatedTokens.value = String(functionCache.simulatedTokens ?? 0);
+    form.functionTTL.value = String(functionCache.ttlSeconds ?? 300);
+    form.ttlJitter.value = String(functionCache.ttlJitterPercent ?? 0);
+    form.tokenJitter.value = String(functionCache.tokenJitterPercent ?? 0);
+    form.hitRate.value = String(functionCache.hitRatePercent ?? 100);
+    form.maxRead.value = String(functionCache.maxCacheReadPercent ?? 85);
+    form.minTokens.value = String(functionCache.minTokens ?? 0);
+    form.fingerprintChars.value = String(functionCache.inputFingerprintChars ?? 0);
+    toggleCachePolicyMode(prefix);
+    refreshCustomSelects(prefix ? $('promptCachePolicyModal') : document);
   }
   async function saveDispatchPolicies() {
     let rules;
@@ -2374,53 +2482,217 @@
     }
   }
   async function savePromptCacheConfig() {
-    const ratioInput = $('promptCacheMaxRatio');
-    const entriesInput = $('promptCacheMaxEntries');
-    const ttlInput = $('promptCacheTTLSeconds');
-    const promptCacheMaxRatio = Number(ratioInput.value);
-    if (!Number.isFinite(promptCacheMaxRatio) || promptCacheMaxRatio < 0.01 || promptCacheMaxRatio > 1) {
-      toast(t('settings.promptCacheMaxRatioInvalid'), 'warning');
-      ratioInput.focus();
-      return;
-    }
-    const promptCacheMaxEntries = Number(entriesInput.value);
-    if (!Number.isInteger(promptCacheMaxEntries) || promptCacheMaxEntries < 256 || promptCacheMaxEntries > 1048576) {
-      toast(t('settings.promptCacheMaxEntriesInvalid'), 'warning');
-      entriesInput.focus();
-      return;
-    }
-    const promptCacheTTLSeconds = Number(ttlInput.value);
-    if (promptCacheTTLSeconds !== 300 && promptCacheTTLSeconds !== 3600) {
-      toast(t('settings.promptCacheTTLInvalid'), 'warning');
-      ttlInput.focus();
-      return;
-    }
     try {
-      const cacheMode = $('cacheMode').value;
-      const functionCache = {
-        enabled: $('functionCacheEnabled').checked,
-        simulatedData: $('functionSimulatedData').value,
-        simulatedTokens: policyNumber('functionSimulatedTokens', 0, 1000000),
-        scopeMode: 'body_fingerprint',
-        ttlSeconds: policyNumber('functionTTLSeconds', 1, 86400),
-        ttlJitterPercent: policyNumber('functionTTLJitter', 0, 100),
-        tokenJitterPercent: policyNumber('functionTokenJitter', 0, 100),
-        hitRatePercent: policyNumber('functionHitRate', 0, 100),
-        maxCacheReadPercent: policyNumber('functionMaxRead', 1, 100),
-        minTokens: policyNumber('functionMinTokens', 0, 100000),
-        inputFingerprintChars: policyNumber('functionFingerprintChars', 0, 12000)
-      };
+      const payload = readCachePolicyForm('');
       const res = await api('/settings', {
-        method: 'POST', body: JSON.stringify({ promptCacheMaxRatio, promptCacheMaxEntries, promptCacheTTLSeconds, cacheMode, functionCache })
+        method: 'POST', body: JSON.stringify(payload)
       });
       const d = await res.json().catch(() => ({}));
       if (!res.ok || d.success === false) throw new Error(d.error || t('common.saveFailed'));
-      ratioInput.value = String(promptCacheMaxRatio);
-      entriesInput.value = String(promptCacheMaxEntries);
-      ttlInput.value = String(promptCacheTTLSeconds);
       toast(t('settings.promptCacheSaved'), 'success');
     } catch (e) {
-      toast((e && e.message) || t('common.saveFailed'), 'error');
+      toast((e && e.message) || t('common.saveFailed'), e && e.isValidationError ? 'warning' : 'error');
+    }
+  }
+
+  const PROMPT_CACHE_POLICY_FORM_PREFIX = 'promptCachePolicyForm_';
+  let promptCachePoliciesCache = [];
+  let promptCachePoliciesLoadFailed = false;
+  let promptCachePolicyEditingId = '';
+  let promptCachePolicyModalSubmitting = false;
+
+  function promptCachePolicyState(key) {
+    return '<div class="prompt-cache-policy-state">' + escapeHtml(t(key)) + '</div>';
+  }
+  function findPromptCachePolicy(id) {
+    return promptCachePoliciesCache.find(policy => policy && policy.id === id) || null;
+  }
+  function promptCachePolicyBoundApiKeys(id) {
+    return apiKeysCache.filter(item => item && item.promptCachePolicyId === id);
+  }
+  function renderPromptCachePolicies() {
+    const list = $('promptCachePoliciesList');
+    if (!list) return;
+    if (promptCachePoliciesLoadFailed) {
+      list.innerHTML = promptCachePolicyState('cachePolicies.loadFailed');
+      return;
+    }
+    if (!promptCachePoliciesCache.length) {
+      list.innerHTML = promptCachePolicyState('cachePolicies.empty');
+      return;
+    }
+    list.innerHTML = promptCachePoliciesCache.map(policy => {
+      const id = escapeAttr(policy.id || '');
+      const name = escapeHtml(policy.name || t('cachePolicies.unnamed'));
+      const functionCache = policy.functionCache || {};
+      const isFunction = policy.cacheMode === 'function_simulation';
+      const mode = t(isFunction ? 'settings.cacheModeFunction' : 'settings.cacheModeNative');
+      const ttlLabel = Number(policy.promptCacheTTLSeconds) === 3600
+        ? t('settings.promptCacheTTL1h')
+        : t('settings.promptCacheTTL5m');
+      const summary = isFunction
+        ? t(
+            'cachePolicies.summaryFunction',
+            functionCache.enabled === true ? t('cachePolicies.enabled') : t('cachePolicies.disabled'),
+            formatNumber(functionCache.simulatedTokens || 0),
+            formatNumber(functionCache.ttlSeconds ?? 300),
+            formatNumber(functionCache.hitRatePercent ?? 100)
+          )
+        : t(
+            'cachePolicies.summaryNative',
+            formatNumber(policy.promptCacheMaxRatio ?? 0.85),
+            formatNumber(policy.promptCacheMaxEntries ?? 131072),
+            ttlLabel
+          );
+      const bound = promptCachePolicyBoundApiKeys(policy.id);
+      const boundNames = bound.slice(0, 3).map(item => item.name || item.keyMasked || t('apiKeys.unnamed'));
+      if (bound.length > boundNames.length) {
+        boundNames.push(t('cachePolicies.moreBindings', bound.length - boundNames.length));
+      }
+      const bindings = bound.length
+        ? t('cachePolicies.boundKeys', bound.length) + ': ' + boundNames.join(', ')
+        : t('cachePolicies.noBindings');
+      return '<div class="prompt-cache-policy-item" data-cache-policy-id="' + id + '">' +
+        '<div class="prompt-cache-policy-main">' +
+          '<div class="prompt-cache-policy-title-row">' +
+            '<span class="prompt-cache-policy-name">' + name + '</span>' +
+            '<span class="prompt-cache-policy-mode">' + escapeHtml(mode) + '</span>' +
+          '</div>' +
+          '<div class="prompt-cache-policy-summary">' + escapeHtml(summary) + '</div>' +
+          '<div class="prompt-cache-policy-bindings"><i class="fa-solid fa-key" aria-hidden="true"></i><span>' + escapeHtml(bindings) + '</span></div>' +
+        '</div>' +
+        '<div class="prompt-cache-policy-actions">' +
+          '<button class="btn btn-outline btn-sm" type="button" data-cache-policy-action="edit" data-id="' + id + '">' +
+            '<i class="fa-solid fa-pen" aria-hidden="true"></i><span>' + escapeHtml(t('cachePolicies.actionEdit')) + '</span>' +
+          '</button>' +
+          '<button class="btn btn-danger btn-sm" type="button" data-cache-policy-action="delete" data-id="' + id + '">' +
+            '<i class="fa-solid fa-trash" aria-hidden="true"></i><span>' + escapeHtml(t('cachePolicies.actionDelete')) + '</span>' +
+          '</button>' +
+        '</div>' +
+      '</div>';
+    }).join('');
+  }
+  function renderApiKeyPolicyOptions(selectedId) {
+    const select = $('apiKeyForm_promptCachePolicyId');
+    if (!select) return;
+    const selection = selectedId || '';
+    const options = [];
+    const fallback = document.createElement('option');
+    fallback.value = '';
+    fallback.textContent = t('apiKeys.cachePolicyGlobal');
+    options.push(fallback);
+    promptCachePoliciesCache.forEach(policy => {
+      if (!policy || !policy.id) return;
+      const option = document.createElement('option');
+      option.value = policy.id;
+      option.textContent = policy.name || t('cachePolicies.unnamed');
+      options.push(option);
+    });
+    if (selection && !findPromptCachePolicy(selection)) {
+      const missing = document.createElement('option');
+      missing.value = selection;
+      missing.textContent = t('apiKeys.cachePolicyMissing');
+      missing.disabled = true;
+      options.push(missing);
+    }
+    select.replaceChildren(...options);
+    select.value = selection;
+    refreshCustomSelects($('apiKeyModal'));
+  }
+  async function loadPromptCachePolicies() {
+    const list = $('promptCachePoliciesList');
+    if (!list) return;
+    promptCachePoliciesLoadFailed = false;
+    list.innerHTML = promptCachePolicyState('cachePolicies.loading');
+    try {
+      const res = await api('/prompt-cache-policies');
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(d.error || ('http ' + res.status));
+      promptCachePoliciesCache = Array.isArray(d.policies) ? d.policies : [];
+      renderPromptCachePolicies();
+    } catch (e) {
+      promptCachePoliciesCache = [];
+      promptCachePoliciesLoadFailed = true;
+      list.innerHTML = promptCachePolicyState('cachePolicies.loadFailed');
+    }
+    const selectedId = $('apiKeyForm_promptCachePolicyId') ? $('apiKeyForm_promptCachePolicyId').value : '';
+    renderApiKeyPolicyOptions(selectedId);
+    renderApiKeys();
+  }
+  function openPromptCachePolicyModal(policy) {
+    promptCachePolicyEditingId = policy ? (policy.id || '') : '';
+    $('promptCachePolicyModalTitle').textContent = t(
+      promptCachePolicyEditingId ? 'cachePolicies.modalTitleEdit' : 'cachePolicies.modalTitleCreate'
+    );
+    $('promptCachePolicyForm_name').value = policy ? (policy.name || '') : '';
+    populateCachePolicyForm(PROMPT_CACHE_POLICY_FORM_PREFIX, policy || {});
+    promptCachePolicyModalSubmitting = false;
+    $('promptCachePolicyModalSaveBtn').disabled = false;
+    openDialog('promptCachePolicyModal');
+    setTimeout(() => $('promptCachePolicyForm_name').focus(), 0);
+  }
+  function closePromptCachePolicyModal() {
+    closeDialog('promptCachePolicyModal');
+    promptCachePolicyEditingId = '';
+    promptCachePolicyModalSubmitting = false;
+    $('promptCachePolicyModalSaveBtn').disabled = false;
+  }
+  async function submitPromptCachePolicyModal() {
+    if (promptCachePolicyModalSubmitting) return;
+    const nameInput = $('promptCachePolicyForm_name');
+    const name = nameInput.value.trim();
+    if (!name) {
+      nameInput.focus();
+      toast(t('cachePolicies.nameRequired'), 'warning');
+      return;
+    }
+    const duplicate = promptCachePoliciesCache.some(policy =>
+      policy && policy.id !== promptCachePolicyEditingId && String(policy.name || '').trim().toLowerCase() === name.toLowerCase()
+    );
+    if (duplicate) {
+      nameInput.focus();
+      toast(t('cachePolicies.nameDuplicate'), 'warning');
+      return;
+    }
+    const saveBtn = $('promptCachePolicyModalSaveBtn');
+    try {
+      const payload = readCachePolicyForm(PROMPT_CACHE_POLICY_FORM_PREFIX);
+      payload.name = name;
+      promptCachePolicyModalSubmitting = true;
+      saveBtn.disabled = true;
+      const editing = !!promptCachePolicyEditingId;
+      const path = editing
+        ? '/prompt-cache-policies/' + encodeURIComponent(promptCachePolicyEditingId)
+        : '/prompt-cache-policies';
+      const res = await api(path, { method: editing ? 'PUT' : 'POST', body: JSON.stringify(payload) });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.success === false) throw new Error(d.error || t('common.saveFailed'));
+      closePromptCachePolicyModal();
+      toast(t(editing ? 'cachePolicies.updated' : 'cachePolicies.created'), 'success');
+      await loadPromptCachePolicies();
+    } catch (e) {
+      toast((e && e.message) || t('common.saveFailed'), e && e.isValidationError ? 'warning' : 'error');
+    } finally {
+      promptCachePolicyModalSubmitting = false;
+      saveBtn.disabled = false;
+    }
+  }
+  async function deletePromptCachePolicyEntry(id, name) {
+    const ok = await confirmAction(t('cachePolicies.confirmDelete', name || t('cachePolicies.unnamed')), {
+      title: t('cachePolicies.actionDelete'),
+      confirmText: t('cachePolicies.actionDelete'),
+      variant: 'danger'
+    });
+    if (!ok) return;
+    try {
+      const res = await api('/prompt-cache-policies/' + encodeURIComponent(id), { method: 'DELETE' });
+      const d = await res.json().catch(() => ({}));
+      if (res.status === 409) throw new Error(t('cachePolicies.deleteInUse'));
+      if (!res.ok || d.success === false) throw new Error(d.error || t('common.failed'));
+      toast(t('cachePolicies.deleted'), 'success');
+      await loadPromptCachePolicies();
+    } catch (e) {
+      toast((e && e.message) || t('common.failed'), 'error');
     }
   }
   async function changePassword() {
@@ -2467,9 +2739,11 @@
       const d = await res.json();
       apiKeysCache = Array.isArray(d.apiKeys) ? d.apiKeys : [];
       renderApiKeys();
+      renderPromptCachePolicies();
     } catch (e) {
       apiKeysCache = [];
       list.innerHTML = '<div class="muted-text" style="padding:0.5rem 0;">' + escapeHtml(t('apiKeys.loadFailed')) + '</div>';
+      renderPromptCachePolicies();
     }
   }
 
@@ -2520,6 +2794,16 @@
       const tokensLine = usageLine(t('apiKeys.tokens'), item.tokensUsed || 0, item.tokenLimit || 0);
       const creditsLine = usageLine(t('apiKeys.credits'), item.creditsUsed || 0, item.creditLimit || 0);
       const requestsLine = '<div class="text-xs muted-text">' + escapeHtml(t('apiKeys.requests')) + ': ' + escapeHtml(formatNumber(item.requestsCount || 0)) + '</div>';
+      const policyId = item.promptCachePolicyId || '';
+      const policy = policyId ? findPromptCachePolicy(policyId) : null;
+      const responsePolicyName = String(item.promptCachePolicyName || '').trim();
+      const policyName = policyId
+        ? (policy ? policy.name : (responsePolicyName || t('apiKeys.cachePolicyMissing')))
+        : t('apiKeys.cachePolicyGlobal');
+      const policyMissing = !!policyId && !policy && !responsePolicyName;
+      const policyLine = '<div class="api-key-policy-line"><i class="fa-solid fa-box-archive" aria-hidden="true"></i>' +
+        '<span>' + escapeHtml(t('apiKeys.cachePolicy')) + ':</span>' +
+        '<span class="api-key-policy-name' + (policyMissing ? ' is-missing' : '') + '">' + escapeHtml(policyName) + '</span></div>';
       return '<div class="card" data-apikey-id="' + id + '" style="margin-top:0.5rem;padding:0.75rem;">' +
         '<div class="flex items-center gap-2" style="flex-wrap:wrap;justify-content:space-between;">' +
           '<div class="flex items-center gap-2" style="flex-wrap:wrap;">' +
@@ -2539,6 +2823,7 @@
           '</div>' +
         '</div>' +
         '<div style="margin-top:0.5rem;display:grid;gap:0.35rem;">' +
+          policyLine +
           tokensLine +
           creditsLine +
           requestsLine +
@@ -2562,6 +2847,7 @@
       keyEl.readOnly = false;
     }
     $('apiKeyForm_enabled').checked = entry ? !!entry.enabled : true;
+    renderApiKeyPolicyOptions(entry ? (entry.promptCachePolicyId || '') : '');
     $('apiKeyForm_tokenLimit').value = entry ? String(entry.tokenLimit || 0) : '0';
     $('apiKeyForm_creditLimit').value = entry ? String(entry.creditLimit || 0) : '0';
     apiKeyModalSubmitting = false;
@@ -2589,6 +2875,7 @@
       const payload = {
         name: name,
         enabled: enabled,
+        promptCachePolicyId: $('apiKeyForm_promptCachePolicyId').value || '',
         tokenLimit: isNaN(tokenLimit) || tokenLimit < 0 ? 0 : tokenLimit,
         creditLimit: isNaN(creditLimit) || creditLimit < 0 ? 0 : creditLimit
       };
@@ -2690,6 +2977,27 @@
     } catch (e) {
       toast(t('common.failed'), 'error');
     }
+  }
+
+  function bindPromptCachePolicyEvents() {
+    const list = $('promptCachePoliciesList');
+    if (list) {
+      list.addEventListener('click', e => {
+        const btn = e.target.closest('[data-cache-policy-action]');
+        if (!btn) return;
+        const id = btn.dataset.id;
+        const policy = findPromptCachePolicy(id);
+        if (!policy) return;
+        if (btn.dataset.cachePolicyAction === 'edit') openPromptCachePolicyModal(policy);
+        else if (btn.dataset.cachePolicyAction === 'delete') deletePromptCachePolicyEntry(id, policy.name);
+      });
+    }
+    $('addPromptCachePolicyBtn').addEventListener('click', () => openPromptCachePolicyModal(null));
+    $('promptCachePolicyForm_cacheMode').addEventListener('change', () => toggleCachePolicyMode(PROMPT_CACHE_POLICY_FORM_PREFIX));
+    $('promptCachePolicyModalSaveBtn').addEventListener('click', submitPromptCachePolicyModal);
+    $('promptCachePolicyModalCancelBtn').addEventListener('click', closePromptCachePolicyModal);
+    $('promptCachePolicyModalClose').addEventListener('click', closePromptCachePolicyModal);
+    bindDialogBackdropClose('promptCachePolicyModal', closePromptCachePolicyModal);
   }
 
   function bindApiKeyEvents() {
@@ -3871,6 +4179,7 @@
     $('proxyType').addEventListener('change', onProxyTypeChange);
     $('saveProxyBtn').addEventListener('click', saveProxyConfig);
     $('resetStatsBtn').addEventListener('click', resetStats);
+    bindPromptCachePolicyEvents();
     bindApiKeyEvents();
   }
 

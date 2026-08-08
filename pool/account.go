@@ -36,14 +36,17 @@ type RuntimeAccountState struct {
 
 // AccountPool 账号池
 type AccountPool struct {
-	mu            sync.RWMutex
-	accounts      []config.Account
-	totalAccounts int
-	currentIndex  uint64
-	cooldowns     map[string]time.Time       // 账号冷却时间
-	errorCounts   map[string]int             // 连续错误计数
-	modelLists    map[string]map[string]bool // accountID → set of modelIDs (from ListAvailableModels)
-	inFlight      map[string]int             // accountID → 当前并发占用数
+	reloadMu       sync.Mutex // preserves Reload caller order while config is read outside mu
+	mu             sync.RWMutex
+	accounts       []config.Account
+	uniqueIndexes  []int // first weighted-list index for each account ID, rebuilt by Reload
+	accountIndexes map[string][]int
+	totalAccounts  int
+	currentIndex   uint64
+	cooldowns      map[string]time.Time       // 账号冷却时间
+	errorCounts    map[string]int             // 连续错误计数
+	modelLists     map[string]map[string]bool // accountID → set of modelIDs (from ListAvailableModels)
+	inFlight       map[string]int             // accountID → 当前并发占用数
 }
 
 var (
@@ -71,10 +74,12 @@ func GetPool() *AccountPool {
 // Overages switch (OverageStatus=ENABLED) or the global AllowOverUsage
 // setting permits over-quota routing.
 func (p *AccountPool) Reload() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.reloadMu.Lock()
+	defer p.reloadMu.Unlock()
 	enabled := config.GetEnabledAccounts()
 	allowOverUsage := config.GetAllowOverUsage()
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	// Config may not yet contain counters accumulated since the last 30-second
 	// flush. Preserve the newer in-memory values across policy/account reloads.
 	liveStats := make(map[string]config.AccountStatsSnapshot)
@@ -92,6 +97,9 @@ func (p *AccountPool) Reload() {
 		}
 	}
 	var weighted []config.Account
+	uniqueIndexes := make([]int, 0, len(enabled))
+	uniqueIDs := make(map[string]struct{}, len(enabled))
+	accountIndexes := make(map[string][]int, len(enabled))
 	for _, a := range enabled {
 		if stats, ok := liveStats[a.ID]; ok {
 			a.RequestCount = stats.RequestCount
@@ -103,12 +111,19 @@ func (p *AccountPool) Reload() {
 		if isQuotaBlocked(a, allowOverUsage) {
 			continue
 		}
+		if _, duplicate := uniqueIDs[a.ID]; !duplicate {
+			uniqueIDs[a.ID] = struct{}{}
+			uniqueIndexes = append(uniqueIndexes, len(weighted))
+		}
 		w := effectiveWeight(a.Weight)
 		for j := 0; j < w; j++ {
+			accountIndexes[a.ID] = append(accountIndexes[a.ID], len(weighted))
 			weighted = append(weighted, a)
 		}
 	}
 	p.accounts = weighted
+	p.uniqueIndexes = uniqueIndexes
+	p.accountIndexes = accountIndexes
 	p.totalAccounts = len(enabled)
 	if p.inFlight == nil {
 		p.inFlight = make(map[string]int)
@@ -131,9 +146,11 @@ func (p *AccountPool) GetNext() *config.Account {
 
 // GetNextExcluding 获取下一个可用账号（不占用并发），并跳过指定账号。
 func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account {
+	mode := config.GetSchedulingConfig().Mode
+	selection := loadAccountSelectionPolicy("")
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	acc, _ := p.selectNextLocked("", excluded, false, config.GetSchedulingConfig().Mode)
+	acc, _ := p.selectNextLocked("", excluded, false, mode, selection)
 	return copyAccount(acc)
 }
 
@@ -141,9 +158,11 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 // its in-flight counter atomically. The bool is true when there are otherwise usable
 // accounts, but every one of them has reached its configured concurrency limit.
 func (p *AccountPool) AcquireNextForModelExcluding(model string, excluded map[string]bool) (*config.Account, bool) {
+	mode := config.GetSchedulingConfig().Mode
+	selection := loadAccountSelectionPolicy(model)
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	acc, allFull := p.selectNextLocked(model, excluded, true, config.GetSchedulingConfig().Mode)
+	acc, allFull := p.selectNextLocked(model, excluded, true, mode, selection)
 	if acc != nil {
 		p.inFlight[acc.ID]++
 	}
@@ -153,25 +172,19 @@ func (p *AccountPool) AcquireNextForModelExcluding(model string, excluded map[st
 // AcquireByIDForModel tries to acquire a specific account, respecting model support,
 // cooldown, quota, token freshness, exclusion, and per-account concurrency.
 func (p *AccountPool) AcquireByIDForModel(id, model string, excluded map[string]bool) (*config.Account, bool) {
+	selection := loadAccountSelectionPolicy(model)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
-	allowOverUsage := config.GetAllowOverUsage()
-	for i := range p.accounts {
-		acc := &p.accounts[i]
-		if acc.ID != id {
-			continue
-		}
-		if !p.isSelectableLocked(acc, model, excluded, now, allowOverUsage) {
-			return nil, false
-		}
-		if p.isConcurrencyFullLocked(acc) {
-			return nil, true
-		}
-		p.inFlight[acc.ID]++
-		return copyAccount(acc), false
+	acc := p.accountByIDLocked(id)
+	if !p.isSelectableLocked(acc, model, excluded, now, selection) {
+		return nil, false
 	}
-	return nil, false
+	if p.isConcurrencyFullLocked(acc) {
+		return nil, true
+	}
+	p.inFlight[acc.ID]++
+	return copyAccount(acc), false
 }
 
 // AcquireForTest leases a specific configured account for an explicit admin
@@ -212,6 +225,22 @@ func (p *AccountPool) InFlight(id string) int {
 	return p.inFlight[id]
 }
 
+// UpdateProfileArn updates every weighted copy of an account after first-use
+// discovery so subsequent leases do not repeat the cross-region lookup.
+func (p *AccountPool) UpdateProfileArn(id, profileArn string) {
+	if p == nil || id == "" || strings.TrimSpace(profileArn) == "" {
+		return
+	}
+	profileArn = strings.TrimSpace(profileArn)
+	p.mu.Lock()
+	for i := range p.accounts {
+		if p.accounts[i].ID == id {
+			p.accounts[i].ProfileArn = profileArn
+		}
+	}
+	p.mu.Unlock()
+}
+
 // AvailabilitySnapshot describes why the scheduler can or cannot select accounts
 // for a request. It is intentionally read-only and used by handlers to distinguish
 // "no accounts configured" from "accounts are temporarily refreshing tokens".
@@ -230,32 +259,27 @@ func tokenNeedsRefresh(acc *config.Account, now time.Time) bool {
 // skipped because their access token is expired/near expiry. The checks mirror
 // isSelectableLocked, except token freshness is returned separately.
 func (p *AccountPool) InspectAvailability(model string, excluded map[string]bool) AvailabilitySnapshot {
+	selection := loadAccountSelectionPolicy(model)
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
-	allowOverUsage := config.GetAllowOverUsage()
-	seen := make(map[string]bool)
 	snap := AvailabilitySnapshot{}
 
-	for i := range p.accounts {
-		acc := &p.accounts[i]
-		if seen[acc.ID] {
-			continue
-		}
-		seen[acc.ID] = true
+	for _, accountIndex := range p.uniqueAccountIndexesLocked() {
+		acc := &p.accounts[accountIndex]
 		if excluded != nil && excluded[acc.ID] {
 			continue
 		}
 		if model != "" && !p.accountHasModel(acc.ID, model) {
 			continue
 		}
-		if model != "" && !config.AccountAllowedForModel(model, *acc, config.GetAccountPriorityConfig()) {
+		if !selection.accountAllowed(acc) {
 			continue
 		}
 		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
 			continue
 		}
-		if isQuotaBlocked(*acc, allowOverUsage) {
+		if isQuotaBlocked(*acc, selection.allowOverUsage) {
 			continue
 		}
 		if tokenNeedsRefresh(acc, now) {
@@ -272,26 +296,79 @@ func (p *AccountPool) InspectAvailability(model string, excluded map[string]bool
 	return snap
 }
 
-func (p *AccountPool) selectNextLocked(model string, excluded map[string]bool, respectConcurrency bool, mode string) (*config.Account, bool) {
+type accountSelectionPolicy struct {
+	allowOverUsage      bool
+	restrictLevels      bool
+	allowedAccountLevel map[string]struct{}
+}
+
+// loadAccountSelectionPolicy snapshots config before the pool lock is acquired.
+// Priority rules are normalized by config, so the first matching rule can be
+// reduced once per request to an account-level membership check.
+func loadAccountSelectionPolicy(model string) accountSelectionPolicy {
+	selection := accountSelectionPolicy{allowOverUsage: config.GetAllowOverUsage()}
+	model = strings.ToLower(strings.TrimSpace(model))
+	if model == "" {
+		return selection
+	}
+	priority := config.GetAccountPriorityConfig()
+	if !priority.Enabled {
+		return selection
+	}
+	for _, rule := range priority.Rules {
+		if !rule.Enabled {
+			continue
+		}
+		matched := false
+		for _, candidate := range rule.Models {
+			if candidate == "*" || candidate == model {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		selection.restrictLevels = true
+		selection.allowedAccountLevel = make(map[string]struct{}, len(rule.AccountLevels))
+		for _, level := range rule.AccountLevels {
+			selection.allowedAccountLevel[level] = struct{}{}
+		}
+		break
+	}
+	return selection
+}
+
+func (selection accountSelectionPolicy) accountAllowed(account *config.Account) bool {
+	if !selection.restrictLevels {
+		return true
+	}
+	if account == nil {
+		return false
+	}
+	_, allowed := selection.allowedAccountLevel[config.EffectiveAccountLevel(*account)]
+	return allowed
+}
+
+func (p *AccountPool) selectNextLocked(model string, excluded map[string]bool, respectConcurrency bool, mode string, selection accountSelectionPolicy) (*config.Account, bool) {
 	if len(p.accounts) == 0 {
 		return nil, false
 	}
 	switch mode {
 	case config.SchedulingModeRoundRobin:
-		return p.selectRoundRobinLocked(model, excluded, respectConcurrency)
+		return p.selectRoundRobinLocked(model, excluded, respectConcurrency, selection)
 	case config.SchedulingModeLeastRequests:
-		return p.selectLeastRequestsLocked(model, excluded, respectConcurrency)
+		return p.selectBestAccountLocked(model, excluded, respectConcurrency, mode, selection)
 	case config.SchedulingModeLeastCredits:
-		return p.selectLeastCreditsLocked(model, excluded, respectConcurrency)
+		return p.selectBestAccountLocked(model, excluded, respectConcurrency, mode, selection)
 	case config.SchedulingModeLoadBalance:
-		return p.selectCreditBalanceLocked(model, excluded, respectConcurrency)
+		return p.selectBestAccountLocked(model, excluded, respectConcurrency, mode, selection)
 	default:
-		return p.selectCreditBalanceLocked(model, excluded, respectConcurrency)
+		return p.selectBestAccountLocked(model, excluded, respectConcurrency, config.SchedulingModeLoadBalance, selection)
 	}
 }
 
-func (p *AccountPool) selectRoundRobinLocked(model string, excluded map[string]bool, respectConcurrency bool) (*config.Account, bool) {
-	allowOverUsage := config.GetAllowOverUsage()
+func (p *AccountPool) selectRoundRobinLocked(model string, excluded map[string]bool, respectConcurrency bool, selection accountSelectionPolicy) (*config.Account, bool) {
 	now := time.Now()
 	n := len(p.accounts)
 	eligible := 0
@@ -302,7 +379,7 @@ func (p *AccountPool) selectRoundRobinLocked(model string, excluded map[string]b
 	for i := 0; i < n; i++ {
 		idx := (atomic.AddUint64(&p.currentIndex, 1) - 1) % uint64(n)
 		acc := &p.accounts[idx]
-		if !p.isSelectableLocked(acc, model, excluded, now, allowOverUsage) {
+		if !p.isSelectableLocked(acc, model, excluded, now, selection) {
 			continue
 		}
 		eligible++
@@ -315,21 +392,15 @@ func (p *AccountPool) selectRoundRobinLocked(model string, excluded map[string]b
 	return nil, eligible > 0 && full == eligible
 }
 
-func (p *AccountPool) collectUniqueCandidatesLocked(model string, excluded map[string]bool, respectConcurrency bool) ([]*config.Account, int, int) {
-	allowOverUsage := config.GetAllowOverUsage()
+func (p *AccountPool) selectBestAccountLocked(model string, excluded map[string]bool, respectConcurrency bool, mode string, selection accountSelectionPolicy) (*config.Account, bool) {
 	now := time.Now()
-	seen := make(map[string]bool)
-	candidates := make([]*config.Account, 0)
+	var best *config.Account
 	eligible := 0
 	full := 0
 
-	for i := range p.accounts {
-		acc := &p.accounts[i]
-		if seen[acc.ID] {
-			continue
-		}
-		seen[acc.ID] = true
-		if !p.isSelectableLocked(acc, model, excluded, now, allowOverUsage) {
+	for _, accountIndex := range p.uniqueAccountIndexesLocked() {
+		acc := &p.accounts[accountIndex]
+		if !p.isSelectableLocked(acc, model, excluded, now, selection) {
 			continue
 		}
 		eligible++
@@ -337,84 +408,83 @@ func (p *AccountPool) collectUniqueCandidatesLocked(model string, excluded map[s
 			full++
 			continue
 		}
-		candidates = append(candidates, acc)
+		if best == nil || p.accountRanksBeforeLocked(acc, best, mode) {
+			best = acc
+		}
 	}
 
-	return candidates, eligible, full
-}
-
-func (p *AccountPool) selectLeastRequestsLocked(model string, excluded map[string]bool, respectConcurrency bool) (*config.Account, bool) {
-	candidates, eligible, full := p.collectUniqueCandidatesLocked(model, excluded, respectConcurrency)
-	if len(candidates) == 0 {
+	if best == nil {
 		return nil, eligible > 0 && full == eligible
 	}
-
-	// “最少请求优先”按当前账号并发数选择；历史请求数只作为平局兜底，
-	// 避免低并发账号在持续并发场景中被饿死。
-	sort.SliceStable(candidates, func(i, j int) bool {
-		ci := p.inFlight[candidates[i].ID]
-		cj := p.inFlight[candidates[j].ID]
-		if ci != cj {
-			return ci < cj
-		}
-		if candidates[i].LastUsed != candidates[j].LastUsed {
-			return candidates[i].LastUsed < candidates[j].LastUsed
-		}
-		if candidates[i].RequestCount != candidates[j].RequestCount {
-			return candidates[i].RequestCount < candidates[j].RequestCount
-		}
-		return effectiveWeight(candidates[i].Weight) > effectiveWeight(candidates[j].Weight)
-	})
-
-	return candidates[0], false
+	return best, false
 }
 
-func (p *AccountPool) selectLeastCreditsLocked(model string, excluded map[string]bool, respectConcurrency bool) (*config.Account, bool) {
-	candidates, eligible, full := p.collectUniqueCandidatesLocked(model, excluded, respectConcurrency)
-	if len(candidates) == 0 {
-		return nil, eligible > 0 && full == eligible
+// uniqueAccountIndexesLocked returns the Reload-built unique index without an
+// allocation in production. The fallback keeps directly-constructed pools used
+// by tests and embedders compatible without making the request path maintain a
+// second mutable account collection.
+func (p *AccountPool) uniqueAccountIndexesLocked() []int {
+	if len(p.uniqueIndexes) > 0 || len(p.accounts) == 0 {
+		return p.uniqueIndexes
 	}
-
-	// “最少积分优先”按当前账号已消耗积分的绝对值选择。
-	sort.SliceStable(candidates, func(i, j int) bool {
-		ci := accountCreditUsage(*candidates[i])
-		cj := accountCreditUsage(*candidates[j])
-		if ci != cj {
-			return ci < cj
+	seen := make(map[string]struct{}, len(p.accounts))
+	indexes := make([]int, 0, len(p.accounts))
+	for i := range p.accounts {
+		if _, duplicate := seen[p.accounts[i].ID]; duplicate {
+			continue
 		}
-		if p.inFlight[candidates[i].ID] != p.inFlight[candidates[j].ID] {
-			return p.inFlight[candidates[i].ID] < p.inFlight[candidates[j].ID]
-		}
-		return candidates[i].LastUsed < candidates[j].LastUsed
-	})
-
-	return candidates[0], false
+		seen[p.accounts[i].ID] = struct{}{}
+		indexes = append(indexes, i)
+	}
+	return indexes
 }
 
-func (p *AccountPool) selectCreditBalanceLocked(model string, excluded map[string]bool, respectConcurrency bool) (*config.Account, bool) {
-	candidates, eligible, full := p.collectUniqueCandidatesLocked(model, excluded, respectConcurrency)
-	if len(candidates) == 0 {
-		return nil, eligible > 0 && full == eligible
+// accountRanksBeforeLocked implements the former stable-sort comparison. The
+// caller only replaces its current best on a strict improvement, preserving the
+// first candidate when all configured tie-breakers are equal.
+func (p *AccountPool) accountRanksBeforeLocked(candidate, current *config.Account, mode string) bool {
+	switch mode {
+	case config.SchedulingModeLeastRequests:
+		candidateInFlight := p.inFlight[candidate.ID]
+		currentInFlight := p.inFlight[current.ID]
+		if candidateInFlight != currentInFlight {
+			return candidateInFlight < currentInFlight
+		}
+		if candidate.LastUsed != current.LastUsed {
+			return candidate.LastUsed < current.LastUsed
+		}
+		if candidate.RequestCount != current.RequestCount {
+			return candidate.RequestCount < current.RequestCount
+		}
+		return effectiveWeight(candidate.Weight) > effectiveWeight(current.Weight)
+	case config.SchedulingModeLeastCredits:
+		candidateCredits := accountCreditUsage(*candidate)
+		currentCredits := accountCreditUsage(*current)
+		if candidateCredits != currentCredits {
+			return candidateCredits < currentCredits
+		}
+		candidateInFlight := p.inFlight[candidate.ID]
+		currentInFlight := p.inFlight[current.ID]
+		if candidateInFlight != currentInFlight {
+			return candidateInFlight < currentInFlight
+		}
+		return candidate.LastUsed < current.LastUsed
+	default:
+		candidateScore := accountCreditBalanceScore(*candidate)
+		currentScore := accountCreditBalanceScore(*current)
+		if candidateScore != currentScore {
+			return candidateScore < currentScore
+		}
+		candidateInFlight := p.inFlight[candidate.ID]
+		currentInFlight := p.inFlight[current.ID]
+		if candidateInFlight != currentInFlight {
+			return candidateInFlight < currentInFlight
+		}
+		if candidate.LastUsed != current.LastUsed {
+			return candidate.LastUsed < current.LastUsed
+		}
+		return candidate.RequestCount < current.RequestCount
 	}
-
-	// “负载均衡”按积分消耗分配：选择 normalized consumed credits 最低的账号。
-	// 权重大于 1 的账号可承担更多消耗，因此分数按 weight 折算。
-	sort.SliceStable(candidates, func(i, j int) bool {
-		si := accountCreditBalanceScore(*candidates[i])
-		sj := accountCreditBalanceScore(*candidates[j])
-		if si != sj {
-			return si < sj
-		}
-		if p.inFlight[candidates[i].ID] != p.inFlight[candidates[j].ID] {
-			return p.inFlight[candidates[i].ID] < p.inFlight[candidates[j].ID]
-		}
-		if candidates[i].LastUsed != candidates[j].LastUsed {
-			return candidates[i].LastUsed < candidates[j].LastUsed
-		}
-		return candidates[i].RequestCount < candidates[j].RequestCount
-	})
-
-	return candidates[0], false
 }
 
 func accountCreditUsage(acc config.Account) float64 {
@@ -429,7 +499,7 @@ func accountCreditBalanceScore(acc config.Account) float64 {
 	return accountCreditUsage(acc) / float64(weight)
 }
 
-func (p *AccountPool) isSelectableLocked(acc *config.Account, model string, excluded map[string]bool, now time.Time, allowOverUsage bool) bool {
+func (p *AccountPool) isSelectableLocked(acc *config.Account, model string, excluded map[string]bool, now time.Time, selection accountSelectionPolicy) bool {
 	if acc == nil {
 		return false
 	}
@@ -439,7 +509,7 @@ func (p *AccountPool) isSelectableLocked(acc *config.Account, model string, excl
 	if model != "" && !p.accountHasModel(acc.ID, model) {
 		return false
 	}
-	if model != "" && !config.AccountAllowedForModel(model, *acc, config.GetAccountPriorityConfig()) {
+	if !selection.accountAllowed(acc) {
 		return false
 	}
 	if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
@@ -448,7 +518,7 @@ func (p *AccountPool) isSelectableLocked(acc *config.Account, model string, excl
 	if tokenNeedsRefresh(acc, now) {
 		return false
 	}
-	if isQuotaBlocked(*acc, allowOverUsage) {
+	if isQuotaBlocked(*acc, selection.allowOverUsage) {
 		return false
 	}
 	return true
@@ -528,9 +598,11 @@ func (p *AccountPool) GetNextForModel(model string) *config.Account {
 
 // GetNextForModelExcluding 获取下一个支持指定模型的可用账号（不占用并发），并跳过指定账号。
 func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string]bool) *config.Account {
+	mode := config.GetSchedulingConfig().Mode
+	selection := loadAccountSelectionPolicy(model)
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	acc, _ := p.selectNextLocked(model, excluded, false, config.GetSchedulingConfig().Mode)
+	acc, _ := p.selectNextLocked(model, excluded, false, mode, selection)
 	return copyAccount(acc)
 }
 
@@ -538,9 +610,16 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 func (p *AccountPool) GetByID(id string) *config.Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+	return copyAccount(p.accountByIDLocked(id))
+}
+
+func (p *AccountPool) accountByIDLocked(id string) *config.Account {
+	if indexes := p.accountIndexes[id]; len(indexes) > 0 {
+		return &p.accounts[indexes[0]]
+	}
 	for i := range p.accounts {
 		if p.accounts[i].ID == id {
-			return copyAccount(&p.accounts[i])
+			return &p.accounts[i]
 		}
 	}
 	return nil
@@ -773,6 +852,24 @@ func (p *AccountPool) RefillEligibleCount() int {
 func (p *AccountPool) UpdateStats(id string, tokens int, credits float64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if indexes := p.accountIndexes[id]; len(indexes) > 0 {
+		primary := &p.accounts[indexes[0]]
+		primary.RequestCount++
+		primary.TotalTokens += tokens
+		primary.TotalCredits += credits
+		primary.LastUsed = time.Now().Unix()
+		for _, index := range indexes[1:] {
+			p.accounts[index].RequestCount = primary.RequestCount
+			p.accounts[index].ErrorCount = primary.ErrorCount
+			p.accounts[index].TotalTokens = primary.TotalTokens
+			p.accounts[index].TotalCredits = primary.TotalCredits
+			p.accounts[index].LastUsed = primary.LastUsed
+		}
+		return
+	}
+
+	// Compatibility fallback for directly constructed pools that have not gone
+	// through Reload and therefore do not have the production index metadata.
 	var updated bool
 	var requestCount, errorCount, totalTokens int
 	var totalCredits float64

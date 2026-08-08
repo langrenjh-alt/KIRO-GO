@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"kiro-go/config"
 )
@@ -126,5 +127,42 @@ func TestResponsesWebSearchStreamEmitsExecutionEvents(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Fatalf("stream is missing %q:\n%s", want, body)
 		}
+	}
+}
+
+func TestResponsesWebSearchStreamFlushesFirstTextDeltaImmediately(t *testing.T) {
+	result := testWebSearchResultSet()
+	response, _ := buildResponsesWebSearchObject(
+		"resp_search_flush", "claude-sonnet-4.6", &ResponsesRequest{}, result, 12,
+	)
+	tracker := &latencyTracker{}
+	_, timing := withRequestTiming(context.Background(), tracker)
+	recorder := &flushSnapshotResponseRecorder{ResponseRecorder: httptest.NewRecorder()}
+	wrapped, bounded := wrapBoundedResponseWriterWithPolicy(recorder, func() {}, timing, responseWritePolicy{
+		writeTimeout: time.Second,
+		flushWindow:  time.Hour,
+	})
+
+	if err := writeResponsesWebSearchSSE(wrapped, response); err != nil {
+		t.Fatalf("writeResponsesWebSearchSSE: %v", err)
+	}
+	if got := len(recorder.snapshots); got != immediateSSEFlushes+1 {
+		t.Fatalf("flushes before finish=%d, want %d", got, immediateSSEFlushes+1)
+	}
+	for index, snapshot := range recorder.snapshots[:len(recorder.snapshots)-1] {
+		if strings.Contains(snapshot, "event: response.output_text.delta") {
+			t.Fatalf("text delta appeared in pre-visible flush %d", index)
+		}
+	}
+	if visibleFlush := recorder.snapshots[len(recorder.snapshots)-1]; !strings.Contains(visibleFlush, "event: response.output_text.delta") {
+		t.Fatalf("first text delta was not present in the immediate flush: %s", visibleFlush)
+	}
+	if snapshot := tracker.Snapshot()["first_visible_token_flush"]; snapshot.Samples != 1 {
+		t.Fatalf("first visible flush samples=%d, want 1", snapshot.Samples)
+	}
+
+	bounded.finish()
+	if got := len(recorder.snapshots); got != immediateSSEFlushes+2 {
+		t.Fatalf("finish flushes=%d, want %d", got, immediateSSEFlushes+2)
 	}
 }

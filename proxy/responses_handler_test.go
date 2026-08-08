@@ -462,6 +462,63 @@ func TestResponsesStreamSSE(t *testing.T) {
 	}
 }
 
+func TestResponsesStreamFlushesFirstVisibleDeltaImmediately(t *testing.T) {
+	h, cleanup := setupResponsesTestHandler(t)
+	defer cleanup()
+	h.kiroCaller = func(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
+		callback.OnText("first visible delta", false)
+		callback.OnComplete(4, 4)
+		return nil
+	}
+
+	tracker := &latencyTracker{}
+	baseCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx, _ := withRequestTiming(baseCtx, tracker)
+	payload := bindKiroPayloadContext(&KiroPayload{}, ctx)
+	recorder := &flushSnapshotResponseRecorder{ResponseRecorder: httptest.NewRecorder()}
+	wrapped, bounded := wrapBoundedResponseWriterWithPolicy(recorder, cancel, requestTimingFromContext(ctx), responseWritePolicy{
+		writeTimeout: time.Second,
+		flushWindow:  time.Hour,
+	})
+
+	h.handleResponsesStream(
+		wrapped, payload, "claude-sonnet-4.5", "claude-sonnet-4.5", false,
+		4, "", "resp_first_visible_flush", &ResponsesRequest{Stream: true}, nil, false,
+	)
+
+	if got := len(recorder.snapshots); got != immediateSSEFlushes+1 {
+		t.Fatalf("flushes before finish=%d, want %d", got, immediateSSEFlushes+1)
+	}
+	for index, snapshot := range recorder.snapshots[:len(recorder.snapshots)-1] {
+		if strings.Contains(snapshot, "event: response.output_text.delta") {
+			t.Fatalf("visible delta appeared in pre-visible flush %d", index)
+		}
+	}
+	visibleFlush := recorder.snapshots[len(recorder.snapshots)-1]
+	if !strings.Contains(visibleFlush, "event: response.output_text.delta") || !strings.Contains(visibleFlush, "first visible delta") {
+		t.Fatalf("first visible delta was not present in the immediate flush: %s", visibleFlush)
+	}
+	if snapshot := tracker.Snapshot()["first_visible_token_flush"]; snapshot.Samples != 1 {
+		t.Fatalf("first visible flush samples=%d, want 1", snapshot.Samples)
+	}
+
+	bounded.finish()
+	if got := len(recorder.snapshots); got != immediateSSEFlushes+2 {
+		t.Fatalf("finish flushes=%d, want %d", got, immediateSSEFlushes+2)
+	}
+}
+
+type flushSnapshotResponseRecorder struct {
+	*httptest.ResponseRecorder
+	snapshots []string
+}
+
+func (r *flushSnapshotResponseRecorder) Flush() {
+	r.snapshots = append(r.snapshots, r.Body.String())
+	r.ResponseRecorder.Flush()
+}
+
 func TestResponsesStreamReasoningIDsMatchTerminalOutput(t *testing.T) {
 	h, cleanup := setupResponsesTestHandler(t)
 	defer cleanup()
@@ -519,6 +576,35 @@ func TestResponsesStreamReasoningIDsMatchTerminalOutput(t *testing.T) {
 		if !strings.Contains(rec.Body.String(), expected) {
 			t.Fatalf("missing %s\n%s", expected, rec.Body.String())
 		}
+	}
+}
+
+func TestResponsesStreamSuppressesTaggedDuplicateReasoning(t *testing.T) {
+	h, cleanup := setupResponsesTestHandler(t)
+	defer cleanup()
+	frames := [][]byte{
+		awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{"text": "NATIVE_REASONING"}),
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "<thi"}),
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "nking>TAGGED_DUPLICATE</think"}),
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "ing>VISIBLE_TEXT"}),
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		for _, frame := range frames {
+			_, _ = w.Write(frame)
+		}
+	}))
+	defer server.Close()
+	defer swapKiroEndpointsForTest(t, server)()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"claude-opus-4.8","input":"test","stream":true,"store":false,"reasoning":{"effort":"high","summary":"auto"}}`))
+	rec := httptest.NewRecorder()
+	h.handleOpenAIResponses(rec, req)
+	body := rec.Body.String()
+	if rec.Code != http.StatusOK || !strings.Contains(body, "NATIVE_REASONING") || !strings.Contains(body, "VISIBLE_TEXT") {
+		t.Fatalf("status=%d body=%s", rec.Code, body)
+	}
+	if strings.Contains(body, "TAGGED_DUPLICATE") || strings.Contains(body, "<thinking>") {
+		t.Fatalf("tagged reasoning leaked beside native reasoning: %s", body)
 	}
 }
 

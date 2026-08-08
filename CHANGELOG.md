@@ -20,12 +20,16 @@
   mapping for supported Kiro models.
 - Added compatible tool-choice, stop-sequence, and structured JSON output
   handling across the Claude and OpenAI request adapters.
+- Added named Prompt Cache policies with create, edit, delete, live reload, and
+  per-API-key binding in both the Admin API and embedded Web UI.
+- Added stage-level TTFT histograms to `/v1/stats` for request-body processing,
+  configuration/cache/account waits, connection and TLS setup, upstream headers
+  and first events, and the first client-visible token flush.
 
 ### Changed
 
-- Kiro API-key requests now keep one leased key and one serialized payload
-  while trying the regional IDE, Kiro Runtime, CodeWhisperer-target, and
-  Amazon Q-target endpoints in order, stopping on the first 2xx response.
+- Kiro generation requests now use only the regional
+  `q.<region>.amazonaws.com` endpoint; endpoint-level fallback has been removed.
 - Forward complete conversation payloads to Kiro without the former 900 KiB
   history truncation, and return Kiro's `Input is too long` response directly
   instead of compacting and retrying the request.
@@ -48,9 +52,77 @@
   `-trimpath` binaries.
 - Retired the embedded legacy Admin entry point; old
   `/admin/index-legacy.html` bookmarks now redirect to the maintained UI.
+- Moved API-key usage accounting off the request-time configuration write path;
+  counters now accumulate atomically in memory, flush every five seconds, retry
+  failed writes, and perform a final flush during graceful shutdown.
+- Reduced burst-request memory by streaming bounded JSON decoding wherever raw
+  request bytes are not required. Function-cache simulation retains its existing
+  byte-level request fingerprint behavior.
+- Reduced Prompt Cache tail latency with bounded expiry maintenance, background
+  cleanup, lock-independent persistence snapshots, function-cache expiry heaps,
+  named-policy preload, and single-flight lazy recovery.
+- Kept global and per-API-key request concurrency unrestricted. Connection-pool
+  tuning limits idle reuse only and does not cap active upstream connections.
+- Left streaming response-header waits unlimited by default so a slow but valid
+  upstream first response is not aborted; operators can opt in with
+  `KIRO_RESPONSE_HEADER_TIMEOUT_SECONDS`.
+- Coalesced duplicate Profile ARN discovery per account and synchronized newly
+  resolved ARNs into the live pool; upstream retries now add jitter, honor
+  `Retry-After`, and share a process-wide retry budget.
+- Kept the first SSE events immediately flushed while coalescing later events in
+  a bounded window; downstream writes now have per-write deadlines and cancel
+  their upstream request on failure.
 
 ### Fixed
 
+- Replaced flattened historical `Tool results:` dialogue with an explicit
+  untrusted-data envelope, and scrubbed model-authored `user Tool results ...
+  assistant` transcript copies before validated structured tool calls are
+  exposed. Tool-free final answers and ordinary prose remain untouched.
+- Parsed Kiro's terminal `metadataEvent.stopReason`. Clean Enterprise/IdC
+  streams that omit metadata use their final `meteringEvent` as a terminal
+  fallback, while `MAX_TOKENS`, missing coding-agent marker/tool evidence,
+  interrupted agent output, and incomplete tools still enter bounded recovery.
+- Corrected native Kiro stop-reason mapping so `END_TURN` remains a completed
+  response in Chat Completions and Responses instead of being mislabeled as
+  `length` or `incomplete`.
+- Removed the five-minute wall-clock timeout from Kiro streaming requests so
+  long-running agent turns are not cut off mid-response; downstream request
+  cancellation still terminates abandoned upstream streams.
+- Added a request-scoped completion protocol for recognized coding agents:
+  reasoning is forwarded immediately, completed answers carry a stripped random
+  marker, and unmarked assistant text remains pending until a real structured
+  tool call confirms it as tool narration.
+- Removed recovery action windows, marker-mismatch grace timers, and
+  reasoning/pending-text byte ceilings. Marker prefix checks only control text
+  visibility; normally correction is considered after the upstream stream ends
+  with neither the marker nor a valid tool call.
+- Limited only the initial coding-agent reasoning phase to 300 seconds after its
+  first native reasoning event. A completion marker or structured tool event
+  cancels the timer; expiry enters the existing semantic correction flow, while
+  both correction attempts and ordinary requests remain untimed.
+- Preserved upstream event order for successful tool turns across Claude
+  Messages, Chat Completions, and Responses: reasoning, assistant text, then the
+  structured tool call. Final answers that need no tool use the marker path and
+  are released immediately after the internal marker is stripped.
+- Limited missing-marker correction to two attempts while keeping transport and
+  account retries separate. Repeated protocol failure returns an explicit
+  `upstream_incomplete_response` without exposing buffered narration.
+- Added bounded dial and TLS-handshake timeouts for tool follow-up requests
+  without applying a whole-stream or model-thinking deadline; response-header
+  timeout remains opt-in through `KIRO_RESPONSE_HEADER_TIMEOUT_SECONDS`.
+- Compacted only long coding-agent requests after an actionless semantic failure:
+  recovery keeps the system protocol, current request, recent user/tool evidence,
+  and tool definitions while dropping old assistant planning from a fresh recovery
+  conversation. Normal first attempts and short-request compatibility paths are
+  unchanged.
+- Added a UTF-8-safe 1 KiB action hint to semantic recovery requests. The hint
+  retains only the failed attempt's tail, is JSON-escaped and marked as untrusted
+  diagnostic context, and is replaced rather than duplicated on a later recovery;
+  normal first attempts and transport-only retries remain unchanged.
+- Returned a protocol-valid unavailable result when every account receives a
+  permanent WebSearch MCP JSON-RPC rejection, while retaining failed-request
+  metrics and classifying WebSearch and agent-protocol failures separately.
 - Kept long-running Claude, Chat Completions, and Responses streams alive while
   Kiro is silent by forwarding a 25-second SSE heartbeat, matching kiro.rs
   without changing active-stream content or protocol metadata.

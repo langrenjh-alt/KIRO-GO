@@ -34,6 +34,29 @@ func TestAccountFailureClassifiers(t *testing.T) {
 	}
 }
 
+func TestRetryBudgetAndRetryAfterParsing(t *testing.T) {
+	budget := &retryBudget{limit: 2}
+	now := time.Now()
+	if !budget.allow(now) || !budget.allow(now) || budget.allow(now) {
+		t.Fatal("retry budget did not enforce its per-second limit")
+	}
+	if !budget.allow(now.Add(time.Second)) {
+		t.Fatal("retry budget did not reset after one second")
+	}
+	if got := parseRetryAfter("3", now); got != 3*time.Second {
+		t.Fatalf("numeric Retry-After=%s", got)
+	}
+	if got := parseRetryAfter(now.Add(5*time.Second).UTC().Format(http.TimeFormat), now); got < 4*time.Second || got > 5*time.Second {
+		t.Fatalf("date Retry-After=%s", got)
+	}
+	for i := 0; i < 100; i++ {
+		got := jitterRetryDelay(time.Second)
+		if got < time.Second || got > 1200*time.Millisecond {
+			t.Fatalf("jittered delay out of bounds: %s", got)
+		}
+	}
+}
+
 func TestTransientTransportFailureDoesNotCooldownAccount(t *testing.T) {
 	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
 		t.Fatalf("config.Init: %v", err)
@@ -94,6 +117,20 @@ func TestRateLimitPolicyDecisionsAndSwitchRounds(t *testing.T) {
 	}
 	if third.RetrySameID != "" || !excluded[account.ID] {
 		t.Fatalf("exhausted retry decision = %+v excluded=%v", third, excluded)
+	}
+	retryAfterDecision := h.applyRateLimitPolicy(
+		account,
+		make(map[string]int),
+		make(map[string]bool),
+		&UpstreamRateLimitError{RetryAfter: 3 * time.Second},
+	)
+	if retryAfterDecision.Delay != 3*time.Second {
+		t.Fatalf("Retry-After was not preserved as the delay floor: %+v", retryAfterDecision)
+	}
+	for i := 0; i < 100; i++ {
+		if got := jitterRetryDelay(retryAfterDecision.Delay); got < retryAfterDecision.Delay {
+			t.Fatalf("jitter shortened Retry-After floor: got %s want >= %s", got, retryAfterDecision.Delay)
+		}
 	}
 
 	return429 := config.RateLimitConfig{Mode: config.RateLimitModeReturn429}

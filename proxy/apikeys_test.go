@@ -113,6 +113,198 @@ func TestAuthenticateAcceptsEnabledKey(t *testing.T) {
 	}
 }
 
+func TestAuthenticateUsesProtocolPreferredCredentialWithoutHeaderMasking(t *testing.T) {
+	mustInitConfig(t)
+	claudeKey, err := config.AddApiKey(config.ApiKeyEntry{Name: "claude", Key: "sk-claude", Enabled: true})
+	if err != nil {
+		t.Fatalf("seed Claude key: %v", err)
+	}
+	openAIKey, err := config.AddApiKey(config.ApiKeyEntry{Name: "openai", Key: "sk-openai", Enabled: true})
+	if err != nil {
+		t.Fatalf("seed OpenAI key: %v", err)
+	}
+
+	h := &Handler{}
+	claudeReq := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("{}"))
+	claudeReq.Header.Set("X-Api-Key", " sk-claude ")
+	claudeReq.Header.Set("Authorization", "Bearer sk-openai")
+	entry, err := h.authenticate(claudeReq)
+	if err != nil || entry == nil || entry.ID != claudeKey.ID {
+		t.Fatalf("Claude credential selection: entry=%+v err=%v", entry, err)
+	}
+
+	openAIReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader("{}"))
+	openAIReq.Header.Set("X-Api-Key", "sk-claude")
+	openAIReq.Header.Set("Authorization", "  bEaReR   sk-openai  ")
+	entry, err = h.authenticate(openAIReq)
+	if err != nil || entry == nil || entry.ID != openAIKey.ID {
+		t.Fatalf("OpenAI credential selection: entry=%+v err=%v", entry, err)
+	}
+}
+
+func TestAuthenticateUnknownCredentialDoesNotMaskConfiguredKey(t *testing.T) {
+	mustInitConfig(t)
+	created, err := config.AddApiKey(config.ApiKeyEntry{Name: "bound", Key: "sk-bound", Enabled: true})
+	if err != nil {
+		t.Fatalf("seed key: %v", err)
+	}
+
+	h := &Handler{}
+	r := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("{}"))
+	r.Header.Set("X-Api-Key", "sk-bound")
+	r.Header.Set("Authorization", "Bearer unknown-injected-credential")
+	entry, err := h.authenticate(r)
+	if err != nil || entry == nil || entry.ID != created.ID {
+		t.Fatalf("configured key was masked: entry=%+v err=%v", entry, err)
+	}
+}
+
+func TestAuthenticatePublicDisabledCredentialDoesNotMaskEnabledKey(t *testing.T) {
+	tests := []struct {
+		name          string
+		path          string
+		disabledHead  string
+		disabledValue string
+		enabledHead   string
+		enabledValue  string
+	}{
+		{
+			name:          "Claude preferred X-Api-Key is disabled",
+			path:          "/v1/messages",
+			disabledHead:  "X-Api-Key",
+			disabledValue: "sk-disabled-claude",
+			enabledHead:   "Authorization",
+			enabledValue:  "Bearer sk-enabled-claude",
+		},
+		{
+			name:          "OpenAI preferred bearer is disabled",
+			path:          "/v1/chat/completions",
+			disabledHead:  "Authorization",
+			disabledValue: "Bearer sk-disabled-openai",
+			enabledHead:   "X-Api-Key",
+			enabledValue:  "sk-enabled-openai",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mustInitConfig(t)
+			if _, err := config.AddApiKey(config.ApiKeyEntry{Name: "disabled", Key: strings.TrimPrefix(tc.disabledValue, "Bearer "), Enabled: false}); err != nil {
+				t.Fatalf("seed disabled key: %v", err)
+			}
+			enabled, err := config.AddApiKey(config.ApiKeyEntry{Name: "enabled", Key: strings.TrimPrefix(tc.enabledValue, "Bearer "), Enabled: true})
+			if err != nil {
+				t.Fatalf("seed enabled key: %v", err)
+			}
+
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader("{}"))
+			req.Header.Set(tc.disabledHead, tc.disabledValue)
+			req.Header.Set(tc.enabledHead, tc.enabledValue)
+			entry, err := (&Handler{}).authenticate(req)
+			if err != nil || entry == nil || entry.ID != enabled.ID {
+				t.Fatalf("enabled key was masked by disabled credential: entry=%+v err=%v", entry, err)
+			}
+		})
+	}
+}
+
+func TestAuthenticateRequiredRejectsDisabledProtocolPreferredCredential(t *testing.T) {
+	tests := []struct {
+		name            string
+		path            string
+		preferredHeader string
+		preferredValue  string
+		secondaryHeader string
+		secondaryValue  string
+	}{
+		{
+			name:            "Claude disabled X-Api-Key is authoritative",
+			path:            "/v1/messages",
+			preferredHeader: "X-Api-Key",
+			preferredValue:  "sk-disabled",
+			secondaryHeader: "Authorization",
+			secondaryValue:  "Bearer sk-enabled",
+		},
+		{
+			name:            "OpenAI disabled bearer is authoritative",
+			path:            "/v1/chat/completions",
+			preferredHeader: "Authorization",
+			preferredValue:  "Bearer sk-disabled",
+			secondaryHeader: "X-Api-Key",
+			secondaryValue:  "sk-enabled",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mustInitConfig(t)
+			if _, err := config.AddApiKey(config.ApiKeyEntry{Name: "disabled", Key: "sk-disabled", Enabled: false}); err != nil {
+				t.Fatalf("seed disabled key: %v", err)
+			}
+			if _, err := config.AddApiKey(config.ApiKeyEntry{Name: "enabled", Key: "sk-enabled", Enabled: true}); err != nil {
+				t.Fatalf("seed enabled key: %v", err)
+			}
+			requireAuth(t)
+
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader("{}"))
+			req.Header.Set(tc.preferredHeader, tc.preferredValue)
+			req.Header.Set(tc.secondaryHeader, tc.secondaryValue)
+			entry, err := (&Handler{}).authenticate(req)
+			authErr, ok := err.(*authError)
+			if entry != nil || !ok || authErr.status != http.StatusUnauthorized || !strings.Contains(authErr.message, "disabled") {
+				t.Fatalf("disabled preferred credential was bypassed: entry=%+v err=%v", entry, err)
+			}
+		})
+	}
+}
+
+func TestAuthenticateRequiredSkipsUnknownProtocolPreferredCredential(t *testing.T) {
+	tests := []struct {
+		name            string
+		path            string
+		preferredHeader string
+		preferredValue  string
+		secondaryHeader string
+		secondaryValue  string
+	}{
+		{
+			name:            "Claude unknown X-Api-Key",
+			path:            "/v1/messages",
+			preferredHeader: "X-Api-Key",
+			preferredValue:  "unknown",
+			secondaryHeader: "Authorization",
+			secondaryValue:  "Bearer sk-enabled",
+		},
+		{
+			name:            "OpenAI unknown bearer",
+			path:            "/v1/chat/completions",
+			preferredHeader: "Authorization",
+			preferredValue:  "Bearer unknown",
+			secondaryHeader: "X-Api-Key",
+			secondaryValue:  "sk-enabled",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mustInitConfig(t)
+			enabled, err := config.AddApiKey(config.ApiKeyEntry{Name: "enabled", Key: "sk-enabled", Enabled: true})
+			if err != nil {
+				t.Fatalf("seed enabled key: %v", err)
+			}
+			requireAuth(t)
+
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader("{}"))
+			req.Header.Set(tc.preferredHeader, tc.preferredValue)
+			req.Header.Set(tc.secondaryHeader, tc.secondaryValue)
+			entry, err := (&Handler{}).authenticate(req)
+			if err != nil || entry == nil || entry.ID != enabled.ID {
+				t.Fatalf("unknown preferred credential masked valid secondary key: entry=%+v err=%v", entry, err)
+			}
+		})
+	}
+}
+
 func TestAuthenticateRejectsOverTokenLimit(t *testing.T) {
 	mustInitConfig(t)
 	created, err := config.AddApiKey(config.ApiKeyEntry{

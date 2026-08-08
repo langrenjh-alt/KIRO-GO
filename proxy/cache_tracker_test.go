@@ -511,6 +511,136 @@ func TestCanonicalCacheValuePreservesSemanticPositionKeys(t *testing.T) {
 	}
 }
 
+func TestPromptCacheToolFingerprintIncludesServerToolSettings(t *testing.T) {
+	tracker := newPromptCacheTracker(time.Hour)
+	description := strings.Repeat("server tool cache fingerprint ", 220)
+	base := ClaudeTool{
+		Type:           "web_search_20250305",
+		Name:           "web_search",
+		Description:    description,
+		InputSchema:    map[string]interface{}{"type": "object"},
+		Model:          "tool-model-a",
+		MaxUses:        2,
+		MaxTokens:      2048,
+		Caching:        map[string]interface{}{"enabled": true},
+		AllowedDomains: []string{"a.example"},
+		BlockedDomains: []string{"blocked.example"},
+	}
+	buildFingerprint := func(tool ClaudeTool) [32]byte {
+		t.Helper()
+		profile := tracker.BuildClaudeProfile(&ClaudeRequest{
+			Model: "claude-sonnet-4.5",
+			Tools: []ClaudeTool{tool},
+		}, 4096, "tool-fingerprint-tenant")
+		if profile == nil || len(profile.Breakpoints) == 0 {
+			t.Fatalf("tool profile was not built: %+v", profile)
+		}
+		return profile.Breakpoints[len(profile.Breakpoints)-1].Fingerprint
+	}
+
+	baseFingerprint := buildFingerprint(base)
+	tests := []struct {
+		name   string
+		mutate func(*ClaudeTool)
+	}{
+		{"type", func(tool *ClaudeTool) { tool.Type = "web_search_20260209" }},
+		{"model", func(tool *ClaudeTool) { tool.Model = "tool-model-b" }},
+		{"max uses", func(tool *ClaudeTool) { tool.MaxUses++ }},
+		{"max tokens", func(tool *ClaudeTool) { tool.MaxTokens++ }},
+		{"caching", func(tool *ClaudeTool) { tool.Caching = map[string]interface{}{"enabled": false} }},
+		{"allowed domains", func(tool *ClaudeTool) { tool.AllowedDomains = []string{"b.example"} }},
+		{"blocked domains", func(tool *ClaudeTool) { tool.BlockedDomains = []string{"other.example"} }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			changed := base
+			changed.AllowedDomains = append([]string(nil), base.AllowedDomains...)
+			changed.BlockedDomains = append([]string(nil), base.BlockedDomains...)
+			tc.mutate(&changed)
+			if got := buildFingerprint(changed); got == baseFingerprint {
+				t.Fatal("semantic server-tool change did not change the cache fingerprint")
+			}
+		})
+	}
+}
+
+func TestPromptCacheAllowedDomainChangeMissesNativeCache(t *testing.T) {
+	tracker := newPromptCacheTracker(time.Hour)
+	policy := config.PromptCachePolicy{
+		CacheMode:             config.CacheModeNative,
+		PromptCacheMaxRatio:   0.85,
+		PromptCacheMaxEntries: 128,
+		PromptCacheTTLSeconds: config.DefaultPromptCacheTTLSeconds,
+	}
+	base := &ClaudeRequest{
+		Model: "claude-sonnet-4.5",
+		Tools: []ClaudeTool{{
+			Type:           "web_search_20250305",
+			Name:           "web_search",
+			Description:    strings.Repeat("native server tool fingerprint ", 220),
+			InputSchema:    map[string]interface{}{"type": "object"},
+			AllowedDomains: []string{"a.com"},
+		}},
+	}
+	build := func(req *ClaudeRequest) *promptCacheProfile {
+		t.Helper()
+		profile := tracker.BuildClaudeProfileWithPolicy(req, 4096, policy, "native-tool-tenant")
+		if profile == nil {
+			t.Fatal("native prompt-cache profile was not built")
+		}
+		return profile
+	}
+
+	first := build(base)
+	if usage := tracker.Compute("acct", first); usage.CacheReadInputTokens != 0 {
+		t.Fatalf("first request unexpectedly hit cache: %+v", usage)
+	}
+	tracker.Update("acct", first)
+	if usage := tracker.Compute("acct", build(base)); usage.CacheReadInputTokens == 0 {
+		t.Fatalf("identical server-tool settings did not hit cache: %+v", usage)
+	}
+
+	changed := *base
+	changed.Tools = append([]ClaudeTool(nil), base.Tools...)
+	changed.Tools[0].AllowedDomains = []string{"b.com"}
+	if usage := tracker.Compute("acct", build(&changed)); usage.CacheReadInputTokens != 0 {
+		t.Fatalf("allowed_domains change reused the old native cache entry: %+v", usage)
+	}
+}
+
+func TestFunctionCacheTTLShrinkAppliesBeforeNextHit(t *testing.T) {
+	tracker := newPromptCacheTrackerWithCapacity(time.Hour, 16)
+	fingerprint := [32]byte{0x42}
+	oldTTL := time.Hour
+	newTTL := 5 * time.Minute
+	lastRefresh := time.Now().Add(-10 * time.Minute)
+
+	tracker.functionMu.Lock()
+	tracker.putFunctionEntryLocked(fingerprint, lastRefresh.Add(oldTTL), oldTTL)
+	tracker.functionMu.Unlock()
+
+	profile := &promptCacheProfile{
+		Breakpoints: []promptCacheBreakpoint{{
+			Fingerprint:      fingerprint,
+			CumulativeTokens: 2000,
+			TTL:              newTTL,
+		}},
+		TotalInputTokens:        2000,
+		Model:                   "claude-sonnet-4.5",
+		SimulatedFunctionCache:  true,
+		SimulatedHitRatePercent: 100,
+		SimulatedMaxReadPercent: 100,
+	}
+
+	usage := tracker.Compute("acct", profile)
+	if usage.CacheReadInputTokens != 0 {
+		t.Fatalf("TTL shrink reused an entry older than the new TTL: %+v", usage)
+	}
+	if got := tracker.Stats().FunctionEntries; got != 0 {
+		t.Fatalf("expired function entry remained after TTL shrink: %d", got)
+	}
+}
+
 // TestPromptCacheImplicitBreakpointAtMessageEnd verifies that once any
 // explicit cache_control breakpoint has been seen, subsequent message-end
 // boundaries act as implicit breakpoints. This allows multi-turn conversations

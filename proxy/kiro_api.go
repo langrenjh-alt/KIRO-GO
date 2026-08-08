@@ -8,6 +8,7 @@ import (
 	"kiro-go/auth"
 	"kiro-go/config"
 	"kiro-go/logger"
+	"kiro-go/pool"
 	"net/http"
 	neturl "net/url"
 	"os"
@@ -22,6 +23,17 @@ const (
 )
 
 var profileArnResolutionCooldowns sync.Map
+
+type profileArnFlight struct {
+	done chan struct{}
+	arn  string
+	err  error
+}
+
+var profileArnFlights = struct {
+	sync.Mutex
+	active map[string]*profileArnFlight
+}{active: make(map[string]*profileArnFlight)}
 
 func regionFromProfileArn(profileArn string) string {
 	parts := strings.SplitN(strings.TrimSpace(profileArn), ":", 6)
@@ -261,6 +273,7 @@ func ListAvailableModels(account *config.Account) ([]ModelInfo, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, err
 	}
+	registerModelTokenLimits(result.Models)
 	return result.Models, nil
 }
 
@@ -287,6 +300,37 @@ func ResolveProfileArnContext(ctx context.Context, account *config.Account) (str
 		return profileArn, nil
 	}
 
+	key := profileArnCooldownKey(account)
+	if key == "" {
+		return resolveProfileArnContextUnshared(ctx, account)
+	}
+	profileArnFlights.Lock()
+	if flight := profileArnFlights.active[key]; flight != nil {
+		profileArnFlights.Unlock()
+		select {
+		case <-flight.done:
+			if flight.arn != "" {
+				account.ProfileArn = flight.arn
+			}
+			return flight.arn, flight.err
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	flight := &profileArnFlight{done: make(chan struct{})}
+	profileArnFlights.active[key] = flight
+	profileArnFlights.Unlock()
+
+	flight.arn, flight.err = resolveProfileArnContextUnshared(ctx, account)
+	profileArnFlights.Lock()
+	delete(profileArnFlights.active, key)
+	close(flight.done)
+	profileArnFlights.Unlock()
+	return flight.arn, flight.err
+}
+
+func resolveProfileArnContextUnshared(ctx context.Context, account *config.Account) (string, error) {
+
 	profileLookupSuppressed := isProfileArnResolutionSuppressed(account)
 	var profileUnsupportedErr error
 	var profileUnsupported bool
@@ -301,10 +345,7 @@ func ResolveProfileArnContext(ctx context.Context, account *config.Account) (str
 		// region, which can legitimately differ from the profile's region).
 		profileArn, err := resolveProfileArnAcrossRegionsContext(ctx, account)
 		if err == nil && profileArn != "" {
-			if updateErr := config.UpdateAccountProfileArn(account.ID, profileArn); updateErr != nil {
-				logger.Warnf("[ProfileArn] Failed to cache profile ARN for %s: %v", account.Email, updateErr)
-			}
-			account.ProfileArn = profileArn
+			cacheResolvedProfileArn(account, profileArn)
 			return profileArn, nil
 		}
 		profileUnsupportedErr = err
@@ -318,10 +359,7 @@ func ResolveProfileArnContext(ctx context.Context, account *config.Account) (str
 	if account.RefreshToken != "" {
 		_, _, _, refreshedArn, refreshErr := auth.RefreshTokenContext(ctx, account)
 		if refreshErr == nil && refreshedArn != "" {
-			if updateErr := config.UpdateAccountProfileArn(account.ID, refreshedArn); updateErr != nil {
-				logger.Warnf("[ProfileArn] Failed to cache profile ARN for %s: %v", account.Email, updateErr)
-			}
-			account.ProfileArn = refreshedArn
+			cacheResolvedProfileArn(account, refreshedArn)
 			return refreshedArn, nil
 		}
 	}
@@ -338,6 +376,21 @@ func ResolveProfileArnContext(ctx context.Context, account *config.Account) (str
 	}
 
 	return "", fmt.Errorf("no available Kiro profile")
+}
+
+func cacheResolvedProfileArn(account *config.Account, profileArn string) {
+	if account == nil {
+		return
+	}
+	profileArn = strings.TrimSpace(profileArn)
+	if profileArn == "" {
+		return
+	}
+	if updateErr := config.UpdateAccountProfileArn(account.ID, profileArn); updateErr != nil {
+		logger.Warnf("[ProfileArn] Failed to cache profile ARN for %s: %v", account.Email, updateErr)
+	}
+	account.ProfileArn = profileArn
+	pool.GetPool().UpdateProfileArn(account.ID, profileArn)
 }
 
 func isBuilderIDProfileUnsupportedError(account *config.Account, err error) bool {

@@ -139,6 +139,7 @@ type webSearchResultSet struct {
 	Query        string
 	Results      []webSearchResult
 	TotalResults *int
+	Unavailable  bool
 }
 
 type webSearchResult struct {
@@ -210,6 +211,7 @@ type webSearchExecution struct {
 	Result        *webSearchResultSet
 	Account       *config.Account
 	LastAccountID string
+	DegradedError error
 }
 
 func (h *Handler) handleWebSearchRequest(
@@ -218,12 +220,13 @@ func (h *Handler) handleWebSearchRequest(
 	req *ClaudeRequest,
 	estimatedInputTokens int,
 	apiKeyID string,
+	cacheProfile *promptCacheProfile,
 ) {
 	call := h.webSearchMCPCaller
 	if call == nil {
 		call = callMCPWebSearch
 	}
-	h.handleWebSearchRequestWithCaller(w, ctx, req, estimatedInputTokens, apiKeyID, call)
+	h.handleWebSearchRequestWithCallerAndCache(w, ctx, req, estimatedInputTokens, apiKeyID, cacheProfile, call)
 }
 
 func (h *Handler) handleWebSearchRequestWithCaller(
@@ -232,6 +235,18 @@ func (h *Handler) handleWebSearchRequestWithCaller(
 	req *ClaudeRequest,
 	estimatedInputTokens int,
 	apiKeyID string,
+	call webSearchMCPCaller,
+) {
+	h.handleWebSearchRequestWithCallerAndCache(w, ctx, req, estimatedInputTokens, apiKeyID, nil, call)
+}
+
+func (h *Handler) handleWebSearchRequestWithCallerAndCache(
+	w http.ResponseWriter,
+	ctx context.Context,
+	req *ClaudeRequest,
+	estimatedInputTokens int,
+	apiKeyID string,
+	cacheProfile *promptCacheProfile,
 	call webSearchMCPCaller,
 ) {
 	tool, ok := findNativeWebSearchTool(req)
@@ -294,14 +309,29 @@ func (h *Handler) handleWebSearchRequestWithCaller(
 		return
 	}
 
-	outputTokens, err := writeWebSearchResponse(w, req, execution.Result, estimatedInputTokens)
+	cacheTracker := promptCacheTrackerForProfile(h.promptCache, cacheProfile)
+	cacheUsage := promptCacheUsage{}
+	if execution.Account != nil {
+		cacheUsage = cacheTracker.Compute(execution.Account.ID, cacheProfile)
+		cacheUsage = reanchorClaudeCacheUsage(cacheProfile, cacheUsage, estimatedInputTokens)
+	}
+	outputTokens, err := writeWebSearchResponseWithCache(w, req, execution.Result, estimatedInputTokens, cacheUsage)
 	if err != nil {
-		h.pool.RecordSuccess(execution.Account.ID)
-		h.recordFailureWithDetails("claude", req.Model, execution.Account.ID, err)
+		if execution.Account != nil {
+			h.pool.RecordSuccess(execution.Account.ID)
+		}
+		h.recordFailureWithDetails("claude", req.Model, execution.LastAccountID, err)
 		return
 	}
+	if execution.DegradedError != nil {
+		h.recordFailureWithDetails("claude", req.Model, execution.LastAccountID, execution.DegradedError)
+		return
+	}
+	if execution.Account != nil {
+		cacheTracker.Update(execution.Account.ID, cacheProfile)
+	}
 
-	h.recordWebSearchSuccess("claude", req.Model, apiKeyID, execution.Account, estimatedInputTokens, outputTokens, requestStarted)
+	h.recordWebSearchSuccess("claude", req.Model, apiKeyID, execution.Account, estimatedInputTokens, outputTokens, cacheUsage, requestStarted)
 }
 
 func (h *Handler) executeWebSearch(
@@ -335,7 +365,7 @@ func (h *Handler) executeWebSearch(
 			break
 		}
 
-		account, allFull := h.acquireAccountForModel("", excluded, retrySameID)
+		account, allFull := h.acquireAccountForModel("", excluded, retrySameID, ctx)
 		retrySameID = ""
 		if account == nil {
 			// Preserve the useful JSON-RPC failure when no compatible alternate
@@ -396,7 +426,7 @@ func (h *Handler) executeWebSearch(
 				break
 			}
 			if isRateLimitError(err) {
-				decision := h.applyRateLimitPolicy(account, retryCounts, excluded)
+				decision := h.applyRateLimitPolicy(account, retryCounts, excluded, err)
 				if decision.Return429 {
 					break
 				}
@@ -430,6 +460,18 @@ func (h *Handler) executeWebSearch(
 	if lastErr == nil {
 		lastErr = errNoWebSearchAccounts
 	}
+	if isPermanentWebSearchRPCErrorCode(lastErr) {
+		// Kiro can reject WebSearch at the MCP layer for an otherwise valid chat
+		// account or region. Preserve the native server-tool response contract so
+		// the client can continue, while retaining the failure for metrics/logs.
+		execution.Result = &webSearchResultSet{
+			ToolUseID:   newClaudeServerToolUseID(),
+			Query:       query,
+			Unavailable: true,
+		}
+		execution.DegradedError = lastErr
+		return execution, nil
+	}
 	return execution, lastErr
 }
 
@@ -440,12 +482,13 @@ func (h *Handler) recordWebSearchSuccess(
 	account *config.Account,
 	inputTokens int,
 	outputTokens int,
+	cacheUsage promptCacheUsage,
 	started time.Time,
 ) {
 	if account == nil {
 		return
 	}
-	h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, 0)
+	h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, 0, cacheUsage)
 	h.pool.RecordSuccess(account.ID)
 	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, 0)
 	h.recordSuccessLog(endpoint, model, account.ID, inputTokens+outputTokens, 0, time.Since(started).Milliseconds())
@@ -985,8 +1028,14 @@ func callMCPWebSearchWithOptionsInternal(
 			}
 		}
 		message := "web search MCP upstream returned a JSON-RPC error"
+		if mcpResponse.Error.Code != nil {
+			message = fmt.Sprintf("%s (JSON-RPC %d)", message, *mcpResponse.Error.Code)
+		}
 		if isPermanentWebSearchRPCError(mcpResponse.Error.Code) {
 			message = "web search MCP upstream rejected the request"
+			if mcpResponse.Error.Code != nil {
+				message = fmt.Sprintf("%s (JSON-RPC %d)", message, *mcpResponse.Error.Code)
+			}
 		}
 		return nil, &webSearchMCPError{
 			StatusCode: http.StatusBadGateway,
@@ -1099,6 +1148,16 @@ func writeWebSearchResponse(
 	result *webSearchResultSet,
 	estimatedInputTokens int,
 ) (int, error) {
+	return writeWebSearchResponseWithCache(w, req, result, estimatedInputTokens, promptCacheUsage{})
+}
+
+func writeWebSearchResponseWithCache(
+	w http.ResponseWriter,
+	req *ClaudeRequest,
+	result *webSearchResultSet,
+	estimatedInputTokens int,
+	cacheUsage promptCacheUsage,
+) (int, error) {
 	if w == nil {
 		return 0, fmt.Errorf("web search response writer is nil")
 	}
@@ -1129,7 +1188,7 @@ func writeWebSearchResponse(
 			"stop_reason":   "end_turn",
 			"stop_sequence": nil,
 			"stop_details":  nil,
-			"usage":         buildWebSearchUsage(inputTokens, outputTokens),
+			"usage":         buildWebSearchUsage(inputTokens, outputTokens, cacheUsage),
 			"context_management": map[string]interface{}{
 				"applied_edits": []interface{}{},
 			},
@@ -1150,7 +1209,7 @@ func writeWebSearchResponse(
 	if !ok {
 		return 0, fmt.Errorf("streaming web search response is not supported by the response writer")
 	}
-	streamBody, err := renderWebSearchSSE(responseModel, result, content, summary, inputTokens, outputTokens)
+	streamBody, err := renderWebSearchSSEWithCache(responseModel, result, content, summary, inputTokens, outputTokens, cacheUsage)
 	if err != nil {
 		return 0, err
 	}
@@ -1252,6 +1311,10 @@ func opaqueWebSearchValue(kind uint64, sessionID string, parts ...string) string
 
 func generateWebSearchSummary(result *webSearchResultSet) string {
 	var summary strings.Builder
+	if result.Unavailable {
+		fmt.Fprintf(&summary, "Web search for %q is temporarily unavailable. No search results were returned.", result.Query)
+		return summary.String()
+	}
 	fmt.Fprintf(&summary, "Here are the search results for %q:\n\n", result.Query)
 	if len(result.Results) == 0 {
 		summary.WriteString("No results found.\n")
@@ -1282,24 +1345,14 @@ func truncateWebSearchSnippet(value string, maxRunes int) string {
 	return value
 }
 
-func buildWebSearchUsage(inputTokens, outputTokens int) map[string]interface{} {
-	return map[string]interface{}{
-		"input_tokens":                inputTokens,
-		"output_tokens":               outputTokens,
-		"output_tokens_details":       map[string]int{"thinking_tokens": 0},
-		"cache_creation_input_tokens": 0,
-		"cache_read_input_tokens":     0,
-		"cache_creation": map[string]interface{}{
-			"ephemeral_5m_input_tokens": 0,
-			"ephemeral_1h_input_tokens": 0,
-		},
-		"service_tier":  "standard",
-		"inference_geo": "not_available",
-		"server_tool_use": map[string]interface{}{
-			"web_search_requests": 1,
-			"web_fetch_requests":  0,
-		},
+func buildWebSearchUsage(inputTokens, outputTokens int, cacheUsage promptCacheUsage) map[string]interface{} {
+	usage := buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, true)
+	usage["output_tokens_details"] = map[string]int{"thinking_tokens": 0}
+	usage["server_tool_use"] = map[string]interface{}{
+		"web_search_requests": 1,
+		"web_fetch_requests":  0,
 	}
+	return usage
 }
 
 func renderWebSearchSSE(
@@ -1309,8 +1362,19 @@ func renderWebSearchSSE(
 	summary string,
 	inputTokens, outputTokens int,
 ) ([]byte, error) {
+	return renderWebSearchSSEWithCache(model, result, content, summary, inputTokens, outputTokens, promptCacheUsage{})
+}
+
+func renderWebSearchSSEWithCache(
+	model string,
+	result *webSearchResultSet,
+	content []interface{},
+	summary string,
+	inputTokens, outputTokens int,
+	cacheUsage promptCacheUsage,
+) ([]byte, error) {
 	var body bytes.Buffer
-	messageStartUsage := buildWebSearchUsage(inputTokens, 0)
+	messageStartUsage := buildWebSearchUsage(inputTokens, 0, cacheUsage)
 	delete(messageStartUsage, "server_tool_use")
 	delete(messageStartUsage, "output_tokens_details")
 	if err := appendWebSearchSSEEvent(&body, "message_start", map[string]interface{}{
@@ -1390,6 +1454,11 @@ func renderWebSearchSSE(
 	if err := appendWebSearchCitedTextBlock(&body, 2, chunkWebSearchText(summary, webSearchSummaryChunkRunes), citations); err != nil {
 		return nil, err
 	}
+	terminalUsage := buildClaudeTerminalUsageMap(inputTokens, outputTokens, cacheUsage)
+	terminalUsage["server_tool_use"] = map[string]interface{}{
+		"web_search_requests": 1,
+		"web_fetch_requests":  0,
+	}
 	if err := appendWebSearchSSEEvent(&body, "message_delta", map[string]interface{}{
 		"type": "message_delta",
 		"delta": map[string]interface{}{
@@ -1400,17 +1469,7 @@ func renderWebSearchSSE(
 		"context_management": map[string]interface{}{
 			"applied_edits": []interface{}{},
 		},
-		"usage": map[string]interface{}{
-			"input_tokens":                inputTokens,
-			"cache_creation_input_tokens": 0,
-			"cache_read_input_tokens":     0,
-			"output_tokens":               outputTokens,
-			"output_tokens_details":       map[string]int{"thinking_tokens": 0},
-			"server_tool_use": map[string]interface{}{
-				"web_search_requests": 1,
-				"web_fetch_requests":  0,
-			},
-		},
+		"usage": terminalUsage,
 	}); err != nil {
 		return nil, err
 	}

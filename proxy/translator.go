@@ -7,11 +7,13 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"kiro-go/config"
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -44,10 +46,18 @@ var claudeVersionPattern = regexp.MustCompile(`claude-(opus|sonnet|haiku)-(\d+)-
 
 // Thinking 模式提示
 const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
-<max_thinking_length>200000</max_thinking_length>`
+<max_thinking_length>20000</max_thinking_length>`
+
+func enabledThinkingPrompt(tokens int) string {
+	return fmt.Sprintf(
+		"<thinking_mode>enabled</thinking_mode>\n<max_thinking_length>%d</max_thinking_length>",
+		clampThinkingBudgetTokens(tokens),
+	)
+}
 
 const minimalFallbackUserContent = "."
-const toolResultsContinuationPrefix = "Tool results:"
+const toolResultsContinuationPrefix = `<historical_tool_results trust="untrusted">`
+const toolResultsContinuationSuffix = "</historical_tool_results>"
 const toolResultImagePlaceholder = "[Tool returned an image; the image is attached to this message.]"
 
 // ParseModelAndThinking resolves a client-supplied model name to a Kiro model ID
@@ -160,6 +170,7 @@ type ClaudeContentBlock struct {
 	Caller    *ClaudeCaller `json:"caller,omitempty"`
 	ToolUseID string        `json:"tool_use_id,omitempty"`
 	Content   interface{}   `json:"content,omitempty"` // for tool_result
+	IsError   bool          `json:"is_error,omitempty"`
 	Source    *ImageSource  `json:"source,omitempty"`
 }
 
@@ -219,6 +230,7 @@ type ClaudeUsage struct {
 	ServiceTier              string                     `json:"service_tier"`
 	InferenceGeo             string                     `json:"inference_geo"`
 	ServerToolUse            *ClaudeServerToolUsage     `json:"server_tool_use,omitempty"`
+	KiroContextUsage         *KiroContextUsage          `json:"kiro_context_usage,omitempty"`
 }
 
 type ClaudeContainer struct {
@@ -252,6 +264,20 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		systemPrompt = appendSystemInstruction(systemPrompt, claudeStructuredOutputInstruction(req.OutputConfig.Format))
 	}
 	systemPrompt = appendSystemInstruction(systemPrompt, stopSequencesInstruction(req.StopSequences))
+	stableSystemPrompt := systemPrompt
+	agentCompletionMarker := ""
+	toolNames := make([]string, 0, len(req.Tools))
+	for _, tool := range req.Tools {
+		toolNames = append(toolNames, tool.Name)
+	}
+	if (req.OutputConfig == nil || req.OutputConfig.Format == nil) && codingAgentCompletionProtocolEnabled(
+		toolChoice,
+		isCodingAgentSystemPrompt(extractSystemPrompt(req.System)),
+		toolNames,
+	) {
+		agentCompletionMarker = newAgentCompletionMarker()
+		systemPrompt = appendSystemInstruction(systemPrompt, agentCompletionProtocolInstruction(agentCompletionMarker))
+	}
 
 	// 构建历史消息
 	history := make([]KiroHistoryMessage, 0)
@@ -383,10 +409,11 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		payload.StructuredOutputSchema = append(json.RawMessage(nil), req.OutputConfig.Format.Schema...)
 	}
 	payload.ToolChoiceMode = toolChoice.Mode
+	payload.AgentCompletionMarker = agentCompletionMarker
 	payload.ConversationState.ChatTriggerType = "MANUAL"
 	payload.ConversationState.AgentTaskType = "vibe"
 	payload.ConversationState.AgentContinuationId = uuid.New().String()
-	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstClaudeConversationAnchor(req.Messages))
+	payload.ConversationState.ConversationID = buildConversationID(modelID, stableSystemPrompt, firstClaudeConversationAnchor(req.Messages))
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
 		Content: finalContent,
 		ModelID: modelID,
@@ -443,33 +470,40 @@ func claudeThinkingPrompt(req *ClaudeRequest, thinking bool) string {
 	if req == nil || !thinking {
 		return ""
 	}
-	if req.Thinking != nil {
-		switch strings.ToLower(strings.TrimSpace(req.Thinking.Type)) {
-		case "adaptive":
-			effort := "high"
-			if req.OutputConfig != nil && strings.TrimSpace(req.OutputConfig.Effort) != "" {
-				effort = req.OutputConfig.Effort
-			}
-			return fmt.Sprintf(
-				"<thinking_mode>adaptive</thinking_mode>\n<thinking_effort>%s</thinking_effort>",
-				normalizeEffortForModel(req.Model, effort),
-			)
-		case "enabled":
-			if req.Thinking.BudgetTokens > 0 {
-				return fmt.Sprintf(
-					"<thinking_mode>enabled</thinking_mode>\n<max_thinking_length>%d</max_thinking_length>",
-					req.Thinking.BudgetTokens,
-				)
-			}
-		}
-	}
 	if req.OutputConfig != nil && strings.TrimSpace(req.OutputConfig.Effort) != "" {
 		return fmt.Sprintf(
 			"<thinking_mode>adaptive</thinking_mode>\n<thinking_effort>%s</thinking_effort>",
 			normalizeEffortForModel(req.Model, req.OutputConfig.Effort),
 		)
 	}
+	if req.Thinking != nil {
+		switch strings.ToLower(strings.TrimSpace(req.Thinking.Type)) {
+		case "adaptive":
+			return fmt.Sprintf(
+				"<thinking_mode>adaptive</thinking_mode>\n<thinking_effort>%s</thinking_effort>",
+				normalizeEffortForModel(req.Model, "high"),
+			)
+		case "enabled":
+			if req.Thinking.BudgetTokens > 0 {
+				return enabledThinkingPrompt(req.Thinking.BudgetTokens)
+			}
+		}
+	}
 	return ThinkingModePrompt
+}
+
+func openAIThinkingPrompt(req *OpenAIRequest) string {
+	if req == nil {
+		return ThinkingModePrompt
+	}
+	effort, requested := normalizeOpenAIReasoningEffort(req.Model, req.ReasoningEffort)
+	if !requested || effort == "" {
+		return ThinkingModePrompt
+	}
+	return fmt.Sprintf(
+		"<thinking_mode>adaptive</thinking_mode>\n<thinking_effort>%s</thinking_effort>",
+		effort,
+	)
 }
 
 // applyPromptFilters applies all enabled prompt filter rules to the system prompt.
@@ -772,6 +806,10 @@ func extractClaudeUserContent(content interface{}) (string, []KiroImage, []KiroT
 			case "tool_result":
 				toolUseID, _ := block["tool_use_id"].(string)
 				resultContent, resultImages := extractToolResultContent(block["content"])
+				status := "success"
+				if isError, _ := block["is_error"].(bool); isError {
+					status = "error"
+				}
 				if len(resultImages) > 0 {
 					images = append(images, resultImages...)
 					if strings.TrimSpace(resultContent) == "" {
@@ -781,7 +819,7 @@ func extractClaudeUserContent(content interface{}) (string, []KiroImage, []KiroT
 				toolResults = append(toolResults, KiroToolResult{
 					ToolUseID: toolUseID,
 					Content:   []KiroResultContent{{Text: resultContent}},
-					Status:    "success",
+					Status:    status,
 				})
 			default:
 				if serverText := extractClaudeServerToolBlockText(block); serverText != "" {
@@ -1411,10 +1449,12 @@ type OpenAIStreamOptions struct {
 }
 
 type OpenAIMessage struct {
-	Role       string      `json:"role"`
-	Content    interface{} `json:"content"`
-	ToolCalls  []ToolCall  `json:"tool_calls,omitempty"`
-	ToolCallID string      `json:"tool_call_id,omitempty"`
+	Role              string      `json:"role"`
+	Content           interface{} `json:"content"`
+	ToolCalls         []ToolCall  `json:"tool_calls,omitempty"`
+	ToolCallID        string      `json:"tool_call_id,omitempty"`
+	ToolResultStatus  string      `json:"status,omitempty"`
+	ToolResultIsError bool        `json:"is_error,omitempty"`
 }
 
 type ToolCall struct {
@@ -1547,7 +1587,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 
 	// 如果启用 thinking 模式，注入 thinking 提示
 	if thinking {
-		systemPrompt = ThinkingModePrompt + "\n\n" + systemPrompt
+		systemPrompt = openAIThinkingPrompt(req) + "\n\n" + systemPrompt
 	}
 	systemPrompt = appendSystemInstruction(systemPrompt, openAIStructuredOutputInstruction(req.ResponseFormat))
 	toolChoice, _ := resolveToolChoice(req.ToolChoice)
@@ -1555,6 +1595,23 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	systemPrompt = appendSystemInstruction(systemPrompt, openAIAgentToolProtocolInstruction(req, toolChoice))
 	stopSequences, _ := resolveOpenAIStopSequences(req.Stop)
 	systemPrompt = appendSystemInstruction(systemPrompt, stopSequencesInstruction(stopSequences))
+	stableSystemPrompt := systemPrompt
+	agentCompletionMarker := ""
+	toolNames := make([]string, 0, len(req.Tools))
+	for _, tool := range req.Tools {
+		toolNames = append(toolNames, openAIToolName(tool))
+	}
+	structuredOutput := req.ResponseFormat != nil &&
+		(strings.EqualFold(strings.TrimSpace(req.ResponseFormat.Type), "json_object") ||
+			strings.EqualFold(strings.TrimSpace(req.ResponseFormat.Type), "json_schema"))
+	if !structuredOutput && codingAgentCompletionProtocolEnabled(
+		toolChoice,
+		isCodingAgentSystemPrompt(systemPrompt),
+		toolNames,
+	) {
+		agentCompletionMarker = newAgentCompletionMarker()
+		systemPrompt = appendSystemInstruction(systemPrompt, agentCompletionProtocolInstruction(agentCompletionMarker))
+	}
 
 	// 构建历史消息
 	history := make([]KiroHistoryMessage, 0)
@@ -1623,7 +1680,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 			currentToolResults = append(currentToolResults, KiroToolResult{
 				ToolUseID: msg.ToolCallID,
 				Content:   []KiroResultContent{{Text: content}},
-				Status:    "success",
+				Status:    normalizeToolResultStatus(msg.ToolResultStatus, msg.ToolResultIsError),
 			})
 
 			// 检查下一条是否还是 tool
@@ -1719,9 +1776,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	payload := &KiroPayload{}
 	payload.ToolNameMap = toolNameMap
 	payload.StopSequences = append([]string(nil), stopSequences...)
-	payload.StructuredOutput = req.ResponseFormat != nil &&
-		(strings.EqualFold(strings.TrimSpace(req.ResponseFormat.Type), "json_object") ||
-			strings.EqualFold(strings.TrimSpace(req.ResponseFormat.Type), "json_schema"))
+	payload.StructuredOutput = structuredOutput
 	if payload.StructuredOutput {
 		payload.StructuredOutputType = req.ResponseFormat.Type
 		if req.ResponseFormat.JSONSchema != nil {
@@ -1729,8 +1784,9 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		}
 	}
 	payload.ToolChoiceMode = toolChoice.Mode
+	payload.AgentCompletionMarker = agentCompletionMarker
 	payload.ConversationState.ChatTriggerType = "MANUAL"
-	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstOpenAIConversationAnchor(nonSystemMessages))
+	payload.ConversationState.ConversationID = buildConversationID(modelID, stableSystemPrompt, firstOpenAIConversationAnchor(nonSystemMessages))
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
 		Content: finalContent,
 		ModelID: modelID,
@@ -1763,6 +1819,18 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	payload.AdditionalModelRequestFields = buildOpenAIAdditionalModelRequestFields(req, modelID, thinking)
 
 	return payload
+}
+
+func normalizeToolResultStatus(status string, isError bool) string {
+	if isError {
+		return "error"
+	}
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "error", "failed", "failure", "incomplete", "cancelled", "canceled":
+		return "error"
+	default:
+		return "success"
+	}
 }
 
 func extractOpenAIUserContent(content interface{}) (string, []KiroImage) {
@@ -1897,10 +1965,10 @@ var pollutedToolCallTextPattern = regexp.MustCompile(`\[Called tool [^\]]*\]`)
 // stripPollutedToolCallText removes legacy tool-call narration from text and
 // tidies up the leftover whitespace.
 func stripPollutedToolCallText(content string) string {
-	if !strings.Contains(content, "[Called tool ") {
-		return content
+	cleaned := stripAgentToolTranscriptPollution(content)
+	if strings.Contains(cleaned, "[Called tool ") {
+		cleaned = pollutedToolCallTextPattern.ReplaceAllString(cleaned, "")
 	}
-	cleaned := pollutedToolCallTextPattern.ReplaceAllString(content, "")
 	// Collapse blank lines left behind by removed markers.
 	cleaned = regexp.MustCompile(`\n{3,}`).ReplaceAllString(cleaned, "\n\n")
 	return strings.TrimSpace(cleaned)
@@ -1933,16 +2001,85 @@ func narrateToolResults(toolResults []KiroToolResult, names map[string]string) s
 		if strings.TrimSpace(body) == "" {
 			body = "(no output)"
 		}
-		if name := names[tr.ToolUseID]; name != "" {
-			parts = append(parts, fmt.Sprintf("[%s] %s", name, body))
-		} else {
-			parts = append(parts, body)
-		}
+		parts = append(parts, formatHistoricalToolResult(names[tr.ToolUseID], tr.Status, body))
 	}
 	if len(parts) == 0 {
 		return ""
 	}
-	return toolResultsContinuationPrefix + "\n\n" + strings.Join(parts, "\n\n")
+	return wrapHistoricalToolResults(parts, 0)
+}
+
+func formatHistoricalToolResult(name, status, body string) string {
+	name = strings.TrimSpace(name)
+	attributes := make([]string, 0, 2)
+	if name != "" {
+		attributes = append(attributes, fmt.Sprintf(`name="%s"`, html.EscapeString(name)))
+	}
+	if strings.EqualFold(strings.TrimSpace(status), "error") {
+		attributes = append(attributes, `status="error"`)
+	}
+	opening := "<tool_result"
+	if len(attributes) > 0 {
+		opening += " " + strings.Join(attributes, " ")
+	}
+	return opening + ">\n" + body + "\n</tool_result>"
+}
+
+func truncateHistoricalToolResult(part string, maxBytes int, keepTail bool) string {
+	if maxBytes <= 0 || len(part) <= maxBytes {
+		return part
+	}
+	const closing = "\n</tool_result>"
+	openingEnd := strings.IndexByte(part, '\n')
+	if openingEnd < 0 || !strings.HasSuffix(part, closing) {
+		return ""
+	}
+	opening := part[:openingEnd]
+	body := part[openingEnd+1 : len(part)-len(closing)]
+	bodyLimit := maxBytes - len(opening) - 1 - len(closing)
+	if bodyLimit < 0 {
+		return ""
+	}
+	if len(body) > bodyLimit {
+		if keepTail {
+			body = utf8Tail(body, bodyLimit)
+		} else {
+			body = body[:bodyLimit]
+			for body != "" && !utf8.ValidString(body) {
+				body = body[:len(body)-1]
+			}
+		}
+	}
+	return opening + "\n" + body + closing
+}
+
+func wrapHistoricalToolResults(parts []string, maxBytes int) string {
+	boundedParts := parts
+	if maxBytes > 0 {
+		overhead := len(toolResultsContinuationPrefix) + len(toolResultsContinuationSuffix) + 2
+		remaining := maxBytes - overhead
+		boundedParts = make([]string, 0, len(parts))
+		for _, part := range parts {
+			separatorBytes := 0
+			if len(boundedParts) > 0 {
+				separatorBytes = 2
+			}
+			if remaining <= separatorBytes {
+				break
+			}
+			bounded := truncateHistoricalToolResult(part, remaining-separatorBytes, false)
+			if bounded == "" {
+				break
+			}
+			boundedParts = append(boundedParts, bounded)
+			remaining -= separatorBytes + len(bounded)
+			if bounded != part {
+				break
+			}
+		}
+	}
+	body := strings.Join(boundedParts, "\n\n")
+	return toolResultsContinuationPrefix + "\n" + body + "\n" + toolResultsContinuationSuffix
 }
 
 // joinHistoryText combines an existing message body with narrated tool text.
@@ -2118,25 +2255,27 @@ func buildToolResultsContinuation(toolResults []KiroToolResult) string {
 
 	parts := make([]string, 0, len(toolResults))
 	for _, tr := range toolResults {
-		if len(tr.Content) == 0 {
-			continue
-		}
+		texts := make([]string, 0, len(tr.Content))
 		for _, c := range tr.Content {
 			if strings.TrimSpace(c.Text) != "" {
-				parts = append(parts, c.Text)
+				texts = append(texts, c.Text)
 			}
 		}
+		body := strings.Join(texts, "\n")
+		if strings.TrimSpace(body) == "" {
+			if !strings.EqualFold(strings.TrimSpace(tr.Status), "error") {
+				continue
+			}
+			body = "(no output)"
+		}
+		parts = append(parts, formatHistoricalToolResult("", tr.Status, body))
 	}
 
 	if len(parts) == 0 {
 		return minimalFallbackUserContent
 	}
 
-	joined := toolResultsContinuationPrefix + "\n\n" + strings.Join(parts, "\n\n")
-	if len(joined) > 4000 {
-		return joined[:4000]
-	}
-	return joined
+	return wrapHistoricalToolResults(parts, 4000)
 }
 
 func trimLeadingAssistantHistory(history []KiroHistoryMessage) []KiroHistoryMessage {
@@ -2407,7 +2546,11 @@ func KiroToOpenAIResponse(content string, toolUses []KiroToolUse, inputTokens, o
 	finishReason := "stop"
 
 	if len(toolUses) > 0 {
-		msg.Content = nil
+		if content != "" {
+			msg.Content = content
+		} else {
+			msg.Content = nil
+		}
 		msg.ToolCalls = make([]ToolCall, len(toolUses))
 		for i, tu := range toolUses {
 			args, _ := json.Marshal(tu.Input)
@@ -2475,9 +2618,24 @@ func KiroToOpenAIResponseWithReasoning(content, reasoningContent string, toolUse
 	message := map[string]interface{}{
 		"role": "assistant",
 	}
+	formattedContent := content
+	if reasoningContent != "" {
+		switch thinkingFormat {
+		case "thinking":
+			formattedContent = "<thinking>" + reasoningContent + "</thinking>" + content
+		case "think":
+			formattedContent = "<think>" + reasoningContent + "</think>" + content
+		default: // "reasoning_content"
+			message["reasoning_content"] = reasoningContent
+		}
+	}
 
 	if len(toolUses) > 0 {
-		message["content"] = nil
+		if formattedContent != "" {
+			message["content"] = formattedContent
+		} else {
+			message["content"] = nil
+		}
 		toolCalls := make([]map[string]interface{}, len(toolUses))
 		for i, tu := range toolUses {
 			args, _ := json.Marshal(tu.Input)
@@ -2493,20 +2651,7 @@ func KiroToOpenAIResponseWithReasoning(content, reasoningContent string, toolUse
 		message["tool_calls"] = toolCalls
 		finishReason = "tool_calls"
 	} else {
-		// 根据配置格式化 thinking 输出
-		if reasoningContent != "" {
-			switch thinkingFormat {
-			case "thinking":
-				message["content"] = "<thinking>" + reasoningContent + "</thinking>" + content
-			case "think":
-				message["content"] = "<think>" + reasoningContent + "</think>" + content
-			default: // "reasoning_content"
-				message["content"] = content
-				message["reasoning_content"] = reasoningContent
-			}
-		} else {
-			message["content"] = content
-		}
+		message["content"] = formattedContent
 	}
 
 	return map[string]interface{}{

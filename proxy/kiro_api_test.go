@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"context"
+	"fmt"
 	"io"
 	"kiro-go/auth"
 	"kiro-go/config"
@@ -8,9 +10,70 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 )
+
+func TestResolveProfileArnDeduplicatesConcurrentDiscovery(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Init(configPath); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+	account := config.Account{
+		ID:          "singleflight-profile",
+		Email:       "singleflight@example.com",
+		AccessToken: "access-token",
+		Region:      "us-east-1",
+	}
+	if err := config.AddAccount(account); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+
+	var requests atomic.Int32
+	started := make(chan struct{})
+	release := make(chan struct{})
+	kiroRestHttpStore.Store(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		if requests.Add(1) == 1 {
+			close(started)
+		}
+		<-release
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"profiles":[{"arn":"arn:aws:codewhisperer:us-east-1:1:profile/singleflight"}]}`)),
+			Header:     make(http.Header),
+		}, nil
+	})})
+	t.Cleanup(func() { InitKiroHttpClient("") })
+
+	const callers = 24
+	results := make(chan error, callers)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			copyAccount := account
+			arn, err := ResolveProfileArnContext(context.Background(), &copyAccount)
+			if err == nil && arn != "arn:aws:codewhisperer:us-east-1:1:profile/singleflight" {
+				err = fmt.Errorf("unexpected arn %q", arn)
+			}
+			results <- err
+		}()
+	}
+	<-started
+	close(release)
+	wg.Wait()
+	close(results)
+	for err := range results {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("profile discovery requests=%d, want 1", got)
+	}
+}
 
 func TestResolveProfileArnReturnsCachedValueWithoutRequest(t *testing.T) {
 	kiroRestHttpStore.Store(&http.Client{
@@ -74,6 +137,58 @@ func TestRegionalizeURLApiKeyUsesEffectiveApiRegion(t *testing.T) {
 	want := "https://q.eu-central-1.amazonaws.com/getUsageLimits"
 	if got != want {
 		t.Fatalf("api_key REST region: want %q, got %q", want, got)
+	}
+}
+
+func TestListAvailableModelsRegistersLiveTokenLimits(t *testing.T) {
+	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+	const modelID = "unit-live-catalog-model"
+	key := canonicalModelLimitKey(modelID)
+	liveModelTokenLimits.Lock()
+	previous, existed := liveModelTokenLimits.byModel[key]
+	delete(liveModelTokenLimits.byModel, key)
+	liveModelTokenLimits.Unlock()
+	t.Cleanup(func() {
+		liveModelTokenLimits.Lock()
+		defer liveModelTokenLimits.Unlock()
+		if existed {
+			liveModelTokenLimits.byModel[key] = previous
+		} else {
+			delete(liveModelTokenLimits.byModel, key)
+		}
+	})
+
+	kiroRestHttpStore.Store(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path != "/ListAvailableModels" {
+			t.Fatalf("unexpected path %q", req.URL.Path)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body: io.NopCloser(strings.NewReader(`{"models":[{
+				"modelId":"unit-live-catalog-model",
+				"tokenLimits":{"maxInputTokens":333000,"maxOutputTokens":44000}
+			}]}`)),
+			Header: make(http.Header),
+		}, nil
+	})})
+	t.Cleanup(func() { InitKiroHttpClient("") })
+
+	models, err := ListAvailableModels(&config.Account{
+		AuthMethod: "api_key",
+		KiroApiKey: "test-key",
+		Region:     "us-east-1",
+	})
+	if err != nil {
+		t.Fatalf("ListAvailableModels: %v", err)
+	}
+	if len(models) != 1 || models[0].TokenLimits == nil {
+		t.Fatalf("models=%#v", models)
+	}
+	limits := lookupModelTokenLimits(modelID)
+	if limits.MaxInputTokens != 333_000 || limits.MaxOutputTokens != 44_000 {
+		t.Fatalf("registered token limits=%#v", limits)
 	}
 }
 

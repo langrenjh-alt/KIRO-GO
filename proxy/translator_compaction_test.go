@@ -88,8 +88,11 @@ func TestClaudeToKiroFlattensHistoryToolCyclesForCompaction(t *testing.T) {
 	}
 	// Tool identity must be attributed on the user (result) side, never authored
 	// by the assistant.
-	if !strings.Contains(combined, "[exec_command]") {
+	if !strings.Contains(combined, `<tool_result name="exec_command">`) {
 		t.Fatalf("expected tool results to be attributed to exec_command on the user side, got:\n%s", combined)
+	}
+	if strings.Contains(combined, "Tool results:") {
+		t.Fatalf("history retained the mimicable legacy carrier, got:\n%s", combined)
 	}
 }
 

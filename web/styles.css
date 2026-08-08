@@ -571,9 +571,145 @@ select.custom-select-native {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0 1rem;
 }
+
+/* Prompt cache policies */
+.prompt-cache-fallback {
+  padding-bottom: 1.25rem;
+}
+.prompt-cache-section-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+.prompt-cache-section-heading h3 {
+  margin: 0;
+  color: var(--foreground);
+  font-size: 0.875rem;
+  font-weight: 600;
+  line-height: 1.35;
+}
+.prompt-cache-section-heading small {
+  display: block;
+  margin-top: 0.25rem;
+}
+.prompt-cache-policy-section {
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--border);
+}
+.prompt-cache-policy-heading {
+  align-items: center;
+}
+.prompt-cache-policy-heading .btn {
+  flex: none;
+}
+.prompt-cache-policy-list {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+.prompt-cache-policy-state {
+  padding: 1rem;
+  color: var(--muted-foreground);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+.prompt-cache-policy-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.875rem 1rem;
+  background: var(--background);
+}
+.prompt-cache-policy-item + .prompt-cache-policy-item {
+  border-top: 1px solid var(--border);
+}
+.prompt-cache-policy-main {
+  min-width: 0;
+}
+.prompt-cache-policy-title-row,
+.prompt-cache-policy-summary,
+.prompt-cache-policy-bindings,
+.prompt-cache-policy-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.prompt-cache-policy-title-row {
+  gap: 0.5rem;
+}
+.prompt-cache-policy-name {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--foreground);
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+.prompt-cache-policy-mode {
+  display: inline-flex;
+  align-items: center;
+  min-height: 1.375rem;
+  padding: 0.125rem 0.5rem;
+  border-radius: var(--radius-sm);
+  background: var(--muted);
+  color: var(--muted-foreground);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  line-height: 1.2;
+}
+.prompt-cache-policy-summary,
+.prompt-cache-policy-bindings {
+  gap: 0.375rem 0.75rem;
+  margin-top: 0.375rem;
+  color: var(--muted-foreground);
+  font-size: 0.75rem;
+  line-height: 1.4;
+}
+.prompt-cache-policy-bindings i {
+  width: 0.875rem;
+  text-align: center;
+}
+.prompt-cache-policy-actions {
+  justify-content: flex-end;
+  gap: 0.5rem;
+}
+.modal-content.prompt-cache-policy-modal-content {
+  width: min(760px, 90vw);
+}
+.api-key-policy-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.375rem;
+  color: var(--muted-foreground);
+  font-size: 0.75rem;
+}
+.api-key-policy-name {
+  color: var(--foreground);
+  font-weight: 500;
+}
+.api-key-policy-name.is-missing {
+  color: var(--destructive);
+}
 @media (max-width: 640px) {
   .form-grid {
     grid-template-columns: 1fr;
+  }
+  .prompt-cache-section-heading,
+  .prompt-cache-policy-item {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+  .prompt-cache-section-heading {
+    flex-direction: column;
+  }
+  .prompt-cache-policy-heading .btn {
+    align-self: flex-start;
+  }
+  .prompt-cache-policy-actions {
+    justify-content: flex-start;
   }
 }
 .form-group-lg {
@@ -1373,12 +1509,16 @@ img.brand-icon {
 .err-badge--suspended { background: #fecaca; color: #7f1d1d; }
 .err-badge--overage { background: #ffedd5; color: #9a3412; }
 .err-badge--profile { background: #e0e7ff; color: #3730a3; }
+.err-badge--websearch { background: #dcfce7; color: #166534; }
+.err-badge--agent { background: #e0f2fe; color: #075985; }
 .err-badge--unknown { background: var(--muted); color: var(--muted-foreground); }
 [data-theme="dark"] .err-badge--quota { background: #451a03; color: #fde68a; }
 [data-theme="dark"] .err-badge--auth { background: #450a0a; color: #fca5a5; }
 [data-theme="dark"] .err-badge--suspended { background: #450a0a; color: #fca5a5; }
 [data-theme="dark"] .err-badge--overage { background: #431407; color: #fdba74; }
 [data-theme="dark"] .err-badge--profile { background: #1e1b4b; color: #a5b4fc; }
+[data-theme="dark"] .err-badge--websearch { background: #052e16; color: #86efac; }
+[data-theme="dark"] .err-badge--agent { background: #082f49; color: #7dd3fc; }
 
 /* Login screen */
 .login-wrapper {

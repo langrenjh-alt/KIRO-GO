@@ -46,9 +46,11 @@ func main() {
 	if err := config.Init(configPath); err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
-
 	// Initialize log level: LOG_LEVEL env var takes priority over config, defaulting to "info".
 	logger.Init(config.GetLogLevel())
+	usageFlusher := config.StartApiKeyUsageFlusher(config.DefaultApiKeyUsageFlushInterval, func(err error) {
+		logger.Warnf("API key usage flush failed: %v", err)
+	})
 
 	// 环境变量覆盖密码
 	if envPassword := os.Getenv("ADMIN_PASSWORD"); envPassword != "" {
@@ -99,12 +101,18 @@ func main() {
 		handler.Close()
 		err = <-serverErr
 		if shutdownErr != nil {
+			if flushErr := usageFlusher.Close(); flushErr != nil {
+				logger.Errorf("Final API key usage flush failed: %v", flushErr)
+			}
 			logger.Fatalf("Server shutdown failed: %v", shutdownErr)
 		}
 	}
 
 	// ListenAndServe returns ErrServerClosed after a graceful shutdown.
 	handler.Close()
+	if flushErr := usageFlusher.Close(); flushErr != nil {
+		logger.Errorf("Final API key usage flush failed: %v", flushErr)
+	}
 	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logger.Fatalf("Server failed: %v", err)
 	}

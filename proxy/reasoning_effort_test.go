@@ -16,14 +16,31 @@ func TestEffortFromBudgetTokensBoundaries(t *testing.T) {
 		{tokens: 4_001, want: "medium"},
 		{tokens: 16_000, want: "medium"},
 		{tokens: 16_001, want: "high"},
+		{tokens: 24_576, want: "high"},
 		{tokens: 64_000, want: "high"},
-		{tokens: 64_001, want: "xhigh"},
+		{tokens: 64_001, want: "high"},
+		{tokens: 200_000, want: "high"},
 	}
 
 	for _, tc := range tests {
 		if got := effortFromBudgetTokens(tc.tokens); got != tc.want {
 			t.Fatalf("effortFromBudgetTokens(%d) = %q, want %q", tc.tokens, got, tc.want)
 		}
+	}
+}
+
+func TestThinkingBudgetDefaultsAndClamp(t *testing.T) {
+	if defaultThinkingBudgetTokens != 20_000 {
+		t.Fatalf("default thinking budget = %d, want 20000", defaultThinkingBudgetTokens)
+	}
+	if maxThinkingBudgetTokens != 24_576 {
+		t.Fatalf("maximum thinking budget = %d, want 24576", maxThinkingBudgetTokens)
+	}
+	if got := enabledThinkingPrompt(defaultThinkingBudgetTokens); got != ThinkingModePrompt {
+		t.Fatalf("default thinking prompt = %q, want %q", got, ThinkingModePrompt)
+	}
+	if got := clampThinkingBudgetTokens(200_000); got != maxThinkingBudgetTokens {
+		t.Fatalf("clamped budget = %d, want %d", got, maxThinkingBudgetTokens)
 	}
 }
 
@@ -211,6 +228,32 @@ func TestClaudeThinkingPromptMatchesRequestedMode(t *testing.T) {
 		}
 	})
 
+	t.Run("enabled clamps oversized client budget", func(t *testing.T) {
+		req := &ClaudeRequest{
+			Model:    "claude-opus-4.8",
+			Thinking: &ClaudeThinkingConfig{Type: "enabled", BudgetTokens: 200_000},
+		}
+		got := claudeThinkingPrompt(req, true)
+		want := "<thinking_mode>enabled</thinking_mode>\n<max_thinking_length>24576</max_thinking_length>"
+		if got != want {
+			t.Fatalf("oversized enabled prompt = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("adaptive xhigh and max do not carry a legacy budget", func(t *testing.T) {
+		for _, effort := range []string{"xhigh", "max"} {
+			req := &ClaudeRequest{
+				Model:        "claude-opus-4.8",
+				Thinking:     &ClaudeThinkingConfig{Type: "adaptive"},
+				OutputConfig: &ClaudeOutputConfig{Effort: effort},
+			}
+			got := claudeThinkingPrompt(req, true)
+			if strings.Contains(got, "max_thinking_length") || !strings.Contains(got, "<thinking_effort>"+effort+"</thinking_effort>") {
+				t.Fatalf("adaptive %s prompt = %q", effort, got)
+			}
+		}
+	})
+
 	t.Run("effort-only request uses adaptive prompt", func(t *testing.T) {
 		req := &ClaudeRequest{
 			Model:        "claude-opus-4.8",
@@ -290,6 +333,38 @@ func TestOpenAIReasoningEffortNoneAndMinimal(t *testing.T) {
 		t.Fatal("minimal must enable the nearest supported reasoning tier")
 	}
 	assertPayloadEffort(t, OpenAIToKiro(minimalReq, thinking), "low")
+}
+
+func TestOpenAIThinkingPromptUsesExplicitEffort(t *testing.T) {
+	for _, effort := range []string{"xhigh", "max"} {
+		req := &OpenAIRequest{Model: "claude-opus-4.8", ReasoningEffort: effort}
+		got := openAIThinkingPrompt(req)
+		if strings.Contains(got, "max_thinking_length") || !strings.Contains(got, "<thinking_effort>"+effort+"</thinking_effort>") {
+			t.Fatalf("OpenAI %s prompt = %q", effort, got)
+		}
+	}
+	minimal := openAIThinkingPrompt(&OpenAIRequest{Model: "claude-opus-4.8", ReasoningEffort: "minimal"})
+	if !strings.Contains(minimal, "<thinking_effort>low</thinking_effort>") {
+		t.Fatalf("OpenAI minimal prompt = %q", minimal)
+	}
+}
+
+func TestOpenAIToKiroCarriesAdaptiveEffortPrompt(t *testing.T) {
+	for _, effort := range []string{"low", "medium", "high", "xhigh", "max"} {
+		req := &OpenAIRequest{
+			Model:           "claude-opus-4.8",
+			Messages:        []OpenAIMessage{{Role: "user", Content: "test"}},
+			ReasoningEffort: effort,
+		}
+		payload := OpenAIToKiro(req, true)
+		if len(payload.ConversationState.History) < 1 || payload.ConversationState.History[0].UserInputMessage == nil {
+			t.Fatalf("OpenAI %s payload is missing the system priming message", effort)
+		}
+		prompt := payload.ConversationState.History[0].UserInputMessage.Content
+		if strings.Contains(prompt, "max_thinking_length") || !strings.Contains(prompt, "<thinking_effort>"+effort+"</thinking_effort>") {
+			t.Fatalf("OpenAI %s priming prompt = %q", effort, prompt)
+		}
+	}
 }
 
 func TestResponsesReasoningEffortNestedPrecedesTopLevelAlias(t *testing.T) {

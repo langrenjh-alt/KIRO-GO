@@ -14,6 +14,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"kiro-go/logger"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -202,13 +203,14 @@ type PromptFilterRule struct {
 // Limits with value 0 are treated as "no limit". Counters are cumulative and never reset
 // automatically; operators can use the admin endpoint to manually reset them.
 type ApiKeyEntry struct {
-	ID         string `json:"id"`                 // Unique identifier (UUID)
-	Name       string `json:"name,omitempty"`     // Human-readable label
-	Key        string `json:"key"`                // The actual key value clients send
-	Enabled    bool   `json:"enabled"`            // Whether this key may authenticate
-	Migrated   bool   `json:"migrated,omitempty"` // True if migrated from legacy single ApiKey field
-	CreatedAt  int64  `json:"createdAt"`          // Creation timestamp (Unix seconds)
-	LastUsedAt int64  `json:"lastUsedAt,omitempty"`
+	ID                  string `json:"id"`                            // Unique identifier (UUID)
+	Name                string `json:"name,omitempty"`                // Human-readable label
+	Key                 string `json:"key"`                           // The actual key value clients send
+	Enabled             bool   `json:"enabled"`                       // Whether this key may authenticate
+	Migrated            bool   `json:"migrated,omitempty"`            // True if migrated from legacy single ApiKey field
+	PromptCachePolicyID string `json:"promptCachePolicyId,omitempty"` // Empty uses the global prompt-cache settings
+	CreatedAt           int64  `json:"createdAt"`                     // Creation timestamp (Unix seconds)
+	LastUsedAt          int64  `json:"lastUsedAt,omitempty"`
 
 	// Limits (0 = unlimited)
 	TokenLimit  int64   `json:"tokenLimit,omitempty"`
@@ -229,10 +231,13 @@ type Config struct {
 	ApiKey        string        `json:"apiKey,omitempty"`  // [Deprecated] Legacy single API key, migrated into ApiKeys on first load
 	RequireApiKey bool          `json:"requireApiKey"`     // [Deprecated] Whether to enforce API key validation; with multi-key support, len(ApiKeys)>0 implicitly enforces auth
 	ApiKeys       []ApiKeyEntry `json:"apiKeys,omitempty"` // Multiple API keys, each with independent quota
-	KiroVersion   string        `json:"kiroVersion,omitempty"`
-	SystemVersion string        `json:"systemVersion,omitempty"`
-	NodeVersion   string        `json:"nodeVersion,omitempty"`
-	Accounts      []Account     `json:"accounts"` // Registered Kiro accounts
+	// PromptCachePolicies are named prompt-cache configurations that API keys may
+	// reference. An unbound API key continues to use the legacy global fields.
+	PromptCachePolicies []PromptCachePolicy `json:"promptCachePolicies,omitempty"`
+	KiroVersion         string              `json:"kiroVersion,omitempty"`
+	SystemVersion       string              `json:"systemVersion,omitempty"`
+	NodeVersion         string              `json:"nodeVersion,omitempty"`
+	Accounts            []Account           `json:"accounts"` // Registered Kiro accounts
 
 	// Thinking mode configuration for extended reasoning output
 	ThinkingSuffix       string `json:"thinkingSuffix,omitempty"`       // Model suffix to trigger thinking mode (default: "-thinking")
@@ -355,9 +360,11 @@ const (
 )
 
 var (
-	cfg     *Config
-	cfgLock sync.RWMutex
-	cfgPath string
+	cfg              *Config
+	cfgLock          sync.RWMutex
+	cfgPath          string
+	cfgProcessLock   configProcessLock
+	cfgProcessLockID string
 )
 
 // Init initializes the configuration system with the specified file path.
@@ -365,19 +372,102 @@ var (
 func Init(path string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
+	lockID, err := configPathIdentity(path)
+	if err != nil {
+		return err
+	}
+	reuseProcessLock := cfgProcessLock != nil && sameConfigPathIdentity(cfgProcessLockID, lockID)
+	lock := cfgProcessLock
+	if !reuseProcessLock {
+		lock, err = acquireConfigProcessLock(lockID)
+		if err != nil {
+			return configPathLockError(path, err)
+		}
+	}
+
+	preserveApiKeyUsage := cfg != nil && reuseProcessLock
+	previousCfg, previousPath := cfg, cfgPath
+	if preserveApiKeyUsage {
+		if err := flushApiKeyUsageLocked(); err != nil {
+			return err
+		}
+	}
 	cfgPath = path
-	return loadLocked()
+	if err := loadLocked(preserveApiKeyUsage); err != nil {
+		// Keep a previously working configuration and lock when a reload fails.
+		// A failed second-instance startup must not release the owner lock.
+		cfg, cfgPath = previousCfg, previousPath
+		if !reuseProcessLock {
+			_ = lock.Close()
+		}
+		return err
+	}
+	if !reuseProcessLock {
+		if cfgProcessLock != nil {
+			_ = cfgProcessLock.Close()
+		}
+		cfgProcessLock = lock
+		cfgProcessLockID = lockID
+	}
+	return nil
 }
 
 func Load() error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	return loadLocked()
+	acquiredProcessLock := false
+	if cfgProcessLock == nil && cfgPath != "" {
+		lockID, err := configPathIdentity(cfgPath)
+		if err != nil {
+			return err
+		}
+		lock, err := acquireConfigProcessLock(lockID)
+		if err != nil {
+			return configPathLockError(cfgPath, err)
+		}
+		cfgProcessLock = lock
+		cfgProcessLockID = lockID
+		acquiredProcessLock = true
+	}
+	if cfg != nil {
+		if err := flushApiKeyUsageLocked(); err != nil {
+			if acquiredProcessLock {
+				_ = cfgProcessLock.Close()
+				cfgProcessLock = nil
+				cfgProcessLockID = ""
+			}
+			return err
+		}
+	}
+	if err := loadLocked(true); err != nil {
+		if acquiredProcessLock {
+			_ = cfgProcessLock.Close()
+			cfgProcessLock = nil
+			cfgProcessLockID = ""
+		}
+		return err
+	}
+	return nil
+}
+
+// Close releases the process-wide configuration lock. The lock is also
+// released automatically when the process exits; this method is useful for
+// graceful shutdowns and tests that switch configuration files explicitly.
+func Close() error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfgProcessLock == nil {
+		return nil
+	}
+	err := cfgProcessLock.Close()
+	cfgProcessLock = nil
+	cfgProcessLockID = ""
+	return err
 }
 
 // loadLocked replaces the in-memory configuration from cfgPath. The caller
 // must hold cfgLock so Init cannot switch paths while another save is running.
-func loadLocked() error {
+func loadLocked(preserveApiKeyUsage bool) error {
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -390,6 +480,7 @@ func loadLocked() error {
 				RequireApiKey: false,
 				Accounts:      []Account{},
 			}
+			rebuildApiKeyUsageStatesLocked(preserveApiKeyUsage)
 			return saveLocked()
 		}
 		return err
@@ -400,6 +491,7 @@ func loadLocked() error {
 		return err
 	}
 	cfg = &c
+	dirty := false
 
 	// Migration: if a legacy single ApiKey is present and the new ApiKeys list is empty,
 	// promote it into the new structure. The migrated entry inherits the legacy
@@ -407,18 +499,25 @@ func loadLocked() error {
 	// we mark the entry disabled so it doesn't accidentally start enforcing auth.
 	// Operators can flip it on later from the admin UI. The legacy field is kept
 	// for backward compatibility when reading older config files.
-	if cfg.ApiKey != "" && len(cfg.ApiKeys) == 0 {
+	legacyAPIKey := strings.TrimSpace(cfg.ApiKey)
+	if cfg.ApiKey != legacyAPIKey {
+		cfg.ApiKey = legacyAPIKey
+		dirty = true
+	}
+	if legacyAPIKey != "" && len(cfg.ApiKeys) == 0 {
 		cfg.ApiKeys = append(cfg.ApiKeys, ApiKeyEntry{
 			ID:        newUUID(),
 			Name:      "legacy",
-			Key:       cfg.ApiKey,
+			Key:       legacyAPIKey,
 			Enabled:   cfg.RequireApiKey,
 			Migrated:  true,
 			CreatedAt: time.Now().Unix(),
 		})
-		if err := saveLocked(); err != nil {
-			return err
-		}
+		dirty = true
+	}
+
+	if normalizeLoadedPromptCacheBindingsLocked() {
+		dirty = true
 	}
 
 	// Migration: per-account AllowOverage → OverageStatus.
@@ -428,22 +527,123 @@ func loadLocked() error {
 	// previously-allowed accounts on first launch, treat allowOverage=true as
 	// OverageStatus="ENABLED" (operators can refresh from AWS later). The
 	// legacy field is then cleared so future saves don't re-emit it.
-	overageMigrated := false
 	for i := range cfg.Accounts {
 		if cfg.Accounts[i].LegacyAllowOverage {
 			if cfg.Accounts[i].OverageStatus == "" {
 				cfg.Accounts[i].OverageStatus = "ENABLED"
 			}
 			cfg.Accounts[i].LegacyAllowOverage = false
-			overageMigrated = true
+			dirty = true
 		}
 	}
-	if overageMigrated {
+
+	// Publish the normalized IDs before saving so a different-path Init cannot
+	// accidentally merge pending usage from the previous configuration. A
+	// same-path Load still reuses states for IDs that remained stable.
+	rebuildApiKeyUsageStatesLocked(preserveApiKeyUsage)
+	if dirty {
 		if err := saveLocked(); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// normalizeLoadedPromptCacheBindingsLocked repairs identity and reference
+// fields that may have been hand-edited or written by older releases. The
+// caller persists the returned dirty state together with all other migrations.
+func normalizeLoadedPromptCacheBindingsLocked() bool {
+	dirty := false
+	usedPolicyIDs := make(map[string]struct{}, len(cfg.PromptCachePolicies))
+	for i := range cfg.PromptCachePolicies {
+		policy := &cfg.PromptCachePolicies[i]
+		originalID := policy.ID
+		id := strings.TrimSpace(originalID)
+		_, duplicate := usedPolicyIDs[id]
+		if id == "" || duplicate {
+			id = newUniqueConfigID(usedPolicyIDs)
+			logger.Warnf("[Config] repaired prompt-cache policy ID at index %d (blank=%t duplicate=%t); new ID=%s", i, strings.TrimSpace(originalID) == "", duplicate, id)
+		}
+		if policy.ID != id {
+			policy.ID = id
+			dirty = true
+		}
+		usedPolicyIDs[id] = struct{}{}
+
+		name := strings.TrimSpace(policy.Name)
+		if policy.Name != name {
+			policy.Name = name
+			dirty = true
+		}
+	}
+
+	usedAPIKeyIDs := make(map[string]struct{}, len(cfg.ApiKeys))
+	firstAPIKeyByValue := make(map[string]string, len(cfg.ApiKeys))
+	for i := range cfg.ApiKeys {
+		entry := &cfg.ApiKeys[i]
+		id := strings.TrimSpace(entry.ID)
+		_, duplicateID := usedAPIKeyIDs[id]
+		if id == "" || duplicateID {
+			id = newUniqueConfigID(usedAPIKeyIDs)
+			logger.Warnf("[Config] repaired API key ID at index %d (blank=%t duplicate=%t); new ID=%s", i, strings.TrimSpace(entry.ID) == "", duplicateID, id)
+		}
+		if entry.ID != id {
+			entry.ID = id
+			dirty = true
+		}
+		usedAPIKeyIDs[id] = struct{}{}
+
+		name := strings.TrimSpace(entry.Name)
+		if entry.Name != name {
+			entry.Name = name
+			dirty = true
+		}
+		key := strings.TrimSpace(entry.Key)
+		if entry.Key != key {
+			entry.Key = key
+			dirty = true
+		}
+		if key == "" {
+			if entry.Enabled {
+				entry.Enabled = false
+				dirty = true
+			}
+			logger.Warnf("[Config] disabled API key %s at index %d because its value is empty after trimming", entry.ID, i)
+		} else if firstID, duplicate := firstAPIKeyByValue[key]; duplicate {
+			if entry.Enabled {
+				entry.Enabled = false
+				dirty = true
+			}
+			logger.Warnf("[Config] disabled duplicate API key %s at index %d; value is already owned by API key %s", entry.ID, i, firstID)
+		} else {
+			firstAPIKeyByValue[key] = entry.ID
+		}
+
+		policyID := strings.TrimSpace(entry.PromptCachePolicyID)
+		if policyID != "" {
+			if _, exists := usedPolicyIDs[policyID]; !exists {
+				// Keep the reference intact. A policy can be temporarily absent
+				// during an external restore or a mixed-version write; runtime
+				// resolution already falls back to global settings and retaining the
+				// ID lets the binding recover automatically when the policy returns.
+				logger.Warnf("[Config] preserving dangling prompt-cache policy binding %q from API key %s", policyID, entry.ID)
+			}
+		}
+		if entry.PromptCachePolicyID != policyID {
+			entry.PromptCachePolicyID = policyID
+			dirty = true
+		}
+	}
+	return dirty
+}
+
+func newUniqueConfigID(used map[string]struct{}) string {
+	for {
+		id := newUUID()
+		if _, exists := used[id]; !exists {
+			return id
+		}
+	}
 }
 
 // saveLocked persists cfg to disk. Caller MUST already hold cfgLock.
@@ -461,7 +661,7 @@ func newUUID() string {
 // Save persists the current configuration without exposing a partially written
 // JSON file if the process or filesystem fails during the write.
 func Save() error {
-	data, err := json.MarshalIndent(cfg, "", "  ")
+	data, err := json.MarshalIndent(configSnapshotWithApiKeyUsageLocked(), "", "  ")
 	if err != nil {
 		return err
 	}

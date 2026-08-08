@@ -17,10 +17,17 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 )
 
 const defaultPromptCacheTTL = 5 * time.Minute
 const promptCachePersistenceVersion = 2
+
+// Request work stays bounded even when a large cache expires at once. The
+// save-loop maintenance pass drains larger batches away from the TTFT path.
+const promptCacheRequestPruneLimit = 32
+const promptCacheMaintenancePruneLimit = 512
+const promptCacheMaintenanceInterval = time.Second
 
 // Anthropic requires cached prefixes to reach a minimum token count before
 // caching takes effect. Breakpoints below this threshold are excluded from
@@ -47,10 +54,13 @@ type promptCacheProfile struct {
 	TotalInputTokens           int
 	Model                      string
 	IsolationSeed              string
+	MaxCacheReadRatio          float64
 	SimulatedFunctionCache     bool
 	SimulatedHitRatePercent    int
 	SimulatedMaxReadPercent    int
 	SimulatedMinCacheableToken int
+	runtimeTracker             *promptCacheTracker
+	requestTiming              *requestTiming
 }
 
 func minCacheableTokensForModel(model string) int {
@@ -69,6 +79,12 @@ type promptCacheEntry struct {
 }
 
 type simulatedFunctionCacheEntry struct {
+	ExpiresAt  time.Time
+	TTL        time.Duration
+	expiryItem *promptCacheExpiryItem
+}
+
+type promptCachePersistentEntry struct {
 	ExpiresAt time.Time
 	TTL       time.Duration
 }
@@ -106,14 +122,22 @@ func (h *promptCacheExpiryHeap) Pop() interface{} {
 }
 
 type promptCacheTracker struct {
+	policyMu              sync.Mutex
+	policyRevision        uint64
 	mu                    sync.Mutex
 	entries               map[[32]byte]*promptCacheEntry
-	functionEntries       map[[32]byte]simulatedFunctionCacheEntry
 	order                 *list.List // front = most-recently-used; Element.Value = [32]byte fingerprint
 	expiryQueue           promptCacheExpiryHeap
 	maxEntries            int
 	maxSupportedTTL       time.Duration
 	defaultTTL            time.Duration
+	functionMu            sync.Mutex
+	functionEntries       map[[32]byte]simulatedFunctionCacheEntry
+	functionExpiryQueue   promptCacheExpiryHeap
+	functionMaxEntries    int
+	persistentEntries     sync.Map // [32]byte -> promptCachePersistentEntry; flushes never range t.entries under t.mu
+	persistenceRevision   uint64   // protected by mu; prevents an older snapshot from clearing newer mutations
+	flushMu               sync.Mutex
 	hits                  int64 // atomic — Compute calls returning CacheReadInputTokens > 0
 	misses                int64 // atomic — Compute calls returning CacheReadInputTokens == 0
 	evictions             int64 // atomic — LRU pop-backs in evictOverflowLocked
@@ -136,12 +160,13 @@ func newPromptCacheTrackerWithCapacity(maxTTL time.Duration, maxEntries int) *pr
 		maxTTL = defaultPromptCacheTTL
 	}
 	return &promptCacheTracker{
-		entries:         make(map[[32]byte]*promptCacheEntry),
-		functionEntries: make(map[[32]byte]simulatedFunctionCacheEntry),
-		order:           list.New(),
-		maxEntries:      maxEntries,
-		maxSupportedTTL: maxTTL,
-		defaultTTL:      defaultPromptCacheTTL,
+		entries:            make(map[[32]byte]*promptCacheEntry),
+		functionEntries:    make(map[[32]byte]simulatedFunctionCacheEntry),
+		order:              list.New(),
+		maxEntries:         maxEntries,
+		functionMaxEntries: maxEntries,
+		maxSupportedTTL:    maxTTL,
+		defaultTTL:         defaultPromptCacheTTL,
 	}
 }
 
@@ -183,7 +208,7 @@ func (t *promptCacheTracker) Load(path string) {
 	entriesBefore := len(t.entries)
 	t.evictOverflowLocked()
 	if len(t.entries) != entriesBefore {
-		t.dirty = true
+		t.markDirtyLocked()
 	}
 }
 
@@ -195,12 +220,16 @@ func (t *promptCacheTracker) startSaveLoop(path string, flushInterval time.Durat
 	t.stopDone = make(chan struct{})
 	go func() {
 		defer close(t.stopDone)
-		ticker := time.NewTicker(flushInterval)
-		defer ticker.Stop()
+		flushTicker := time.NewTicker(flushInterval)
+		defer flushTicker.Stop()
+		maintenanceTicker := time.NewTicker(promptCacheMaintenanceInterval)
+		defer maintenanceTicker.Stop()
 		for {
 			select {
-			case <-ticker.C:
+			case <-flushTicker.C:
 				t.flush(path)
+			case <-maintenanceTicker.C:
+				t.pruneExpiredBackground(time.Now())
 			case <-t.stopChan:
 				t.flush(path) // final flush
 				return
@@ -226,26 +255,19 @@ func (t *promptCacheTracker) Stop() {
 }
 
 func (t *promptCacheTracker) flush(path string) {
+	t.flushMu.Lock()
+	defer t.flushMu.Unlock()
+
 	t.mu.Lock()
 	if !t.dirty {
 		t.mu.Unlock()
 		return
 	}
-	now := time.Now()
-	entries := make([]promptCacheEntryOnDisk, 0, len(t.entries))
-	for fp, e := range t.entries {
-		if !e.ExpiresAt.After(now) {
-			continue
-		}
-		entries = append(entries, promptCacheEntryOnDisk{
-			Fingerprint: fp,
-			ExpiresAt:   e.ExpiresAt.Unix(),
-			TTLSeconds:  int64(e.TTL.Seconds()),
-		})
-	}
-	t.dirty = false
+	revision := t.persistenceRevision
+	entryCount := len(t.entries)
 	t.mu.Unlock()
 
+	entries := t.snapshotPersistentEntries(time.Now(), entryCount)
 	data, err := json.MarshalIndent(map[string]interface{}{
 		"version": promptCachePersistenceVersion,
 		"entries": entries,
@@ -253,12 +275,42 @@ func (t *promptCacheTracker) flush(path string) {
 	if err == nil {
 		err = writeFileAtomic(path, data)
 	}
+	t.mu.Lock()
 	if err != nil {
-		t.mu.Lock()
 		t.dirty = true
-		t.mu.Unlock()
+	} else if t.persistenceRevision == revision {
+		// A concurrent Compute/Update leaves dirty set so its newer generation
+		// is guaranteed to reach a later flush.
+		t.dirty = false
+	}
+	t.mu.Unlock()
+	if err != nil {
 		logger.Warnf("[PromptCache] failed to persist cache state: %v", err)
 	}
+}
+
+// snapshotPersistentEntries intentionally ranges the shadow index without
+// holding t.mu. sync.Map permits concurrent refreshes/deletes; revision
+// checking in flush ensures a mixed snapshot can never clear newer work.
+func (t *promptCacheTracker) snapshotPersistentEntries(now time.Time, capacityHint int) []promptCacheEntryOnDisk {
+	entries := make([]promptCacheEntryOnDisk, 0, capacityHint)
+	t.persistentEntries.Range(func(key, value interface{}) bool {
+		fp, ok := key.([32]byte)
+		if !ok {
+			return true
+		}
+		entry, ok := value.(promptCachePersistentEntry)
+		if !ok || !entry.ExpiresAt.After(now) {
+			return true
+		}
+		entries = append(entries, promptCacheEntryOnDisk{
+			Fingerprint: fp,
+			ExpiresAt:   entry.ExpiresAt.Unix(),
+			TTLSeconds:  int64(entry.TTL.Seconds()),
+		})
+		return true
+	})
+	return entries
 }
 
 // writeFileAtomic writes data to path via a temp file in the same directory
@@ -366,8 +418,20 @@ func defaultPromptCachePrefixBreakpointIndex(blocks []cacheablePromptBlock) int 
 }
 
 func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTokens int, isolationSeeds ...string) *promptCacheProfile {
-	if config.GetCacheMode() == config.CacheModeFunctionSimulation {
-		return buildSimulatedFunctionCacheProfile(req, totalInputTokens, config.GetFunctionCacheConfig())
+	policy := config.ResolvePromptCachePolicyForAPIKey("")
+	policy.PromptCacheTTLSeconds = int(t.DefaultTTL() / time.Second)
+	return t.BuildClaudeProfileWithPolicy(req, totalInputTokens, policy, isolationSeeds...)
+}
+
+// BuildClaudeProfileWithPolicy snapshots all request-scoped cache controls into
+// the profile so a concurrent policy edit cannot mix old and new settings.
+func (t *promptCacheTracker) BuildClaudeProfileWithPolicy(req *ClaudeRequest, totalInputTokens int, policy config.PromptCachePolicy, isolationSeeds ...string) *promptCacheProfile {
+	if policy.CacheMode == config.CacheModeFunctionSimulation {
+		profile := buildSimulatedFunctionCacheProfile(req, totalInputTokens, policy.FunctionCache)
+		if profile != nil {
+			profile.runtimeTracker = t
+		}
+		return profile
 	}
 	isolationSeed := ""
 	if len(isolationSeeds) > 0 {
@@ -378,8 +442,12 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 		return nil
 	}
 
+	defaultTTL := time.Duration(policy.PromptCacheTTLSeconds) * time.Second
+	if defaultTTL != time.Hour {
+		defaultTTL = defaultPromptCacheTTL
+	}
 	hasExplicitCacheControl := claudeRequestHasCacheControl(req)
-	blocks := flattenClaudeCacheBlocks(req, t.DefaultTTL())
+	blocks := flattenClaudeCacheBlocks(req, defaultTTL)
 	if len(blocks) == 0 {
 		atomic.AddInt64(&t.skippedNoBreakpoints, 1)
 		return nil
@@ -429,7 +497,6 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 			// marker's TTL at this or later message boundaries.
 			activeTTL = 0
 		} else if !hasExplicitCacheControl && (blockIndex == defaultPrefixBreakpointIndex || block.IsMessageEnd) {
-			defaultTTL := t.DefaultTTL()
 			if activeTTL != defaultTTL {
 				writePromptCachePolicyChange(policyHasher, hasher, defaultTTL)
 			}
@@ -462,20 +529,34 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 	}
 
 	return &promptCacheProfile{
-		Breakpoints:      breakpoints,
-		TotalInputTokens: totalInputTokens,
-		Model:            req.Model,
-		IsolationSeed:    isolationSeed,
+		Breakpoints:       breakpoints,
+		TotalInputTokens:  totalInputTokens,
+		Model:             req.Model,
+		IsolationSeed:     isolationSeed,
+		MaxCacheReadRatio: policy.PromptCacheMaxRatio,
+		runtimeTracker:    t,
 	}
 }
 
 // BuildClaudeProfileForRequest preserves the native cache's tenant isolation
 // while allowing function simulation to fingerprint the original request body.
 func (t *promptCacheTracker) BuildClaudeProfileForRequest(req *ClaudeRequest, totalInputTokens int, isolationSeed, requestBodyFingerprint string) *promptCacheProfile {
-	if config.GetCacheMode() == config.CacheModeFunctionSimulation {
-		return buildSimulatedFunctionCacheProfile(req, totalInputTokens, config.GetFunctionCacheConfig(), requestBodyFingerprint)
+	policy := config.ResolvePromptCachePolicyForAPIKey("")
+	policy.PromptCacheTTLSeconds = int(t.DefaultTTL() / time.Second)
+	return t.BuildClaudeProfileForRequestWithPolicy(req, totalInputTokens, isolationSeed, requestBodyFingerprint, policy)
+}
+
+// BuildClaudeProfileForRequestWithPolicy is the request-body-aware variant used
+// by the handler after resolving the calling API key's named policy.
+func (t *promptCacheTracker) BuildClaudeProfileForRequestWithPolicy(req *ClaudeRequest, totalInputTokens int, isolationSeed, requestBodyFingerprint string, policy config.PromptCachePolicy) *promptCacheProfile {
+	if policy.CacheMode == config.CacheModeFunctionSimulation {
+		profile := buildSimulatedFunctionCacheProfile(req, totalInputTokens, policy.FunctionCache, requestBodyFingerprint)
+		if profile != nil {
+			profile.runtimeTracker = t
+		}
+		return profile
 	}
-	return t.BuildClaudeProfile(req, totalInputTokens, isolationSeed)
+	return t.BuildClaudeProfileWithPolicy(req, totalInputTokens, policy, isolationSeed)
 }
 
 // buildSimulatedFunctionCacheProfile creates usage-only cache metadata. It does
@@ -498,10 +579,7 @@ func buildSimulatedFunctionCacheProfile(req *ClaudeRequest, totalInputTokens int
 		bodyFingerprint = canonicalizeCacheValue(req)
 	}
 	if cfg.InputFingerprintChars > 0 {
-		runes := []rune(bodyFingerprint)
-		if len(runes) > cfg.InputFingerprintChars {
-			bodyFingerprint = string(runes[len(runes)-cfg.InputFingerprintChars:])
-		}
+		bodyFingerprint = trailingRunes(bodyFingerprint, cfg.InputFingerprintChars)
 	}
 	if bodyFingerprint == "" && seedData == "" && cfg.SimulatedTokens <= 0 {
 		return nil
@@ -555,6 +633,28 @@ func buildSimulatedFunctionCacheProfile(req *ClaudeRequest, totalInputTokens int
 		SimulatedMaxReadPercent:    maxRead,
 		SimulatedMinCacheableToken: cfg.MinTokens,
 	}
+}
+
+func trailingRunes(value string, limit int) string {
+	if value == "" || limit <= 0 {
+		return value
+	}
+	count := 0
+	for range value {
+		count++
+		if count > limit {
+			break
+		}
+	}
+	if count <= limit {
+		return value
+	}
+	start := len(value)
+	for i := 0; i < limit && start > 0; i++ {
+		_, size := utf8.DecodeLastRuneInString(value[:start])
+		start -= size
+	}
+	return value[start:]
 }
 
 func functionCacheRequestBodyFingerprint(rawBody []byte) string {
@@ -620,12 +720,20 @@ func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfi
 	minTokens := minCacheableTokensForModel(profile.Model)
 	last := profile.Breakpoints[len(profile.Breakpoints)-1]
 	lastTokens := minInt(last.CumulativeTokens, profile.TotalInputTokens)
-	maxCacheRead := int(float64(profile.TotalInputTokens) * config.GetPromptCacheMaxRatio())
+	maxRatio := profile.MaxCacheReadRatio
+	if maxRatio <= 0 {
+		maxRatio = config.GetPromptCacheMaxRatio()
+	}
+	maxCacheRead := int(float64(profile.TotalInputTokens) * maxRatio)
 	now := time.Now()
 
+	lockStarted := time.Now()
 	t.mu.Lock()
+	if profile.requestTiming != nil {
+		profile.requestTiming.observe(stageCacheLockWait, time.Since(lockStarted))
+	}
 	defer t.mu.Unlock()
-	t.pruneExpiredLocked(now)
+	t.pruneExpiredLockedLimited(now, promptCacheRequestPruneLimit)
 
 	rawMatchedTokens := 0
 	for i := len(profile.Breakpoints) - 1; i >= 0; i-- {
@@ -640,7 +748,7 @@ func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfi
 		}
 		t.refreshEntryLocked(entry, now.Add(entry.TTL), entry.TTL)
 		t.order.MoveToFront(entry.lruElem)
-		t.dirty = true // hit extends TTL — persist so a flush before the next Update doesn't lose it
+		t.markDirtyLocked() // hit extends TTL — persist so a flush before the next Update doesn't lose it
 		rawMatchedTokens = minInt(breakpoint.CumulativeTokens, profile.TotalInputTokens)
 		if rawMatchedTokens > lastTokens {
 			rawMatchedTokens = lastTokens
@@ -680,15 +788,27 @@ func (t *promptCacheTracker) computeSimulatedFunctionCache(profile *promptCacheP
 		return promptCacheUsage{}
 	}
 	now := time.Now()
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	for fingerprint, entry := range t.functionEntries {
-		if !entry.ExpiresAt.After(now) {
-			delete(t.functionEntries, fingerprint)
-		}
+	lockStarted := time.Now()
+	t.functionMu.Lock()
+	if profile.requestTiming != nil {
+		profile.requestTiming.observe(stageCacheLockWait, time.Since(lockStarted))
 	}
+	defer t.functionMu.Unlock()
+	t.pruneExpiredFunctionLocked(now, promptCacheRequestPruneLimit)
 	entry, hit := t.functionEntries[last.Fingerprint]
-	hit = hit && entry.ExpiresAt.After(now) && simulatedFunctionCacheHitAllowed(profile, now)
+	if hit && last.TTL > 0 && entry.TTL > 0 && last.TTL != entry.TTL {
+		// Function-cache TTL is hot-editable. Rebase the existing entry from
+		// its last refresh time so shortening a policy cannot grant one more
+		// hit under the old, longer TTL.
+		lastRefresh := entry.ExpiresAt.Add(-entry.TTL)
+		entry.ExpiresAt = lastRefresh.Add(last.TTL)
+		entry.TTL = last.TTL
+	}
+	if hit && !entry.ExpiresAt.After(now) {
+		t.deleteFunctionEntryLocked(last.Fingerprint, entry)
+		hit = false
+	}
+	hit = hit && simulatedFunctionCacheHitAllowed(profile, now)
 	if !hit {
 		cache5m, cache1h := computePromptCacheTTLBreakdown(profile, 0)
 		return promptCacheUsage{
@@ -698,6 +818,13 @@ func (t *promptCacheTracker) computeSimulatedFunctionCache(profile *promptCacheP
 		}
 	}
 	entry.ExpiresAt = now.Add(entry.TTL)
+	if entry.expiryItem == nil {
+		entry.expiryItem = &promptCacheExpiryItem{Fingerprint: last.Fingerprint, ExpiresAt: entry.ExpiresAt}
+		heap.Push(&t.functionExpiryQueue, entry.expiryItem)
+	} else {
+		entry.expiryItem.ExpiresAt = entry.ExpiresAt
+		heap.Fix(&t.functionExpiryQueue, entry.expiryItem.index)
+	}
 	t.functionEntries[last.Fingerprint] = entry
 	maxRead := int(float64(profile.TotalInputTokens) * float64(profile.SimulatedMaxReadPercent) / 100)
 	if maxRead < 0 {
@@ -719,30 +846,18 @@ func clampCacheReadToModelWindow(usage promptCacheUsage, model string) promptCac
 
 func (t *promptCacheTracker) updateSimulatedFunctionCache(profile *promptCacheProfile) {
 	now := time.Now()
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	for fingerprint, entry := range t.functionEntries {
-		if !entry.ExpiresAt.After(now) {
-			delete(t.functionEntries, fingerprint)
-		}
-	}
+	t.functionMu.Lock()
+	defer t.functionMu.Unlock()
+	t.pruneExpiredFunctionLocked(now, promptCacheRequestPruneLimit)
 	for _, breakpoint := range profile.Breakpoints {
 		if breakpoint.CumulativeTokens < profile.SimulatedMinCacheableToken {
 			continue
 		}
-		t.functionEntries[breakpoint.Fingerprint] = simulatedFunctionCacheEntry{
-			ExpiresAt: now.Add(breakpoint.TTL),
-			TTL:       breakpoint.TTL,
-		}
+		t.putFunctionEntryLocked(breakpoint.Fingerprint, now.Add(breakpoint.TTL), breakpoint.TTL)
 	}
 	// Keep simulation state bounded by the current tracker capacity without
 	// persisting it or mixing it into the native LRU namespace.
-	for len(t.functionEntries) > t.maxEntries {
-		for fingerprint := range t.functionEntries {
-			delete(t.functionEntries, fingerprint)
-			break
-		}
-	}
+	t.evictFunctionOverflowLocked()
 }
 
 func (t *promptCacheTracker) Update(accountID string, profile *promptCacheProfile) {
@@ -758,7 +873,7 @@ func (t *promptCacheTracker) Update(accountID string, profile *promptCacheProfil
 	now := time.Now()
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.pruneExpiredLocked(now)
+	t.pruneExpiredLockedLimited(now, promptCacheRequestPruneLimit)
 
 	// Entries share one bounded map, but the isolation seed is part of every
 	// fingerprint, so tenants cannot match each other's prefixes.
@@ -769,12 +884,21 @@ func (t *promptCacheTracker) Update(accountID string, profile *promptCacheProfil
 		}
 		t.putLocked(breakpoint.Fingerprint, now.Add(breakpoint.TTL), breakpoint.TTL)
 	}
-	t.dirty = true
+	t.markDirtyLocked()
 	t.evictOverflowLocked()
 }
 
 func (t *promptCacheTracker) pruneExpiredLocked(now time.Time) {
+	t.pruneExpiredLockedLimited(now, 0)
+}
+
+// pruneExpiredLockedLimited removes at most limit live heap entries. A zero
+// limit is reserved for startup/admin work where draining the heap is desired.
+// Stale heap nodes do not count toward the bound because they do not touch the
+// maps or LRU.
+func (t *promptCacheTracker) pruneExpiredLockedLimited(now time.Time, limit int) bool {
 	removed := false
+	removedCount := 0
 	for t.expiryQueue.Len() > 0 {
 		item := t.expiryQueue[0]
 		if item.ExpiresAt.After(now) {
@@ -787,12 +911,89 @@ func (t *promptCacheTracker) pruneExpiredLocked(now time.Time) {
 		}
 		t.order.Remove(entry.lruElem)
 		delete(t.entries, item.Fingerprint)
+		t.persistentEntries.Delete(item.Fingerprint)
 		atomic.AddInt64(&t.expirations, 1)
 		removed = true
+		removedCount++
+		if limit > 0 && removedCount >= limit {
+			break
+		}
 	}
 	if removed {
-		t.dirty = true
+		t.markDirtyLocked()
 	}
+	return t.expiryQueue.Len() > 0 && !t.expiryQueue[0].ExpiresAt.After(now)
+}
+
+func (t *promptCacheTracker) pruneExpiredFunctionLocked(now time.Time, limit int) bool {
+	removed := 0
+	for t.functionExpiryQueue.Len() > 0 {
+		item := t.functionExpiryQueue[0]
+		if item.ExpiresAt.After(now) {
+			break
+		}
+		heap.Pop(&t.functionExpiryQueue)
+		entry, ok := t.functionEntries[item.Fingerprint]
+		if !ok || entry.expiryItem != item {
+			continue
+		}
+		delete(t.functionEntries, item.Fingerprint)
+		removed++
+		if limit > 0 && removed >= limit {
+			break
+		}
+	}
+	return t.functionExpiryQueue.Len() > 0 && !t.functionExpiryQueue[0].ExpiresAt.After(now)
+}
+
+func (t *promptCacheTracker) putFunctionEntryLocked(fp [32]byte, expiresAt time.Time, ttl time.Duration) {
+	if entry, ok := t.functionEntries[fp]; ok {
+		entry.ExpiresAt = expiresAt
+		entry.TTL = ttl
+		if entry.expiryItem == nil {
+			entry.expiryItem = &promptCacheExpiryItem{Fingerprint: fp, ExpiresAt: expiresAt}
+			heap.Push(&t.functionExpiryQueue, entry.expiryItem)
+		} else {
+			entry.expiryItem.ExpiresAt = expiresAt
+			heap.Fix(&t.functionExpiryQueue, entry.expiryItem.index)
+		}
+		t.functionEntries[fp] = entry
+		return
+	}
+	item := &promptCacheExpiryItem{Fingerprint: fp, ExpiresAt: expiresAt}
+	heap.Push(&t.functionExpiryQueue, item)
+	t.functionEntries[fp] = simulatedFunctionCacheEntry{ExpiresAt: expiresAt, TTL: ttl, expiryItem: item}
+}
+
+func (t *promptCacheTracker) deleteFunctionEntryLocked(fp [32]byte, entry simulatedFunctionCacheEntry) {
+	if entry.expiryItem != nil && entry.expiryItem.index >= 0 {
+		heap.Remove(&t.functionExpiryQueue, entry.expiryItem.index)
+	}
+	delete(t.functionEntries, fp)
+}
+
+func (t *promptCacheTracker) evictFunctionOverflowLocked() {
+	for len(t.functionEntries) > t.functionMaxEntries {
+		for fingerprint, entry := range t.functionEntries {
+			t.deleteFunctionEntryLocked(fingerprint, entry)
+			break
+		}
+	}
+}
+
+func (t *promptCacheTracker) pruneExpiredBackground(now time.Time) {
+	t.mu.Lock()
+	t.pruneExpiredLockedLimited(now, promptCacheMaintenancePruneLimit)
+	t.mu.Unlock()
+
+	t.functionMu.Lock()
+	t.pruneExpiredFunctionLocked(now, promptCacheMaintenancePruneLimit)
+	t.functionMu.Unlock()
+}
+
+func (t *promptCacheTracker) markDirtyLocked() {
+	t.dirty = true
+	t.persistenceRevision++
 }
 
 // putLocked inserts a fingerprint or refreshes its existing entry, marking it
@@ -807,6 +1008,7 @@ func (t *promptCacheTracker) putLocked(fp [32]byte, expiresAt time.Time, ttl tim
 	expiryItem := &promptCacheExpiryItem{Fingerprint: fp, ExpiresAt: expiresAt}
 	heap.Push(&t.expiryQueue, expiryItem)
 	t.entries[fp] = &promptCacheEntry{ExpiresAt: expiresAt, TTL: ttl, lruElem: elem, expiryItem: expiryItem}
+	t.persistentEntries.Store(fp, promptCachePersistentEntry{ExpiresAt: expiresAt, TTL: ttl})
 }
 
 func (t *promptCacheTracker) refreshEntryLocked(entry *promptCacheEntry, expiresAt time.Time, ttl time.Duration) {
@@ -814,6 +1016,8 @@ func (t *promptCacheTracker) refreshEntryLocked(entry *promptCacheEntry, expires
 	entry.TTL = ttl
 	entry.expiryItem.ExpiresAt = expiresAt
 	heap.Fix(&t.expiryQueue, entry.expiryItem.index)
+	fp := entry.lruElem.Value.([32]byte)
+	t.persistentEntries.Store(fp, promptCachePersistentEntry{ExpiresAt: expiresAt, TTL: ttl})
 }
 
 // evictOverflowLocked bounds the entries map to maxEntries by evicting the
@@ -832,6 +1036,7 @@ func (t *promptCacheTracker) evictOverflowLocked() {
 			heap.Remove(&t.expiryQueue, entry.expiryItem.index)
 		}
 		delete(t.entries, fp)
+		t.persistentEntries.Delete(fp)
 		atomic.AddInt64(&t.evictions, 1)
 	}
 }
@@ -847,8 +1052,12 @@ func (t *promptCacheTracker) SetMaxEntries(maxEntries int) {
 	}
 
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	if t.maxEntries == maxEntries {
+		t.mu.Unlock()
+		t.functionMu.Lock()
+		t.functionMaxEntries = maxEntries
+		t.evictFunctionOverflowLocked()
+		t.functionMu.Unlock()
 		return
 	}
 
@@ -857,8 +1066,14 @@ func (t *promptCacheTracker) SetMaxEntries(maxEntries int) {
 	t.pruneExpiredLocked(time.Now())
 	t.evictOverflowLocked()
 	if len(t.entries) != entriesBefore {
-		t.dirty = true
+		t.markDirtyLocked()
 	}
+	t.mu.Unlock()
+
+	t.functionMu.Lock()
+	t.functionMaxEntries = maxEntries
+	t.evictFunctionOverflowLocked()
+	t.functionMu.Unlock()
 }
 
 // DefaultTTL returns the runtime default used when a cache_control marker does
@@ -886,6 +1101,29 @@ func (t *promptCacheTracker) SetDefaultTTL(ttl time.Duration) {
 	t.mu.Unlock()
 }
 
+// ApplyPolicySettings applies a complete saved policy generation. Revision is
+// separate from persistenceRevision: it prevents an older admin request from
+// overwriting a newer hot update after configuration writes complete out of
+// order with runtime application.
+func (t *promptCacheTracker) ApplyPolicySettings(revision uint64, maxEntries int, ttl time.Duration) bool {
+	if t == nil {
+		return false
+	}
+	if revision == 0 {
+		revision = 1
+	}
+
+	t.policyMu.Lock()
+	defer t.policyMu.Unlock()
+	if revision < t.policyRevision {
+		return false
+	}
+	t.SetMaxEntries(maxEntries)
+	t.SetDefaultTTL(ttl)
+	t.policyRevision = revision
+	return true
+}
+
 // PromptCacheStats is a point-in-time snapshot of cache counters, surfaced via
 // /v1/stats. All counters are cumulative since tracker construction.
 type PromptCacheStats struct {
@@ -907,9 +1145,11 @@ func (t *promptCacheTracker) Stats() PromptCacheStats {
 	}
 	t.mu.Lock()
 	entries := len(t.entries)
-	functionEntries := len(t.functionEntries)
 	capacity := t.maxEntries
 	t.mu.Unlock()
+	t.functionMu.Lock()
+	functionEntries := len(t.functionEntries)
+	t.functionMu.Unlock()
 	return PromptCacheStats{
 		Entries:               entries,
 		Capacity:              capacity,
@@ -987,11 +1227,18 @@ func flattenClaudeCacheBlocks(req *ClaudeRequest, defaultTTL time.Duration) []ca
 
 	for toolIndex, tool := range req.Tools {
 		toolValue := map[string]interface{}{
-			"kind":         "tool",
-			"tool_index":   toolIndex,
-			"name":         tool.Name,
-			"description":  tool.Description,
-			"input_schema": tool.InputSchema,
+			"kind":            "tool",
+			"tool_index":      toolIndex,
+			"type":            tool.Type,
+			"name":            tool.Name,
+			"description":     tool.Description,
+			"input_schema":    tool.InputSchema,
+			"model":           tool.Model,
+			"max_uses":        tool.MaxUses,
+			"max_tokens":      tool.MaxTokens,
+			"caching":         tool.Caching,
+			"allowed_domains": tool.AllowedDomains,
+			"blocked_domains": tool.BlockedDomains,
 		}
 		fingerprintValue := stripCachePositionKeys(toolValue)
 		markerTTL, hasCacheControl := extractPromptCacheTTL(tool, defaultTTL)

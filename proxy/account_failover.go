@@ -2,9 +2,14 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
+	"math/rand"
+	"net/http"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"kiro-go/config"
@@ -16,8 +21,9 @@ const allAccountsConcurrencyFullMessage = "所有账号并发已满请稍后再�
 
 // UpstreamRateLimitError marks HTTP 429 returned by Kiro/AWS upstream.
 type UpstreamRateLimitError struct {
-	Endpoint string
-	Body     string
+	Endpoint   string
+	Body       string
+	RetryAfter time.Duration
 }
 
 func (e *UpstreamRateLimitError) Error() string {
@@ -133,7 +139,7 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 
 	errMsg := err.Error()
 	switch {
-	case isKiroTransportError(err), isRetryableKiroStreamError(err), isKiroTransientHTTPError(err):
+	case isKiroTransportError(err), isRetryableKiroStreamError(err), isKiroTransientHTTPError(err), isKiroTimeoutError(err):
 		// Connection resets, proxy failures, timeouts, and retryable stream
 		// framing errors do not indicate a bad credential. Penalizing them can
 		// cool every account after a shared network incident.
@@ -171,6 +177,38 @@ type rateLimitDecision struct {
 	Delay       time.Duration
 }
 
+type retryBudget struct {
+	mu          sync.Mutex
+	limit       int
+	windowStart time.Time
+	used        int
+}
+
+func newRetryBudgetFromEnv() *retryBudget {
+	return &retryBudget{limit: positiveEnvInt("KIRO_RETRY_BUDGET_PER_SECOND", 128)}
+}
+
+func (b *retryBudget) allow(now time.Time) bool {
+	if b == nil || b.limit <= 0 {
+		return true
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.windowStart.IsZero() || now.Sub(b.windowStart) >= time.Second || now.Before(b.windowStart) {
+		b.windowStart = now
+		b.used = 0
+	}
+	if b.used >= b.limit {
+		return false
+	}
+	b.used++
+	return true
+}
+
+func (h *Handler) allowUpstreamRetry() bool {
+	return h == nil || h.retryBudget == nil || h.retryBudget.allow(time.Now())
+}
+
 func (h *Handler) maxAccountAttempts() int {
 	count := h.pool.Count()
 	if count < 1 {
@@ -200,7 +238,15 @@ func (h *Handler) maxAccountAttempts() int {
 
 const switchRoundMarkerPrefix = "__kiro_switch_round_used_"
 
-func (h *Handler) acquireAccountForModel(model string, excluded map[string]bool, preferredID string) (*config.Account, bool) {
+func (h *Handler) acquireAccountForModel(model string, excluded map[string]bool, preferredID string, requestContexts ...context.Context) (*config.Account, bool) {
+	started := time.Now()
+	var requestContext context.Context
+	if len(requestContexts) > 0 {
+		requestContext = requestContexts[0]
+	}
+	defer func() {
+		observeRequestStage(requestContext, stageAccountPoolWait, time.Since(started))
+	}()
 	// Requests that skip expired/near-expired accounts should kick off one
 	// background refresh attempt, so operators do not have to manually refresh
 	// accounts that still have a valid refresh token.
@@ -276,11 +322,20 @@ func (h *Handler) releaseAccount(account *config.Account) {
 	h.pool.Release(account.ID)
 }
 
-func (h *Handler) applyRateLimitPolicy(account *config.Account, retryCounts map[string]int, excluded map[string]bool) rateLimitDecision {
+func (h *Handler) applyRateLimitPolicy(account *config.Account, retryCounts map[string]int, excluded map[string]bool, causes ...error) rateLimitDecision {
 	if account == nil {
 		return rateLimitDecision{}
 	}
 	cfg := config.GetRateLimitConfig()
+	var cause error
+	if len(causes) > 0 {
+		cause = causes[0]
+	}
+	if (cfg.Mode == config.RateLimitModeRetrySame || cfg.Mode == config.RateLimitModeSwitchAccount) && !h.allowUpstreamRetry() {
+		h.pool.RecordRateLimit(account.ID)
+		logger.Warnf("[RateLimit] Global retry budget exhausted; returning 429")
+		return rateLimitDecision{Return429: true}
+	}
 	switch cfg.Mode {
 	case config.RateLimitModeReturn429:
 		h.pool.RecordRateLimit(account.ID)
@@ -291,7 +346,11 @@ func (h *Handler) applyRateLimitPolicy(account *config.Account, retryCounts map[
 			retryCounts[account.ID] = used + 1
 			h.pool.RecordRateLimit(account.ID)
 			logger.Warnf("[RateLimit] Upstream 429 for %s, retrying same account %d/%d", account.Email, used+1, cfg.RetrySameAccount)
-			return rateLimitDecision{RetrySameID: account.ID, Delay: retrySameDelay(cfg, used+1)}
+			delay := retrySameDelay(cfg, used+1)
+			if retryAfter := retryAfterFromError(cause); retryAfter > delay {
+				delay = retryAfter
+			}
+			return rateLimitDecision{RetrySameID: account.ID, Delay: delay}
 		}
 		excluded[account.ID] = true
 		h.pool.RecordRateLimit(account.ID)
@@ -340,7 +399,7 @@ func waitForRateLimitRetry(ctx context.Context, decision rateLimitDecision) bool
 	if decision.Delay <= 0 {
 		return true
 	}
-	timer := time.NewTimer(decision.Delay)
+	timer := time.NewTimer(jitterRetryDelay(decision.Delay))
 	defer timer.Stop()
 	select {
 	case <-timer.C:
@@ -348,6 +407,41 @@ func waitForRateLimitRetry(ctx context.Context, decision rateLimitDecision) bool
 	case <-ctx.Done():
 		return false
 	}
+}
+
+func jitterRetryDelay(delay time.Duration) time.Duration {
+	if delay <= 0 {
+		return 0
+	}
+	// Only add jitter. The configured delay can include an upstream Retry-After
+	// value and therefore acts as a lower bound that must never be shortened.
+	factor := 1.0 + rand.Float64()*0.2
+	return time.Duration(float64(delay) * factor)
+}
+
+func retryAfterFromError(err error) time.Duration {
+	var rateErr *UpstreamRateLimitError
+	if errors.As(err, &rateErr) && rateErr.RetryAfter > 0 {
+		return rateErr.RetryAfter
+	}
+	return 0
+}
+
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(value); err == nil {
+		if seconds > 0 {
+			return time.Duration(seconds) * time.Second
+		}
+		return 0
+	}
+	if when, err := http.ParseTime(value); err == nil && when.After(now) {
+		return when.Sub(now)
+	}
+	return 0
 }
 
 func isAllAccountsConcurrencyFullError(err error) bool {

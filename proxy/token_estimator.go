@@ -10,17 +10,10 @@ func estimateApproxTokens(text string) int {
 		return 0
 	}
 
-	runes := []rune(text)
-	length := len(runes)
-	if length == 0 {
-		return 0
-	}
-	if length < 5 {
-		return max(1, int(math.Ceil(float64(length)/3.0)))
-	}
-
+	length := 0
 	var regularAscii, digits, symbols, nonASCII int
-	for _, r := range runes {
+	for _, r := range text {
+		length++
 		switch {
 		case r >= 0x80:
 			nonASCII++
@@ -31,6 +24,12 @@ func estimateApproxTokens(text string) int {
 		default:
 			regularAscii++
 		}
+	}
+	if length == 0 {
+		return 0
+	}
+	if length < 5 {
+		return max(1, int(math.Ceil(float64(length)/3.0)))
 	}
 
 	estimated := int(math.Ceil(
@@ -54,7 +53,6 @@ func estimateClaudeRequestInputTokens(req *ClaudeRequest) int {
 	total := estimateClaudeValueTokens(req.System)
 	if choice, err := resolveToolChoice(req.ToolChoice); err == nil {
 		total += estimateApproxTokens(toolChoiceInstruction(choice))
-		total += estimateApproxTokens(claudeAgentToolProtocolInstruction(req, choice))
 	}
 	if req.OutputConfig != nil {
 		total += estimateApproxTokens(claudeStructuredOutputInstruction(req.OutputConfig.Format))
@@ -175,7 +173,6 @@ func estimateOpenAIRequestInputTokens(req *OpenAIRequest) int {
 	total += estimateApproxTokens(openAIStructuredOutputInstruction(req.ResponseFormat))
 	if choice, err := resolveToolChoice(req.ToolChoice); err == nil {
 		total += estimateApproxTokens(toolChoiceInstruction(choice))
-		total += estimateApproxTokens(openAIAgentToolProtocolInstruction(req, choice))
 	}
 	if stopSequences, err := resolveOpenAIStopSequences(req.Stop); err == nil {
 		total += estimateApproxTokens(stopSequencesInstruction(stopSequences))

@@ -146,6 +146,124 @@ func TestHandleAdvisorRequestExecutesAdvisorAndExecutorWithMixedTools(t *testing
 	}
 }
 
+func TestAdvisorExecutorReusesEntryPromptCachePolicySnapshot(t *testing.T) {
+	if err := config.Init(t.TempDir() + "/config.json"); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.AddAccount(config.Account{
+		ID:          "advisor-cache-account",
+		Enabled:     true,
+		AccessToken: "advisor-cache-token",
+		ProfileArn:  "arn:aws:codewhisperer:us-east-1:1:profile/advisor-cache",
+	}); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+	policy, err := config.AddPromptCachePolicy(config.PromptCachePolicy{
+		Name:                  "advisor-entry-policy",
+		CacheMode:             config.CacheModeNative,
+		PromptCacheMaxRatio:   0.85,
+		PromptCacheMaxEntries: 256,
+		PromptCacheTTLSeconds: config.DefaultPromptCacheTTLSeconds,
+	})
+	if err != nil {
+		t.Fatalf("add prompt-cache policy: %v", err)
+	}
+	apiKey, err := config.AddApiKey(config.ApiKeyEntry{
+		Name:                "advisor-cache-key",
+		Key:                 "sk-advisor-cache",
+		Enabled:             true,
+		PromptCachePolicyID: policy.ID,
+	})
+	if err != nil {
+		t.Fatalf("add API key: %v", err)
+	}
+
+	pool := accountpool.GetPool()
+	pool.Reload()
+	t.Cleanup(pool.WaitForPendingStats)
+
+	var calls int
+	var h *Handler
+	h = &Handler{
+		pool:                pool,
+		promptCache:         newPromptCacheTracker(defaultPromptCacheTTL),
+		promptCachePolicies: make(map[string]*promptCacheTracker),
+		kiroCaller: func(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
+			calls++
+			if calls == 1 {
+				changed := *config.GetPromptCachePolicy(policy.ID)
+				changed.CacheMode = config.CacheModeFunctionSimulation
+				changed.PromptCacheTTLSeconds = config.ExtendedPromptCacheTTLSeconds
+				changed.FunctionCache = config.FunctionCacheConfig{
+					Enabled:         true,
+					SimulatedTokens: 2048,
+					TTLSeconds:      120,
+				}
+				updated, updateErr := config.UpdatePromptCachePolicy(policy.ID, changed)
+				if updateErr != nil {
+					t.Fatalf("update policy during advisor call: %v", updateErr)
+				}
+				h.applyPromptCachePolicy(updated)
+				callback.OnText("Review complete.", false)
+				callback.OnComplete(11, 7)
+				return nil
+			}
+			if calls == 2 {
+				callback.OnText("Executor complete.", false)
+				callback.OnComplete(17, 9)
+				return nil
+			}
+			t.Fatalf("unexpected upstream call %d", calls)
+			return nil
+		},
+	}
+	defer h.stopPromptCachePolicyTrackers()
+
+	body, err := json.Marshal(map[string]interface{}{
+		"model":      "claude-sonnet-4-6",
+		"max_tokens": 4096,
+		"system":     strings.Repeat("stable prompt-cache prefix ", 1600),
+		"messages": []map[string]interface{}{
+			{"role": "user", "content": "Implement the change"},
+		},
+		"tools": []map[string]interface{}{
+			{"type": "advisor_20260301", "name": "advisor", "model": "claude-opus-4-8"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(string(body)))
+	request = withApiKeyContext(request, &apiKey)
+	recorder := httptest.NewRecorder()
+	h.handleClaudeMessagesInternal(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if calls != 2 {
+		t.Fatalf("upstream calls=%d, want advisor + executor", calls)
+	}
+
+	h.promptCachePoliciesMu.Lock()
+	tracker := h.promptCachePolicies[policy.ID]
+	h.promptCachePoliciesMu.Unlock()
+	if tracker == nil {
+		t.Fatal("named prompt-cache tracker was not created")
+	}
+	stats := tracker.Stats()
+	if stats.Entries == 0 || stats.FunctionEntries != 0 {
+		t.Fatalf("executor did not retain entry native policy: %+v", stats)
+	}
+	tracker.mu.Lock()
+	for _, entry := range tracker.entries {
+		if entry.TTL != defaultPromptCacheTTL {
+			tracker.mu.Unlock()
+			t.Fatalf("executor used post-entry TTL %v", entry.TTL)
+		}
+	}
+	tracker.mu.Unlock()
+}
+
 func TestForcedAdvisorRemainsClientExecutableToolUse(t *testing.T) {
 	var calls int
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

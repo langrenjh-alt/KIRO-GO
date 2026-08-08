@@ -145,9 +145,9 @@ func resolveClaudeStopReason(toolUseCount int, contextWindowExceeded bool, upstr
 	if contextWindowExceeded {
 		return "model_context_window_exceeded"
 	}
-	switch strings.TrimSpace(upstreamStopReason) {
+	switch normalizeKiroStopReason(upstreamStopReason) {
 	case "max_tokens", "model_context_window_exceeded":
-		return strings.TrimSpace(upstreamStopReason)
+		return normalizeKiroStopReason(upstreamStopReason)
 	}
 	if toolUseCount > 0 {
 		return "tool_use"

@@ -172,6 +172,18 @@ func codingAgentToolProtocolInstruction(choice resolvedToolChoice, recognizedHar
 	return agentToolProtocol
 }
 
+func codingAgentCompletionProtocolEnabled(choice resolvedToolChoice, recognizedHarness bool, toolNames []string) bool {
+	if choice.Mode != "auto" || !recognizedHarness {
+		return false
+	}
+	for _, name := range toolNames {
+		if codingAgentToolCapability(name) != 0 {
+			return true
+		}
+	}
+	return false
+}
+
 const (
 	codingAgentToolInspect = 1 << iota
 	codingAgentToolExecute

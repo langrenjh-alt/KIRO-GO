@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestExtractOpenAIMessageTextStructured(t *testing.T) {
@@ -348,6 +349,54 @@ func TestKiroToClaudeResponsePreservesNativeReasoningAndProtocolEnvelope(t *test
 	}
 }
 
+func TestKiroToOpenAIResponsePreservesReasoningTextAndToolCall(t *testing.T) {
+	toolUses := []KiroToolUse{{
+		ToolUseID: "call_order",
+		Name:      "shell_command",
+		Input:     map[string]interface{}{"command": "rg -n TODO ."},
+	}}
+	tests := []struct {
+		format           string
+		wantContent      string
+		wantReasoningKey bool
+	}{
+		{format: "reasoning_content", wantContent: "Inspecting the repository.", wantReasoningKey: true},
+		{format: "thinking", wantContent: "<thinking>Need to inspect first.</thinking>Inspecting the repository."},
+		{format: "think", wantContent: "<think>Need to inspect first.</think>Inspecting the repository."},
+	}
+
+	for _, test := range tests {
+		t.Run(test.format, func(t *testing.T) {
+			resp := KiroToOpenAIResponseWithReasoning(
+				"Inspecting the repository.",
+				"Need to inspect first.",
+				toolUses,
+				10,
+				5,
+				"claude-opus-5",
+				test.format,
+			)
+			choice := resp["choices"].([]map[string]interface{})[0]
+			message := choice["message"].(map[string]interface{})
+			if choice["finish_reason"] != "tool_calls" || message["content"] != test.wantContent {
+				t.Fatalf("choice=%#v", choice)
+			}
+			if _, ok := message["tool_calls"].([]map[string]interface{}); !ok {
+				t.Fatalf("tool calls missing: %#v", message)
+			}
+			reasoning, hasReasoning := message["reasoning_content"]
+			if hasReasoning != test.wantReasoningKey || (hasReasoning && reasoning != "Need to inspect first.") {
+				t.Fatalf("reasoning format mismatch: %#v", message)
+			}
+		})
+	}
+
+	plain := KiroToOpenAIResponse("Inspecting the repository.", toolUses, 10, 5, "claude-opus-5")
+	if plain.Choices[0].Message.Content != "Inspecting the repository." || len(plain.Choices[0].Message.ToolCalls) != 1 {
+		t.Fatalf("plain OpenAI response lost text or tool call: %#v", plain.Choices[0].Message)
+	}
+}
+
 func TestKiroToClaudeResponsePreservesSignatureOnlyThinking(t *testing.T) {
 	resp := KiroToClaudeResponseWithReasoning(
 		"answer",
@@ -582,6 +631,202 @@ func TestParseModelAndThinkingDoesNotRewriteDatedSnapshotMinor(t *testing.T) {
 	}
 	if strings.Contains(got, ".") {
 		t.Fatalf("dated snapshot must not be rewritten with a dot, got %q", got)
+	}
+}
+
+func TestClaudeToolResultErrorStatusMapping(t *testing.T) {
+	tests := []struct {
+		name            string
+		isErrorFragment string
+		wantStatus      string
+	}{
+		{name: "error", isErrorFragment: `,"is_error":true`, wantStatus: "error"},
+		{name: "explicit success", isErrorFragment: `,"is_error":false`, wantStatus: "success"},
+		{name: "default success", wantStatus: "success"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			raw := `{
+				"model":"claude-opus-4.8",
+				"tools":[{"name":"Write","description":"write a file","input_schema":{"type":"object"}}],
+				"messages":[
+					{"role":"user","content":"write the file"},
+					{"role":"assistant","content":[{"type":"tool_use","id":"tool_write","name":"Write","input":{"file_path":"a.js"}}]},
+					{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool_write","content":"Write failed"` + test.isErrorFragment + `}]}
+				]
+			}`
+
+			var req ClaudeRequest
+			if err := json.Unmarshal([]byte(raw), &req); err != nil {
+				t.Fatalf("unmarshal Claude request: %v", err)
+			}
+			payload := ClaudeToKiro(&req, false)
+			current := payload.ConversationState.CurrentMessage.UserInputMessage
+			if current.UserInputMessageContext == nil || len(current.UserInputMessageContext.ToolResults) != 1 {
+				t.Fatalf("expected one active structured tool result: %#v", current.UserInputMessageContext)
+			}
+			result := current.UserInputMessageContext.ToolResults[0]
+			if result.Status != test.wantStatus {
+				t.Fatalf("tool result status=%q, want %q", result.Status, test.wantStatus)
+			}
+			if result.ToolUseID != "tool_write" || len(result.Content) != 1 || result.Content[0].Text != "Write failed" {
+				t.Fatalf("tool result identity or body was lost: %#v", result)
+			}
+
+			wire, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatalf("marshal Kiro payload: %v", err)
+			}
+			if !strings.Contains(string(wire), `"status":"`+test.wantStatus+`"`) {
+				t.Fatalf("Kiro wire payload omitted status %q: %s", test.wantStatus, wire)
+			}
+		})
+	}
+}
+
+func TestClaudeToolResultErrorStatusSurvivesFlattening(t *testing.T) {
+	t.Run("historical result", func(t *testing.T) {
+		req := &ClaudeRequest{
+			Model: "claude-opus-4.8",
+			Tools: []ClaudeTool{{Name: "Write", Description: "write a file", InputSchema: map[string]interface{}{"type": "object"}}},
+			Messages: []ClaudeMessage{
+				{Role: "user", Content: "write the file"},
+				{Role: "assistant", Content: []interface{}{
+					map[string]interface{}{"type": "tool_use", "id": "tool_write", "name": "Write", "input": map[string]interface{}{"file_path": "a.js"}},
+				}},
+				{Role: "user", Content: []interface{}{
+					map[string]interface{}{"type": "tool_result", "tool_use_id": "tool_write", "content": "Write failed", "is_error": true},
+				}},
+				{Role: "user", Content: "continue with a corrected write"},
+			},
+		}
+
+		payload := ClaudeToKiro(req, false)
+		var historyText strings.Builder
+		for _, message := range payload.ConversationState.History {
+			if message.UserInputMessage != nil {
+				historyText.WriteString(message.UserInputMessage.Content)
+			}
+		}
+		flattened := historyText.String()
+		if !strings.Contains(flattened, `<tool_result name="Write" status="error">`) || !strings.Contains(flattened, "Write failed") {
+			t.Fatalf("flattened history lost tool failure status or body: %q", flattened)
+		}
+	})
+
+	t.Run("orphaned current result", func(t *testing.T) {
+		req := &ClaudeRequest{
+			Model: "claude-opus-4.8",
+			Messages: []ClaudeMessage{{Role: "user", Content: []interface{}{
+				map[string]interface{}{"type": "tool_result", "tool_use_id": "tool_orphan", "content": "permission denied", "is_error": true},
+			}}},
+		}
+
+		content := ClaudeToKiro(req, false).ConversationState.CurrentMessage.UserInputMessage.Content
+		if !strings.Contains(content, `<tool_result status="error">`) || !strings.Contains(content, "permission denied") {
+			t.Fatalf("flattened orphan lost tool failure status or body: %q", content)
+		}
+	})
+}
+
+func TestClaudeParallelToolResultStatusesRemainIndependent(t *testing.T) {
+	req := &ClaudeRequest{
+		Model: "claude-opus-4.8",
+		Tools: []ClaudeTool{
+			{Name: "Read", Description: "read a file", InputSchema: map[string]interface{}{"type": "object"}},
+			{Name: "Write", Description: "write a file", InputSchema: map[string]interface{}{"type": "object"}},
+		},
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "update the files"},
+			{Role: "assistant", Content: []interface{}{
+				map[string]interface{}{"type": "tool_use", "id": "tool_read", "name": "Read", "input": map[string]interface{}{"file_path": "a.js"}},
+				map[string]interface{}{"type": "tool_use", "id": "tool_write", "name": "Write", "input": map[string]interface{}{"file_path": "b.js"}},
+			}},
+			{Role: "user", Content: []interface{}{
+				map[string]interface{}{"type": "tool_result", "tool_use_id": "tool_read", "content": "read ok"},
+				map[string]interface{}{"type": "tool_result", "tool_use_id": "tool_write", "content": "permission denied", "is_error": true},
+			}},
+		},
+	}
+
+	current := ClaudeToKiro(req, false).ConversationState.CurrentMessage.UserInputMessage
+	if current.UserInputMessageContext == nil || len(current.UserInputMessageContext.ToolResults) != 2 {
+		t.Fatalf("expected two active structured results: %#v", current.UserInputMessageContext)
+	}
+	results := make(map[string]KiroToolResult, 2)
+	for _, result := range current.UserInputMessageContext.ToolResults {
+		results[result.ToolUseID] = result
+	}
+	if results["tool_read"].Status != "success" || results["tool_read"].Content[0].Text != "read ok" {
+		t.Fatalf("successful result changed: %#v", results["tool_read"])
+	}
+	if results["tool_write"].Status != "error" || results["tool_write"].Content[0].Text != "permission denied" {
+		t.Fatalf("failed result changed or crossed calls: %#v", results["tool_write"])
+	}
+}
+
+func TestOpenAIToolResultExplicitFailureStatusesRemainIndependent(t *testing.T) {
+	raw := `{
+		"model":"claude-opus-4.8",
+		"tools":[{"type":"function","function":{"name":"shell_command","parameters":{"type":"object"}}}],
+		"messages":[
+			{"role":"user","content":"run checks"},
+			{"role":"assistant","tool_calls":[
+				{"id":"call_ok","type":"function","function":{"name":"shell_command","arguments":"{}"}},
+				{"id":"call_error","type":"function","function":{"name":"shell_command","arguments":"{}"}},
+				{"id":"call_failed","type":"function","function":{"name":"shell_command","arguments":"{}"}}
+			]},
+			{"role":"tool","tool_call_id":"call_ok","content":"ok"},
+			{"role":"tool","tool_call_id":"call_error","content":"permission denied","is_error":true},
+			{"role":"tool","tool_call_id":"call_failed","content":"exit 1","status":"failed"}
+		]
+	}`
+	var req OpenAIRequest
+	if err := json.Unmarshal([]byte(raw), &req); err != nil {
+		t.Fatalf("unmarshal OpenAI request: %v", err)
+	}
+	current := OpenAIToKiro(&req, false).ConversationState.CurrentMessage.UserInputMessage
+	if current.UserInputMessageContext == nil || len(current.UserInputMessageContext.ToolResults) != 3 {
+		t.Fatalf("expected three active tool results: %#v", current.UserInputMessageContext)
+	}
+	results := make(map[string]KiroToolResult, 3)
+	for _, result := range current.UserInputMessageContext.ToolResults {
+		results[result.ToolUseID] = result
+	}
+	if results["call_ok"].Status != "success" || results["call_ok"].Content[0].Text != "ok" {
+		t.Fatalf("successful result changed: %#v", results["call_ok"])
+	}
+	for _, id := range []string{"call_error", "call_failed"} {
+		if results[id].Status != "error" {
+			t.Fatalf("explicit failure %s was not preserved: %#v", id, results[id])
+		}
+	}
+}
+
+func TestBuildToolResultsContinuationPreservesEmptyAndLongErrors(t *testing.T) {
+	empty := buildToolResultsContinuation([]KiroToolResult{{
+		ToolUseID: "tool_empty",
+		Status:    "error",
+	}})
+	if !strings.Contains(empty, `<tool_result status="error">`) ||
+		!strings.Contains(empty, "(no output)") ||
+		!strings.Contains(empty, "</tool_result>") {
+		t.Fatalf("empty error result lost its failure envelope: %q", empty)
+	}
+
+	long := buildToolResultsContinuation([]KiroToolResult{{
+		ToolUseID: "tool_long",
+		Status:    "error",
+		Content:   []KiroResultContent{{Text: strings.Repeat("界", 3000)}},
+	}})
+	if len(long) > 4000 {
+		t.Fatalf("bounded tool result length=%d, want <= 4000", len(long))
+	}
+	if !utf8.ValidString(long) || !strings.Contains(long, `<tool_result status="error">`) ||
+		strings.Count(long, "</tool_result>") != 1 ||
+		!strings.HasSuffix(long, toolResultsContinuationSuffix) {
+		t.Fatalf("long error result was truncated into a malformed envelope: %q", long)
 	}
 }
 

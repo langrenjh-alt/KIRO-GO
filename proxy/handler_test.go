@@ -324,6 +324,7 @@ func TestClaudeNonStreamDoesNotRotateAccountsForMalformedToolJSON(t *testing.T) 
 }
 
 func TestClaudeStreamNativeReasoningProtocol(t *testing.T) {
+	t.Setenv("KIRO_EARLY_STREAM_PRELUDE", "false")
 	cfgFile := t.TempDir() + "/config.json"
 	if err := config.Init(cfgFile); err != nil {
 		t.Fatalf("config.Init: %v", err)
@@ -847,6 +848,13 @@ func TestStatsIncludesCacheMetrics(t *testing.T) {
 	if err := config.Init(cfgFile); err != nil {
 		t.Fatalf("config.Init: %v", err)
 	}
+	policy, err := config.AddPromptCachePolicy(config.PromptCachePolicy{
+		Name:                  "stats-policy",
+		PromptCacheMaxEntries: 512,
+	})
+	if err != nil {
+		t.Fatalf("add prompt-cache policy: %v", err)
+	}
 	p := accountpool.GetPool()
 	p.Reload()
 
@@ -861,9 +869,10 @@ func TestStatsIncludesCacheMetrics(t *testing.T) {
 	tr.Compute("acct", profile) // hit
 
 	h := &Handler{
-		pool:        p,
-		promptCache: tr,
-		startTime:   time.Now().Unix(),
+		pool:                p,
+		promptCache:         tr,
+		promptCachePolicies: map[string]*promptCacheTracker{},
+		startTime:           time.Now().Unix(),
 	}
 
 	rec := httptest.NewRecorder()
@@ -872,6 +881,18 @@ func TestStatsIncludesCacheMetrics(t *testing.T) {
 	var got map[string]interface{}
 	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
 		t.Fatalf("decode stats: %v", err)
+	}
+	policies, ok := got["cachePolicies"].([]interface{})
+	if !ok || len(policies) != 1 {
+		t.Fatalf("expected one cachePolicies entry, got %#v", got["cachePolicies"])
+	}
+	policyStats, ok := policies[0].(map[string]interface{})
+	if !ok || policyStats["id"] != policy.ID || policyStats["name"] != policy.Name {
+		t.Fatalf("unexpected named policy stats: %#v", policies[0])
+	}
+	namedStats, ok := policyStats["stats"].(map[string]interface{})
+	if !ok || namedStats["capacity"] != float64(512) || namedStats["entries"] != float64(0) {
+		t.Fatalf("unexpected inactive policy counters: %#v", policyStats["stats"])
 	}
 	cache, ok := got["cache"].(map[string]interface{})
 	if !ok {

@@ -35,6 +35,7 @@ type bufferedClaudeCall struct {
 	Credits               float64
 	UpstreamStopReason    string
 	ContextWindowExceeded bool
+	ContextInputTokens    int
 }
 
 var errNoAdvisorAccounts = errors.New("no available accounts for advisor request")
@@ -74,6 +75,8 @@ func (h *Handler) handleAdvisorRequest(
 	thinkingOpts claudeThinkingResponseOptions,
 	isolationSeed string,
 	apiKeyID string,
+	cacheTracker *promptCacheTracker,
+	cachePolicy config.PromptCachePolicy,
 ) {
 	if req == nil {
 		h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", "Advisor request is missing")
@@ -145,8 +148,11 @@ func (h *Handler) handleAdvisorRequest(
 	executorEffectiveReq := cloneClaudeRequestForThinking(&executorReq, thinking)
 	executorEstimate := estimateClaudeRequestInputTokens(executorEffectiveReq)
 	var cacheProfile *promptCacheProfile
-	if h.promptCache != nil {
-		cacheProfile = h.promptCache.BuildClaudeProfile(executorEffectiveReq, executorEstimate, isolationSeed)
+	if cacheTracker != nil {
+		cacheProfile = cacheTracker.BuildClaudeProfileWithPolicy(executorEffectiveReq, executorEstimate, cachePolicy, isolationSeed)
+		if cacheProfile != nil {
+			cacheProfile.requestTiming = requestTimingFromContext(ctx)
+		}
 	}
 	executorPayload := bindKiroPayloadContext(ClaudeToKiro(&executorReq, thinking), ctx)
 	toolUseID := newClaudeServerToolUseID()
@@ -183,9 +189,9 @@ func (h *Handler) handleAdvisorRequest(
 	}
 
 	cacheUsage := promptCacheUsage{}
-	if h.promptCache != nil && executorResult.Account != nil {
-		cacheUsage = h.promptCache.Compute(executorResult.Account.ID, cacheProfile)
-		h.promptCache.Update(executorResult.Account.ID, cacheProfile)
+	if cacheTracker != nil && executorResult.Account != nil {
+		cacheUsage = cacheTracker.Compute(executorResult.Account.ID, cacheProfile)
+		cacheTracker.Update(executorResult.Account.ID, cacheProfile)
 	}
 
 	finalContent, extractedReasoning := extractThinkingFromContent(executorResult.Content)
@@ -223,12 +229,16 @@ func (h *Handler) handleAdvisorRequest(
 		cacheUsage,
 		minInt(executorResult.InputTokens, totalInputTokens),
 	)
+	// Kiro's context occupancy includes its hidden system prompt. It is kept in
+	// the diagnostic field below, while public usage/cache remains client-visible.
+	publicInputTokens := totalInputTokens
+	responseCacheUsage := reanchorClaudeCacheUsage(cacheProfile, cacheUsage, totalInputTokens)
 	totalOutputTokens := advisorResult.OutputTokens + estimateClaudeOutputTokensWithRedacted(
 		finalContent, reasoning.Text, reasoning.Redacted, executorResult.ToolUses,
 	)
 	resp := KiroToClaudeResponseWithReasoning(
 		finalContent, responseReasoning, includeEmptyThinkingBlock, executorResult.ToolUses,
-		totalInputTokens, totalOutputTokens, responseModel,
+		publicInputTokens, totalOutputTokens, responseModel,
 	)
 	resp.Content = append(serverBlocks, resp.Content...)
 	resp.StopReason = resolveClaudeStopReason(
@@ -238,13 +248,14 @@ func (h *Handler) handleAdvisorRequest(
 		resp.StopReason = "stop_sequence"
 		resp.StopSequence = &matchedStopSequence
 	}
-	resp.Usage.InputTokens = billedClaudeInputTokens(totalInputTokens, cacheUsage)
+	resp.Usage.InputTokens = billedClaudeInputTokens(publicInputTokens, responseCacheUsage)
 	resp.Usage.OutputTokens = totalOutputTokens
-	resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
-	resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
+	resp.Usage.CacheCreationInputTokens = responseCacheUsage.CacheCreationInputTokens
+	resp.Usage.CacheReadInputTokens = responseCacheUsage.CacheReadInputTokens
+	resp.Usage.KiroContextUsage = kiroContextUsageFromTokens(req.Model, executorResult.ContextInputTokens)
 	resp.Usage.CacheCreation = &ClaudeCacheCreationUsage{
-		Ephemeral5mInputTokens: cacheUsage.CacheCreation5mInputTokens,
-		Ephemeral1hInputTokens: cacheUsage.CacheCreation1hInputTokens,
+		Ephemeral5mInputTokens: responseCacheUsage.CacheCreation5mInputTokens,
+		Ephemeral1hInputTokens: responseCacheUsage.CacheCreation1hInputTokens,
 	}
 	resp.Usage.OutputTokensDetails = claudeReasoningUsageDetails(reasoning, includeEmptyThinkingBlock)
 
@@ -317,6 +328,7 @@ func (h *Handler) callClaudeBuffered(
 	thinking bool,
 	estimatedInputTokens int,
 ) (*bufferedClaudeCall, error) {
+	payload = cloneKiroPayload(payload)
 	if h.pool == nil {
 		return nil, errNoAdvisorAccounts
 	}
@@ -332,7 +344,7 @@ func (h *Handler) callClaudeBuffered(
 
 	attemptLimit := h.maxAccountAttempts()
 	for attempt := 0; attempt < attemptLimit; attempt++ {
-		account, allFull := h.acquireAccountForModel(model, excluded, retrySameID)
+		account, allFull := h.acquireAccountForModel(model, excluded, retrySameID, kiroPayloadContext(payload))
 		retrySameID = ""
 		if account == nil {
 			if h.startExpiredAccountRefreshes(model, excluded) {
@@ -356,7 +368,6 @@ func (h *Handler) callClaudeBuffered(
 		result := &bufferedClaudeCall{Account: account}
 		var content strings.Builder
 		var reasoning strings.Builder
-		var realInputTokens int
 		var suppressedReasoningObserved bool
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -399,8 +410,9 @@ func (h *Handler) callClaudeBuffered(
 				result.Credits = credits
 			},
 			OnContextUsage: func(percent float64) {
-				realInputTokens = int(percent * float64(getContextWindowSize(model)) / 100.0)
-				if percent >= 100 {
+				contextInputTokens, exceeded := observeKiroContextUsage(payload, model, percent)
+				result.ContextInputTokens = contextInputTokens
+				if exceeded {
 					result.ContextWindowExceeded = true
 				}
 			},
@@ -408,14 +420,17 @@ func (h *Handler) callClaudeBuffered(
 		err := call(account, payload, callback)
 		if err == nil {
 			visibleContent, _ := extractThinkingFromContent(content.String())
-			if hiddenReasoningOnlyResponse(
-				thinking,
-				suppressedReasoningObserved,
+			visibleContent, markerSeen := filterAgentCompletionContent(payload, visibleContent, len(result.ToolUses))
+			if incompleteAgentResponse(
+				payload,
+				suppressedReasoningObserved || reasoning.Len() > 0 || result.Reasoning.Signature != "" || len(result.Reasoning.Redacted) > 0,
 				visibleContent,
+				markerSeen,
 				len(result.ToolUses),
 				result.UpstreamStopReason,
 			) {
-				err = newUpstreamIncompleteResponseError()
+				err = newUpstreamAgentMarkerMismatchError()
+				prepareReasoningOnlyRetry(payload, err)
 			}
 		}
 		if err != nil {
@@ -425,16 +440,21 @@ func (h *Handler) callClaudeBuffered(
 			}
 			lastErr = err
 			if isKiroInputTooLongError(err) {
+				if h.retryAgentRecoveryAfterInputTooLong("buffered Claude", payload, account, &retrySameID, err) {
+					attemptLimit++
+					continue
+				}
 				return nil, err
 			}
-			if isUpstreamIncompleteResponseError(err) {
-				retried, retryErr := h.retryKiroPreResponse(payload, account, &preResponseRetryCount, excluded, &retrySameID)
+			if isUpstreamIncompleteResponseError(err) && agentCompletionRetryAllowed(payload, err) {
+				retried, retryErr := h.retryKiroPreResponse(payload, account, &preResponseRetryCount, excluded, &retrySameID, err)
 				if retryErr != nil {
 					return nil, retryErr
 				}
 				if retried {
 					attemptLimit++
-					logger.Warnf("[KiroAPI] retrying buffered Claude call after reasoning-only response account_id=%s retry=%d/%d", account.ID, preResponseRetryCount, maxKiroPreResponseRetries)
+					retryNumber, retryLimit := kiroPreResponseRetryProgress(payload, preResponseRetryCount, err)
+					logger.Warnf("[KiroAPI] retrying buffered Claude call after incomplete agent response account_id=%s retry=%d/%d", account.ID, retryNumber, retryLimit)
 					continue
 				}
 			}
@@ -442,7 +462,7 @@ func (h *Handler) callClaudeBuffered(
 				return nil, err
 			}
 			if isRateLimitError(err) {
-				decision := h.applyRateLimitPolicy(account, retryCounts, excluded)
+				decision := h.applyRateLimitPolicy(account, retryCounts, excluded, err)
 				if decision.Return429 {
 					return nil, err
 				}
@@ -461,13 +481,13 @@ func (h *Handler) callClaudeBuffered(
 		}
 		h.releaseAccount(account)
 
-		result.Content = content.String()
+		result.Content, _ = extractThinkingFromContent(content.String())
+		result.Content, _ = filterAgentCompletionContent(payload, result.Content, len(result.ToolUses))
 		result.Reasoning.Text = reasoning.String()
-		if realInputTokens > 0 {
-			result.InputTokens = realInputTokens
-		} else if result.InputTokens <= 0 {
-			result.InputTokens = max(1, clampClaudeInputTokensToModelWindow(model, estimatedInputTokens))
-		}
+		// Upstream token counters can use the same Kiro context domain as
+		// contextUsagePercentage. Anchor public and internal accounting to the
+		// request estimate; raw occupancy remains in ContextInputTokens.
+		result.InputTokens = max(1, clampClaudeInputTokensToModelWindow(model, estimatedInputTokens))
 		result.OutputTokens = estimateClaudeOutputTokensWithRedacted(
 			result.Content, result.Reasoning.Text, result.Reasoning.Redacted, result.ToolUses,
 		)

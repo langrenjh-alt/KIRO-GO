@@ -77,6 +77,7 @@ func (h *Handler) handleResponsesWebSearch(
 			h.sendOpenAIError(w, http.StatusInternalServerError, "server_error", "Streaming not supported")
 			return
 		}
+		beginExplicitVisibleResponseTracking(w)
 	}
 
 	call := h.webSearchMCPCaller
@@ -85,11 +86,11 @@ func (h *Handler) handleResponsesWebSearch(
 	}
 	started := time.Now()
 	execution, err := h.executeWebSearch(ctx, query, upstreamQuery, tool, call)
+	accountID := ""
+	if execution != nil {
+		accountID = execution.LastAccountID
+	}
 	if err != nil {
-		accountID := ""
-		if execution != nil {
-			accountID = execution.LastAccountID
-		}
 		h.recordFailureWithDetails("responses", model, accountID, err)
 		if isWebSearchContextError(ctx, err) {
 			return
@@ -101,8 +102,16 @@ func (h *Handler) handleResponsesWebSearch(
 		h.sendOpenAIError(w, status, errorType, message)
 		return
 	}
+	cacheAccountID := ""
+	cacheUsage := promptCacheUsage{}
+	if execution.Account != nil && execution.DegradedError == nil {
+		cacheAccountID = execution.Account.ID
+		req.promptCache.compute(cacheAccountID)
+		cacheUsage = responsesPromptCacheUsageForInput(req.promptCache, estimatedInputTokens)
+	}
 
 	respObj, outputTokens := buildResponsesWebSearchObject(respID, responseModel, req, execution.Result, estimatedInputTokens)
+	applyResponsesPromptCacheUsage(respObj, cacheUsage)
 	respObj.StoredInput = storedInput
 	respObj.Instructions = req.Instructions
 	respObj.OwnerKeyID = apiKeyID
@@ -114,20 +123,34 @@ func (h *Handler) handleResponsesWebSearch(
 
 	if req.Stream {
 		if err := writeResponsesWebSearchSSE(w, respObj); err != nil {
-			h.pool.RecordSuccess(execution.Account.ID)
-			h.recordFailureWithDetails("responses", model, execution.Account.ID, err)
+			if execution.Account != nil {
+				h.pool.RecordSuccess(execution.Account.ID)
+			}
+			h.recordFailureWithDetails("responses", model, accountID, err)
 			return
 		}
-		h.recordWebSearchSuccess("responses", model, apiKeyID, execution.Account, estimatedInputTokens, outputTokens, started)
+		if execution.DegradedError != nil {
+			h.recordFailureWithDetails("responses", model, accountID, execution.DegradedError)
+			return
+		}
+		cacheUsage = req.promptCache.complete(cacheAccountID, estimatedInputTokens)
+		h.recordWebSearchSuccess("responses", model, apiKeyID, execution.Account, estimatedInputTokens, outputTokens, cacheUsage, started)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	if err := json.NewEncoder(w).Encode(respObj); err != nil {
-		h.pool.RecordSuccess(execution.Account.ID)
-		h.recordFailureWithDetails("responses", model, execution.Account.ID, err)
+		if execution.Account != nil {
+			h.pool.RecordSuccess(execution.Account.ID)
+		}
+		h.recordFailureWithDetails("responses", model, accountID, err)
 		return
 	}
-	h.recordWebSearchSuccess("responses", model, apiKeyID, execution.Account, estimatedInputTokens, outputTokens, started)
+	if execution.DegradedError != nil {
+		h.recordFailureWithDetails("responses", model, accountID, execution.DegradedError)
+		return
+	}
+	cacheUsage = req.promptCache.complete(cacheAccountID, estimatedInputTokens)
+	h.recordWebSearchSuccess("responses", model, apiKeyID, execution.Account, estimatedInputTokens, outputTokens, cacheUsage, started)
 }
 
 func buildResponsesWebSearchObject(
@@ -214,10 +237,11 @@ func writeResponsesWebSearchSSE(w http.ResponseWriter, response *ResponsesObject
 	if !ok {
 		return errors.New("streaming web search response is not supported by the response writer")
 	}
+	beginExplicitVisibleResponseTracking(w)
 	configureSSEHeaders(w)
 
 	sequenceNumber := 0
-	send := func(eventName string, payload map[string]interface{}) error {
+	sendEvent := func(eventName string, payload map[string]interface{}, visible bool) error {
 		payload["sequence_number"] = sequenceNumber
 		data, err := json.Marshal(payload)
 		if err != nil {
@@ -226,9 +250,18 @@ func writeResponsesWebSearchSSE(w http.ResponseWriter, response *ResponsesObject
 		if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventName, data); err != nil {
 			return err
 		}
+		if visible {
+			markVisibleResponseWritten(w)
+		}
 		flusher.Flush()
 		sequenceNumber++
 		return nil
+	}
+	send := func(eventName string, payload map[string]interface{}) error {
+		return sendEvent(eventName, payload, false)
+	}
+	sendVisible := func(eventName string, payload map[string]interface{}) error {
+		return sendEvent(eventName, payload, true)
 	}
 
 	initial := *response
@@ -294,7 +327,7 @@ func writeResponsesWebSearchSSE(w http.ResponseWriter, response *ResponsesObject
 		}
 	}
 	for _, chunk := range chunkWebSearchText(part.Text, webSearchSummaryChunkRunes) {
-		if err := send("response.output_text.delta", map[string]interface{}{
+		if err := sendVisible("response.output_text.delta", map[string]interface{}{
 			"type": "response.output_text.delta", "item_id": messageItem.ID,
 			"output_index": 1, "content_index": 0, "delta": chunk,
 		}); err != nil {

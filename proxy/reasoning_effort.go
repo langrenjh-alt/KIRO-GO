@@ -2,6 +2,13 @@ package proxy
 
 import "strings"
 
+const (
+	// Enabled thinking uses the legacy budget form. Keep it bounded so a
+	// client-supplied budget cannot turn into an unbounded reasoning pass.
+	defaultThinkingBudgetTokens = 20_000
+	maxThinkingBudgetTokens     = 24_576
+)
+
 // AdditionalModelRequestFields mirrors the mixed-case Kiro wire format. The
 // outer payload key is camelCase, while output_config intentionally stays
 // snake_case.
@@ -14,16 +21,25 @@ type KiroOutputConfig struct {
 }
 
 func effortFromBudgetTokens(tokens int) string {
+	tokens = clampThinkingBudgetTokens(tokens)
 	switch {
 	case tokens <= 4_000:
 		return "low"
 	case tokens <= 16_000:
 		return "medium"
-	case tokens <= 64_000:
-		return "high"
 	default:
-		return "xhigh"
+		return "high"
 	}
+}
+
+func clampThinkingBudgetTokens(tokens int) int {
+	if tokens <= 0 {
+		return tokens
+	}
+	if tokens > maxThinkingBudgetTokens {
+		return maxThinkingBudgetTokens
+	}
+	return tokens
 }
 
 func normalizeEffortForModel(modelID, rawEffort string) string {

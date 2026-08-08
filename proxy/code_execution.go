@@ -92,6 +92,7 @@ func (h *Handler) handleCodeExecutionRequest(
 	responseModel string,
 	estimatedInputTokens int,
 	apiKeyID string,
+	cacheProfile *promptCacheProfile,
 ) {
 	if req == nil {
 		h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", "Code execution request is missing")
@@ -119,7 +120,23 @@ func (h *Handler) handleCodeExecutionRequest(
 	container := newCodeExecutionContainer()
 	inputTokens := max(1, estimatedInputTokens)
 	outputTokens := estimateClaudeOutputTokensWithRedacted(codeExecutionUnavailableText, "", nil, nil)
-	h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, result.Credits)
+	cacheTracker := promptCacheTrackerForProfile(h.promptCache, cacheProfile)
+	cacheUsage := promptCacheUsage{}
+	if result.Account != nil {
+		cacheUsage = cacheTracker.Compute(result.Account.ID, cacheProfile)
+		cacheUsage = reanchorClaudeCacheUsage(cacheProfile, cacheUsage, inputTokens)
+		cacheTracker.Update(result.Account.ID, cacheProfile)
+	}
+	publicInputTokens := claudePublicInputTokens(payload, req.Model, inputTokens)
+	responseCacheUsage := cacheUsage
+	contextUsage := kiroContextUsage(payload, req.Model)
+	// ContextInputTokens is Kiro's raw window occupancy and includes Kiro-owned
+	// instructions. Keep it diagnostic-only; public usage stays client-visible.
+	responseCacheUsage = claudeTerminalCacheUsage(cacheProfile, payload, req.Model, inputTokens, cacheUsage)
+	if result.ContextInputTokens > 0 {
+		contextUsage = kiroContextUsageFromTokens(req.Model, result.ContextInputTokens)
+	}
+	h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, result.Credits, cacheUsage)
 	accountID := ""
 	if result.Account != nil {
 		accountID = result.Account.ID
@@ -127,7 +144,7 @@ func (h *Handler) handleCodeExecutionRequest(
 	h.recordSuccessLog("claude", req.Model, accountID, inputTokens+outputTokens, result.Credits, time.Since(started).Milliseconds())
 
 	if req.Stream {
-		if err := writeCodeExecutionSSE(w, responseModel, blocks, container, inputTokens, outputTokens); err != nil {
+		if err := writeCodeExecutionSSE(w, responseModel, blocks, container, publicInputTokens, outputTokens, responseCacheUsage, contextUsage); err != nil {
 			h.recordFailureWithDetails("claude", req.Model, accountID, err)
 		}
 		return
@@ -143,13 +160,19 @@ func (h *Handler) handleCodeExecutionRequest(
 		StopReason:  "end_turn",
 		StopDetails: nil,
 		Usage: ClaudeUsage{
-			InputTokens:         inputTokens,
-			OutputTokens:        outputTokens,
-			OutputTokensDetails: &ClaudeOutputTokensDetails{},
-			CacheCreation:       &ClaudeCacheCreationUsage{},
-			ServiceTier:         "standard",
-			InferenceGeo:        "not_available",
-			ServerToolUse:       &ClaudeServerToolUsage{},
+			InputTokens:              billedClaudeInputTokens(publicInputTokens, responseCacheUsage),
+			OutputTokens:             outputTokens,
+			OutputTokensDetails:      &ClaudeOutputTokensDetails{},
+			CacheCreationInputTokens: responseCacheUsage.CacheCreationInputTokens,
+			CacheReadInputTokens:     responseCacheUsage.CacheReadInputTokens,
+			CacheCreation: &ClaudeCacheCreationUsage{
+				Ephemeral5mInputTokens: responseCacheUsage.CacheCreation5mInputTokens,
+				Ephemeral1hInputTokens: responseCacheUsage.CacheCreation1hInputTokens,
+			},
+			ServiceTier:      "standard",
+			InferenceGeo:     "not_available",
+			ServerToolUse:    &ClaudeServerToolUsage{},
+			KiroContextUsage: contextUsage,
 		},
 		ContextManagement: ClaudeContextManagement{AppliedEdits: []interface{}{}},
 	}
@@ -165,6 +188,8 @@ func writeCodeExecutionSSE(
 	blocks []ClaudeContentBlock,
 	container *ClaudeContainer,
 	inputTokens, outputTokens int,
+	cacheUsage promptCacheUsage,
+	contextUsage *KiroContextUsage,
 ) error {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -182,7 +207,7 @@ func writeCodeExecutionSSE(
 		"message": map[string]interface{}{
 			"model": model, "id": newClaudeMessageID(), "type": "message", "role": "assistant",
 			"content": []interface{}{}, "stop_reason": nil, "stop_sequence": nil, "stop_details": nil,
-			"usage": buildClaudeUsageMap(inputTokens, 1, promptCacheUsage{}, true),
+			"usage": buildClaudeUsageMap(inputTokens, 1, cacheUsage, true),
 		},
 	})
 	serverUse := blocks[0]
@@ -216,7 +241,10 @@ func writeCodeExecutionSSE(
 		"delta": map[string]interface{}{"type": "text_delta", "text": blocks[2].Text},
 	})
 	send("content_block_stop", map[string]interface{}{"type": "content_block_stop", "index": 2})
-	usage := buildClaudeTerminalUsageMap(inputTokens, outputTokens, promptCacheUsage{})
+	usage := buildClaudeTerminalUsageMap(inputTokens, outputTokens, cacheUsage)
+	if contextUsage != nil {
+		usage["kiro_context_usage"] = contextUsage
+	}
 	usage["server_tool_use"] = map[string]int{"web_search_requests": 0, "web_fetch_requests": 0}
 	send("message_delta", map[string]interface{}{
 		"type": "message_delta",

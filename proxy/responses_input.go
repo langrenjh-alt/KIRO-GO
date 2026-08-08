@@ -84,10 +84,14 @@ func convertResponsesInputItems(items []json.RawMessage) ([]OpenAIMessage, error
 			if out == "" {
 				out = stringifyArbitrary(obj["content"])
 			}
+			status, _ := obj["status"].(string)
+			isError, _ := obj["is_error"].(bool)
 			messages = append(messages, OpenAIMessage{
-				Role:       "tool",
-				Content:    out,
-				ToolCallID: callID,
+				Role:              "tool",
+				Content:           out,
+				ToolCallID:        callID,
+				ToolResultStatus:  status,
+				ToolResultIsError: isError,
 			})
 
 		case typ == "function_call":

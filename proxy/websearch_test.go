@@ -831,6 +831,67 @@ func TestExecuteWebSearchRetriesRPCRejectionOnAlternateAccount(t *testing.T) {
 	}
 }
 
+func TestHandleWebSearchRPCRejectionReturnsStructuredUnavailableResult(t *testing.T) {
+	if err := config.Init(t.TempDir() + "/config.json"); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.AddAccount(config.Account{
+		ID:          "websearch-rpc-rejected",
+		Enabled:     true,
+		AccessToken: "access-token",
+		ProfileArn:  "arn:aws:codewhisperer:us-east-1:1:profile/websearch-rpc-rejected",
+	}); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+
+	pool := accountpool.GetPool()
+	pool.Reload()
+	h := &Handler{pool: pool, traffic: NewTrafficTracker(time.Hour)}
+	req := &ClaudeRequest{
+		Model:    "claude-sonnet-4-6",
+		Messages: []ClaudeMessage{{Role: "user", Content: webSearchQueryPrefix + "release notes"}},
+		Tools:    []ClaudeTool{{Type: "web_search_20250305", Name: "web_search"}},
+	}
+
+	var calls int
+	recorder := httptest.NewRecorder()
+	h.handleWebSearchRequestWithCaller(recorder, context.Background(), req, 10, "",
+		func(context.Context, *config.Account, string) (*webSearchResultSet, error) {
+			calls++
+			code := jsonRPCInvalidParams
+			return nil, &webSearchMCPError{
+				StatusCode: http.StatusBadGateway,
+				RPCCode:    &code,
+				Message:    "web search MCP upstream rejected the request (JSON-RPC -32602)",
+			}
+		})
+
+	if recorder.Code != http.StatusOK || calls != 1 {
+		t.Fatalf("status=%d calls=%d body=%s", recorder.Code, calls, recorder.Body.String())
+	}
+	var response map[string]interface{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	blocks, _ := response["content"].([]interface{})
+	if len(blocks) != 3 {
+		t.Fatalf("structured fallback content=%#v", response["content"])
+	}
+	toolResult := blocks[1].(map[string]interface{})
+	results, ok := toolResult["content"].([]interface{})
+	if !ok || len(results) != 0 || toolResult["type"] != "web_search_tool_result" {
+		t.Fatalf("fallback tool result=%#v", toolResult)
+	}
+	summary := blocks[2].(map[string]interface{})["text"].(string)
+	if !strings.Contains(summary, "temporarily unavailable") || strings.Contains(summary, "No results found") {
+		t.Fatalf("fallback summary=%q", summary)
+	}
+	logs := h.getRequestLogs()
+	if len(logs) != 1 || logs[0].Status != "error" || logs[0].ErrorType != "websearch" {
+		t.Fatalf("fallback logs=%#v", logs)
+	}
+}
+
 func TestHandleWebSearchFailureReturnsRateLimitAndRecordsOnce(t *testing.T) {
 	if err := config.Init(t.TempDir() + "/config.json"); err != nil {
 		t.Fatalf("config.Init: %v", err)
