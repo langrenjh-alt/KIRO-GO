@@ -89,6 +89,154 @@ func inferActiveKiroToolConfig(history []KiroHistoryMessage) ([]KiroToolWrapper,
 	return tools, nameMap
 }
 
+func toolResultsExactlyMatchUses(uses []KiroToolUse, results []KiroToolResult) bool {
+	if len(uses) == 0 || len(uses) != len(results) {
+		return false
+	}
+	usesByID := make(map[string]bool, len(uses))
+	for _, use := range uses {
+		id := strings.TrimSpace(use.ToolUseID)
+		if id == "" || strings.TrimSpace(use.Name) == "" || usesByID[id] {
+			return false
+		}
+		usesByID[id] = true
+	}
+	seen := make(map[string]bool, len(results))
+	for _, result := range results {
+		id := strings.TrimSpace(result.ToolUseID)
+		if id == "" || seen[id] || !usesByID[id] {
+			return false
+		}
+		seen[id] = true
+	}
+	return len(seen) == len(usesByID)
+}
+
+// validateFullKiroToolHistory verifies every structured tool round, including
+// the final assistant round answered by the current user message. Kiro expects
+// each result set to immediately follow the calls it answers.
+func validateFullKiroToolHistory(payload *KiroPayload) (*KiroAssistantResponseMessage, bool) {
+	if payload == nil {
+		return nil, false
+	}
+	var pending *KiroAssistantResponseMessage
+	for i := range payload.ConversationState.History {
+		message := &payload.ConversationState.History[i]
+		if (message.UserInputMessage == nil) == (message.AssistantResponseMessage == nil) {
+			return nil, false
+		}
+		if assistant := message.AssistantResponseMessage; assistant != nil {
+			if pending != nil {
+				return nil, false
+			}
+			if len(assistant.ToolUses) > 0 {
+				pending = assistant
+			}
+			continue
+		}
+
+		user := message.UserInputMessage
+		var results []KiroToolResult
+		if user.UserInputMessageContext != nil {
+			results = user.UserInputMessageContext.ToolResults
+			user.UserInputMessageContext.Tools = nil
+		}
+		if pending == nil {
+			if len(results) > 0 {
+				return nil, false
+			}
+			continue
+		}
+		if !toolResultsExactlyMatchUses(pending.ToolUses, results) {
+			return nil, false
+		}
+		pending = nil
+	}
+
+	current := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+	var currentResults []KiroToolResult
+	if current != nil {
+		currentResults = current.ToolResults
+	}
+	if pending == nil {
+		return nil, len(currentResults) == 0
+	}
+	return pending, toolResultsExactlyMatchUses(pending.ToolUses, currentResults)
+}
+
+func ensureFullKiroHistoryToolConfig(payload *KiroPayload) bool {
+	if payload == nil {
+		return false
+	}
+	current := &payload.ConversationState.CurrentMessage.UserInputMessage
+	if current.UserInputMessageContext == nil {
+		current.UserInputMessageContext = &UserInputMessageContext{}
+	}
+	context := current.UserInputMessageContext
+	available := make(map[string]bool, len(context.Tools))
+	for _, tool := range context.Tools {
+		name := strings.TrimSpace(tool.ToolSpecification.Name)
+		if name == "" || available[name] {
+			return false
+		}
+		available[name] = true
+	}
+	if payload.ToolNameMap == nil {
+		payload.ToolNameMap = make(map[string]string)
+	}
+
+	for i := range payload.ConversationState.History {
+		assistant := payload.ConversationState.History[i].AssistantResponseMessage
+		if assistant == nil {
+			continue
+		}
+		for j := range assistant.ToolUses {
+			original := strings.TrimSpace(assistant.ToolUses[j].Name)
+			if original == "" {
+				return false
+			}
+			upstream := ""
+			if available[original] {
+				upstream = original
+			} else {
+				for candidate, mappedOriginal := range payload.ToolNameMap {
+					if mappedOriginal == original && available[candidate] {
+						if upstream != "" && upstream != candidate {
+							return false
+						}
+						upstream = candidate
+					}
+				}
+			}
+			if upstream == "" {
+				upstream = shortenToolName(sanitizeToolName(original))
+				if mappedOriginal, occupied := payload.ToolNameMap[upstream]; occupied && mappedOriginal != original {
+					return false
+				}
+				if !available[upstream] {
+					wrapper := KiroToolWrapper{}
+					wrapper.ToolSpecification.Name = upstream
+					wrapper.ToolSpecification.Description = normalizeToolDesc("", upstream)
+					wrapper.ToolSpecification.InputSchema = InputSchema{JSON: map[string]interface{}{"type": "object"}}
+					context.Tools = append(context.Tools, wrapper)
+					available[upstream] = true
+				}
+				if upstream != original {
+					payload.ToolNameMap[upstream] = original
+				}
+			}
+			assistant.ToolUses[j].Name = upstream
+		}
+	}
+	if len(payload.ToolNameMap) == 0 {
+		payload.ToolNameMap = nil
+	}
+	if len(context.Tools) == 0 && len(context.ToolResults) == 0 {
+		current.UserInputMessageContext = nil
+	}
+	return true
+}
+
 func stableKiroAssistantMessageID(conversationID string, index int, assistant *KiroAssistantResponseMessage) string {
 	if assistant == nil {
 		return ""
@@ -217,33 +365,110 @@ func fallbackKiroHistoryToLegacy(payload *KiroPayload) {
 	}
 	payload.ConversationState.History = sanitizeKiroHistory(payload.ConversationState.History, nil)
 	stripKiroHistoryReasoning(payload)
+	for i := range payload.ConversationState.History {
+		if assistant := payload.ConversationState.History[i].AssistantResponseMessage; assistant != nil {
+			assistant.MessageID = ""
+		}
+	}
 	payload.HistoryMode = kiroHistoryModeLegacy
 }
 
-// finalizeKiroHistoryProtocol makes the native branch fail closed. Only the
-// last fully paired tool round remains structured, only its opaque redacted
-// reasoning may be replayed, and every other shape returns to legacy history.
+// normalizeNativeKiroHistory removes only proxy-authored pollution while
+// preserving native toolUse/toolResult blocks. Some compatible clients emit a
+// tool-result message and a separate user continuation; Kiro expects one user
+// turn after the assistant tool call, so those adjacent user messages are
+// combined without flattening their structured results.
+func normalizeNativeKiroHistory(history []KiroHistoryMessage) []KiroHistoryMessage {
+	if len(history) == 0 {
+		return history
+	}
+
+	cleaned := make([]KiroHistoryMessage, 0, len(history))
+	for i := range history {
+		message := history[i]
+		if assistant := message.AssistantResponseMessage; assistant != nil {
+			if assistant.Content != "" {
+				assistant.Content = stripPollutedToolCallText(assistant.Content)
+			}
+			if len(assistant.ToolUses) == 0 {
+				content := strings.TrimSpace(assistant.Content)
+				if content == "" || content == minimalFallbackUserContent {
+					continue
+				}
+			}
+		}
+
+		if user := message.UserInputMessage; user != nil {
+			if context := user.UserInputMessageContext; context != nil {
+				// Tool definitions belong to currentMessage. Historical user
+				// contexts carry results only.
+				context.Tools = nil
+				if len(context.ToolResults) == 0 {
+					user.UserInputMessageContext = nil
+				}
+			}
+			if strings.TrimSpace(user.Content) == "" && len(user.Images) == 0 &&
+				(user.UserInputMessageContext == nil || len(user.UserInputMessageContext.ToolResults) == 0) {
+				user.Content = minimalFallbackUserContent
+			}
+
+			if len(cleaned) > 0 {
+				previous := cleaned[len(cleaned)-1].UserInputMessage
+				previousContext := (*UserInputMessageContext)(nil)
+				if previous != nil {
+					previousContext = previous.UserInputMessageContext
+				}
+				// Only coalesce the adjacent user messages that form a native
+				// tool-result turn. Ordinary consecutive user messages are
+				// separate causal turns and must remain separate.
+				coalescesToolTurn := (previousContext != nil && len(previousContext.ToolResults) > 0) ||
+					(user.UserInputMessageContext != nil && len(user.UserInputMessageContext.ToolResults) > 0)
+				if previous != nil && coalescesToolTurn {
+					previous.Content = joinHistoryText(previous.Content, user.Content)
+					previous.Images = append(previous.Images, user.Images...)
+					if user.UserInputMessageContext != nil && len(user.UserInputMessageContext.ToolResults) > 0 {
+						if previous.UserInputMessageContext == nil {
+							previous.UserInputMessageContext = &UserInputMessageContext{}
+						}
+						previous.UserInputMessageContext.ToolResults = append(
+							previous.UserInputMessageContext.ToolResults,
+							user.UserInputMessageContext.ToolResults...,
+						)
+					}
+					continue
+				}
+			}
+		}
+
+		cleaned = append(cleaned, message)
+	}
+	return cleaned
+}
+
+// finalizeKiroHistoryProtocol makes the native branch fail closed. Every fully
+// paired tool round remains structured, while opaque reasoning is replayed only
+// for the active round answered by the current message.
 func finalizeKiroHistoryProtocol(payload *KiroPayload) {
 	if payload == nil || payload.HistoryMode != kiroHistoryModeNativeActive {
 		return
 	}
-	if !normalizeActiveKiroToolNames(payload) {
+	payload.ConversationState.History = normalizeNativeKiroHistory(payload.ConversationState.History)
+	if !ensureFullKiroHistoryToolConfig(payload) {
 		fallbackKiroHistoryToLegacy(payload)
 		return
 	}
-	active, _, ok := activeKiroHistoryRound(payload)
+	active, ok := validateFullKiroToolHistory(payload)
 	if !ok {
 		fallbackKiroHistoryToLegacy(payload)
 		return
 	}
 
-	activeIndex := len(payload.ConversationState.History) - 1
 	for i := range payload.ConversationState.History {
 		assistant := payload.ConversationState.History[i].AssistantResponseMessage
 		if assistant == nil {
 			continue
 		}
-		if i != activeIndex || assistant != active || assistant.ReasoningContent == nil ||
+		if assistant != active || assistant.ReasoningContent == nil ||
 			assistant.ReasoningContent.RedactedContent == "" {
 			assistant.ReasoningContent = nil
 		}

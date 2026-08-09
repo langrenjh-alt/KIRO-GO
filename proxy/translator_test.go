@@ -447,7 +447,7 @@ func TestClaudeAssistantThinkingRoundTripsIntoKiroHistory(t *testing.T) {
 	}
 }
 
-func TestToolResultsContinuationIncludesInstructionPrefix(t *testing.T) {
+func TestToolResultsContinuationUsesNativeKiroContext(t *testing.T) {
 	req := &OpenAIRequest{
 		Model: "claude-sonnet-4.5",
 		Messages: []OpenAIMessage{
@@ -465,13 +465,11 @@ func TestToolResultsContinuationIncludesInstructionPrefix(t *testing.T) {
 	}
 
 	payload := OpenAIToKiro(req, false)
-	content := payload.ConversationState.CurrentMessage.UserInputMessage.Content
-
-	if !strings.Contains(content, toolResultsContinuationPrefix) {
-		t.Fatalf("expected tool continuation prefix, got %q", content)
-	}
-	if !strings.Contains(content, "result-1") {
-		t.Fatalf("expected tool result text in continuation content, got %q", content)
+	current := payload.ConversationState.CurrentMessage.UserInputMessage
+	if current.Content != "" || current.UserInputMessageContext == nil ||
+		len(current.UserInputMessageContext.ToolResults) != 1 ||
+		kiroToolResultText(current.UserInputMessageContext.ToolResults[0]) != "result-1" {
+		t.Fatalf("native continuation changed: %+v", current)
 	}
 }
 
@@ -685,7 +683,7 @@ func TestClaudeToolResultErrorStatusMapping(t *testing.T) {
 	}
 }
 
-func TestClaudeToolResultErrorStatusSurvivesFlattening(t *testing.T) {
+func TestClaudeToolResultErrorStatusSurvivesHistoryConversion(t *testing.T) {
 	t.Run("historical result", func(t *testing.T) {
 		req := &ClaudeRequest{
 			Model: "claude-opus-4.8",
@@ -703,15 +701,10 @@ func TestClaudeToolResultErrorStatusSurvivesFlattening(t *testing.T) {
 		}
 
 		payload := ClaudeToKiro(req, false)
-		var historyText strings.Builder
-		for _, message := range payload.ConversationState.History {
-			if message.UserInputMessage != nil {
-				historyText.WriteString(message.UserInputMessage.Content)
-			}
-		}
-		flattened := historyText.String()
-		if !strings.Contains(flattened, `<tool_result name="Write" status="error">`) || !strings.Contains(flattened, "Write failed") {
-			t.Fatalf("flattened history lost tool failure status or body: %q", flattened)
+		rounds := collectNativeKiroToolRounds(t, payload)
+		if len(rounds) != 1 || rounds[0].Results[0].Status != "error" ||
+			kiroToolResultText(rounds[0].Results[0]) != "Write failed" {
+			t.Fatalf("native history lost tool failure status or body: %+v", rounds)
 		}
 	})
 

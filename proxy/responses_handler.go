@@ -266,6 +266,7 @@ func (h *Handler) handleResponsesNonStream(
 			call = CallKiroAPI
 		}
 		err := call(account, payload, callback)
+		err = resolveKiroOutputTruncation(payload, err, upstreamStopReason, content, completedKiroToolNames(toolUses))
 		if err == nil {
 			visibleContent, _ := extractThinkingFromContent(content)
 			visibleContent, markerSeen := filterAgentCompletionContent(payload, visibleContent, len(toolUses))
@@ -296,6 +297,12 @@ func (h *Handler) handleResponsesNonStream(
 				return
 			}
 			lastErr = err
+			if takeKiroOutputContinuationRetry(payload, err) {
+				retryUsage.markLastContinuationAttemptOutput()
+				retrySameID = account.ID
+				attemptLimit++
+				continue
+			}
 			if isKiroInputTooLongError(err) {
 				if h.retryAgentRecoveryAfterInputTooLong("Responses non-stream", payload, account, &retrySameID, err) {
 					attemptLimit++
@@ -359,6 +366,7 @@ func (h *Handler) handleResponsesNonStream(
 
 		finalContent, _ := extractThinkingFromContent(content)
 		finalContent, _ = filterAgentCompletionContent(payload, finalContent, len(toolUses))
+		finalContent = prependKiroOutputContinuation(payload, finalContent)
 		if !thinking {
 			reasoningContent = ""
 		}
@@ -376,10 +384,11 @@ func (h *Handler) handleResponsesNonStream(
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
 		cacheUsage := req.promptCache.complete(account.ID, inputTokens)
-		h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, credits, cacheUsage)
+		attemptOutputTokens := retryUsage.finalAttemptOutputTokens(outputTokens)
+		h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, attemptOutputTokens, credits, cacheUsage)
 		h.pool.RecordSuccess(account.ID)
-		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.pool.UpdateStats(account.ID, inputTokens+attemptOutputTokens, credits)
+		h.recordSuccessLog("responses", model, account.ID, inputTokens+attemptOutputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		publicInputTokens := contextUsageBlendedInputTokens(payload, model, inputTokens)
 		publicCacheUsage := contextUsageBlendedCacheUsage(payload, model, inputTokens, cacheUsage)
@@ -1045,6 +1054,7 @@ func (h *Handler) handleResponsesStream(
 			call = CallKiroAPI
 		}
 		err := call(account, payload, callback)
+		err = resolveKiroOutputTruncation(payload, err, upstreamStopReason, rawAssistantText.String(), completedKiroToolNames(toolUses))
 		if err == nil {
 			processAssistantText("", true)
 			if completionErr := agentCompletionResponseError(
@@ -1085,12 +1095,18 @@ func (h *Handler) handleResponsesStream(
 					time.Since(reqStart).Milliseconds(),
 				))
 			}
-			if isUpstreamIncompleteResponseError(err) {
+			if isUpstreamIncompleteResponseError(err) || isUpstreamOutputTruncatedError(err) {
 				closeReasoning()
 				closeMessage()
 			}
 			if isDownstreamRequestCanceled(payload, err) {
 				return
+			}
+			if takeKiroOutputContinuationRetry(payload, err) {
+				retryUsage.markLastVisibleContinuation()
+				retrySameID = account.ID
+				attemptLimit++
+				continue
 			}
 			if isKiroInputTooLongError(err) {
 				if h.retryAgentRecoveryAfterInputTooLong("Responses stream", payload, account, &retrySameID, err) {
@@ -1248,7 +1264,8 @@ func (h *Handler) handleResponsesStream(
 		publicInputTokens := contextUsageBlendedInputTokens(payload, model, inputTokens)
 		publicCacheUsage := contextUsageBlendedCacheUsage(payload, model, inputTokens, cacheUsage)
 		publicInputTokens, publicCacheUsage = retryUsage.apply(publicInputTokens, publicCacheUsage)
-		respObj := buildResponsesObjectWithReasoning(respID, responseModel, finalContent, reasoning, toolUses, publicInputTokens, outputTokens, req)
+		publicOutputTokens := retryUsage.applyOutput(outputTokens)
+		respObj := buildResponsesObjectWithReasoning(respID, responseModel, finalContent, reasoning, toolUses, publicInputTokens, publicOutputTokens, req)
 		applyResponsesPromptCacheUsage(respObj, publicCacheUsage)
 		respObj.Usage.KiroContextUsage = kiroContextUsage(payload, model)
 		respObj.Output = streamOutput

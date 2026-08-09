@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/json"
 	"fmt"
+	"kiro-go/config"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -142,6 +143,70 @@ func TestAgentCompletionProtocolIsRequestScopedAndKeepsConversationIDStable(t *t
 	}
 }
 
+func TestAgentCompletionMarkerCanBeHotReloadedWithoutWeakeningForcedToolChoice(t *testing.T) {
+	if err := config.Init(t.TempDir() + "/config.json"); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	t.Cleanup(func() { _ = config.UpdateAgentCompletionMarkerEnabled(true) })
+
+	openAIReq := &OpenAIRequest{
+		Messages: []OpenAIMessage{
+			{Role: "system", Content: "You are Codex, a coding agent."},
+			{Role: "user", Content: "inspect the repository"},
+		},
+		Tools: []OpenAITool{openAITestTool("shell_command")},
+	}
+	claudeReq := &ClaudeRequest{
+		System:   "You are Claude Code, Anthropic's official CLI for Claude.",
+		Messages: []ClaudeMessage{{Role: "user", Content: "inspect the repository"}},
+		Tools:    []ClaudeTool{{Name: "Read", InputSchema: map[string]interface{}{"type": "object"}}},
+	}
+
+	if payload := OpenAIToKiro(openAIReq, false); payload.AgentCompletionMarker == "" {
+		t.Fatal("default setting did not enable the OpenAI marker protocol")
+	}
+	if err := config.UpdateAgentCompletionMarkerEnabled(false); err != nil {
+		t.Fatalf("disable marker setting: %v", err)
+	}
+	for name, payload := range map[string]*KiroPayload{
+		"OpenAI": OpenAIToKiro(openAIReq, false),
+		"Claude": ClaudeToKiro(claudeReq, false),
+	} {
+		priming := structuredOutputPriming(t, payload)
+		if payload.AgentCompletionMarker != "" || strings.Contains(priming, "<agent_completion_protocol>") || strings.Contains(priming, "<agent_final_") {
+			t.Fatalf("%s marker protocol remained active: marker=%q priming=%q", name, payload.AgentCompletionMarker, priming)
+		}
+		if !strings.Contains(priming, agentToolProtocol) {
+			t.Fatalf("%s tool protocol was disabled with the marker: %q", name, priming)
+		}
+		if err := agentCompletionResponseError(payload, false, "finished", false, nil, "END_TURN"); err != nil {
+			t.Fatalf("%s native END_TURN was rejected with marker disabled: %v", name, err)
+		}
+	}
+
+	forcedReq := *openAIReq
+	forcedReq.ToolChoice = "required"
+	forced := OpenAIToKiro(&forcedReq, false)
+	forcedPriming := structuredOutputPriming(t, forced)
+	if forced.AgentCompletionMarker != "" || !forced.AgentCompletionProtocolEnabled || !strings.Contains(forcedPriming, "<forced_tool_choice_completion_protocol>") {
+		t.Fatalf("forced tool guard was disabled with the automatic marker: marker=%q priming=%q", forced.AgentCompletionMarker, forcedPriming)
+	}
+	if strings.Contains(forcedPriming, "<agent_completion_protocol>") || strings.Contains(forcedPriming, "<agent_final_") {
+		t.Fatalf("forced tool guard exposed the automatic final-answer marker: %q", forcedPriming)
+	}
+	if err := agentCompletionResponseError(forced, false, "finished", false, nil, "END_TURN"); err == nil {
+		t.Fatal("forced tool choice accepted prose-only END_TURN")
+	}
+
+	if err := config.UpdateAgentCompletionMarkerEnabled(true); err != nil {
+		t.Fatalf("re-enable marker setting: %v", err)
+	}
+	reenabled := OpenAIToKiro(openAIReq, false)
+	if reenabled.AgentCompletionMarker == "" || !strings.Contains(structuredOutputPriming(t, reenabled), "<agent_completion_protocol>") {
+		t.Fatal("marker protocol did not resume after hot reload")
+	}
+}
+
 func TestAgentCompletionGateStreamsNarrationAndStripsSplitMarker(t *testing.T) {
 	marker := "<agent_final_0123456789abcdef>"
 	gate := newAgentCompletionGate(marker)
@@ -204,8 +269,8 @@ func TestIncompleteAgentResponseTerminalDecisionMatrix(t *testing.T) {
 		stopReason     string
 		wantIncomplete bool
 	}{
-		{name: "unmarked visible native end turn", visibleContent: "final answer", stopReason: "END_TURN"},
-		{name: "action-looking native end turn", visibleContent: "I will inspect the file now.", stopReason: "END_TURN"},
+		{name: "unmarked visible native end turn", visibleContent: "final answer", stopReason: "END_TURN", wantIncomplete: true},
+		{name: "action-looking native end turn", visibleContent: "I will inspect the file now.", stopReason: "END_TURN", wantIncomplete: true},
 		{name: "serialized tool call native end turn", visibleContent: `<invoke name="shell_command"><parameter name="command">pwd</parameter></invoke>`, stopReason: "END_TURN", wantIncomplete: true},
 		{name: "empty native end turn", stopReason: "END_TURN", wantIncomplete: true},
 		{name: "visible max tokens", visibleContent: "partial answer", stopReason: "MAX_TOKENS", wantIncomplete: true},
@@ -250,8 +315,11 @@ func TestSerializedAgentToolCallTerminalClassifier(t *testing.T) {
 		"```xml\n<invoke name=\"edit\"><parameter name=\"file_path\">main.go</parameter></invoke>\n```",
 		`<invoke name="unknown"><parameter name="file_path">main.go</parameter></invoke>`,
 	} {
-		if err := agentCompletionResponseError(payload, false, content, false, nil, "END_TURN"); err != nil {
-			t.Fatalf("ordinary terminal content was rejected: content=%q err=%v", content, err)
+		if err := agentCompletionResponseError(payload, false, content, false, nil, "END_TURN"); err == nil {
+			t.Fatalf("unmarked terminal content was accepted: content=%q", content)
+		}
+		if err := agentCompletionResponseError(payload, false, content, true, nil, "END_TURN"); err != nil {
+			t.Fatalf("marked terminal content was rejected: content=%q err=%v", content, err)
 		}
 	}
 }
@@ -354,11 +422,11 @@ func TestAgentCompletionGateBuffersSplitOrphanToolTail(t *testing.T) {
 	}
 }
 
-func TestUnmarkedVisibleEndTurnSkipsSemanticRecovery(t *testing.T) {
+func TestUnmarkedVisibleEndTurnRequiresSemanticRecovery(t *testing.T) {
 	payload := completionProtocolTestPayload()
 	err := agentCompletionResponseError(payload, true, "All core modules confirmed. Now the test suite -- this is the gate for everything downstream.", false, nil, "END_TURN")
-	if err != nil {
-		t.Fatalf("unmarked visible END_TURN entered semantic recovery: %v", err)
+	if err == nil || !isUpstreamAgentActionOnlyError(err) {
+		t.Fatalf("unmarked visible END_TURN bypassed semantic recovery: %v", err)
 	}
 	if payload.AgentCompletionRetries != 0 || payload.AgentActionContinuations != 0 ||
 		payload.AgentFullContextRecoveries != 0 {

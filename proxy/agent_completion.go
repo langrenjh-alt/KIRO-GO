@@ -79,6 +79,16 @@ The previous response ended without either the completion marker or a structured
 </agent_retry>`, marker)
 }
 
+func outputContinuationInstruction(marker string) string {
+	instruction := `<output_continuation>
+The immediately preceding assistant message was cut off only because the upstream output-token limit was reached. Continue directly from its final byte. Do not repeat, summarize, restart, quote, or wrap any part of the preceding output. Preserve the original language, format, and task state. Emit only the missing continuation.`
+	if marker != "" {
+		instruction += fmt.Sprintf(` This is still the same coding-agent turn. If no external action remains, begin this continuation with the exact private completion marker %s. If external action is required, emit the real native structured tool call instead of describing it.`, marker)
+	}
+	return instruction + `
+</output_continuation>`
+}
+
 func forcedToolChoiceRetryInstruction(mode, selected string) string {
 	return forcedToolChoiceRetryInstructionWithName(mode, shortenToolName(sanitizeToolName(selected)))
 }
@@ -166,7 +176,7 @@ The complete original recovery context would exceed the upstream request budget,
 }
 
 func captureAgentRecoveryOriginalPayload(payload *KiroPayload) bool {
-	if payload == nil || payload.AgentCompletionMarker == "" {
+	if payload == nil || !agentCompletionProtocolEnabled(payload) {
 		return false
 	}
 	if len(payload.agentRecoveryOriginalPayload) > 0 {
@@ -205,10 +215,16 @@ func restoreAgentRecoveryOriginalPayload(payload *KiroPayload) bool {
 	reasoningSignatureRetry := payload.ReasoningSignatureRetry
 
 	marker := payload.AgentCompletionMarker
+	completionProtocolEnabled := payload.AgentCompletionProtocolEnabled
 	completionRetries := payload.AgentCompletionRetries
 	actionContinuations := payload.AgentActionContinuations
 	fullContextRecoveries := payload.AgentFullContextRecoveries
 	inputTooLongRecoveries := payload.AgentInputTooLongRecoveries
+	outputContinuations := payload.OutputContinuations
+	outputPrefix := payload.outputContinuationPrefix
+	outputAttempt := payload.outputContinuationAttemptText
+	outputOverflow := payload.outputContinuationAttemptOverflow
+	outputPending := payload.outputContinuationPending
 	hint := payload.agentRecoveryActionHint
 	attemptReasoning := payload.agentRecoveryAttemptReasoning
 	attemptVisibleText := payload.agentRecoveryAttemptVisibleText
@@ -234,10 +250,16 @@ func restoreAgentRecoveryOriginalPayload(payload *KiroPayload) bool {
 	payload.HistoryMode = historyMode
 	payload.ReasoningSignatureRetry = reasoningSignatureRetry
 	payload.AgentCompletionMarker = marker
+	payload.AgentCompletionProtocolEnabled = completionProtocolEnabled
 	payload.AgentCompletionRetries = completionRetries
 	payload.AgentActionContinuations = actionContinuations
 	payload.AgentFullContextRecoveries = fullContextRecoveries
 	payload.AgentInputTooLongRecoveries = inputTooLongRecoveries
+	payload.OutputContinuations = outputContinuations
+	payload.outputContinuationPrefix = outputPrefix
+	payload.outputContinuationAttemptText = outputAttempt
+	payload.outputContinuationAttemptOverflow = outputOverflow
+	payload.outputContinuationPending = outputPending
 	payload.AgentRecoveryCompacted = false
 	payload.AgentRecoveryAggressive = false
 	payload.agentRecoveryActionHint = hint
@@ -258,7 +280,7 @@ func restoreAgentRecoveryOriginalPayload(payload *KiroPayload) bool {
 }
 
 func prepareFullContextAgentRecovery(payload *KiroPayload) bool {
-	if payload == nil || payload.AgentCompletionMarker == "" ||
+	if payload == nil || !agentCompletionProtocolEnabled(payload) ||
 		payload.AgentFullContextRecoveries >= maxKiroAgentFullContextRecoveries ||
 		len(payload.agentRecoveryOriginalPayload) == 0 {
 		return false
@@ -287,7 +309,7 @@ func prepareFullContextAgentRecovery(payload *KiroPayload) bool {
 }
 
 func agentInputTooLongRecoveryEligible(payload *KiroPayload) bool {
-	return payload != nil && payload.AgentCompletionMarker != "" && kiroPayloadHasTools(payload) &&
+	return payload != nil && agentCompletionProtocolEnabled(payload) && kiroPayloadHasTools(payload) &&
 		payload.AgentCompletionRetries > 0 &&
 		payload.AgentInputTooLongRecoveries < maxKiroAgentInputTooLongRecoveries &&
 		len(payload.agentRecoveryOriginalPayload) > 0 && !payload.agentTerminalRecoveryExhausted
@@ -324,7 +346,7 @@ func prepareAgentInputTooLongRecovery(payload *KiroPayload) bool {
 }
 
 func appendAgentRecoveryActionHint(payload *KiroPayload, text string) {
-	if payload == nil || payload.AgentCompletionMarker == "" || text == "" {
+	if payload == nil || !agentCompletionProtocolEnabled(payload) || text == "" {
 		return
 	}
 	payload.agentRecoveryActionHint = utf8Tail(
@@ -380,7 +402,7 @@ func appendAgentRecoveryAttempt(payload *KiroPayload, text string, reasoning boo
 }
 
 func captureAgentRecoveryActionHint(payload *KiroPayload, callback *KiroStreamCallback) *KiroStreamCallback {
-	if payload == nil || payload.AgentCompletionMarker == "" {
+	if payload == nil {
 		return callback
 	}
 	if callback == nil {
@@ -398,12 +420,26 @@ func captureAgentRecoveryActionHint(payload *KiroPayload, callback *KiroStreamCa
 		// producing output (for example HTTP 400 Input is too long). Replace it
 		// only after this attempt actually emits text or reasoning.
 		if !attemptOutputStarted {
-			payload.agentRecoveryActionHint = ""
-			payload.agentRecoveryAttemptReasoning = ""
-			payload.agentRecoveryAttemptVisibleText = ""
+			if agentCompletionProtocolEnabled(payload) {
+				payload.agentRecoveryActionHint = ""
+				payload.agentRecoveryAttemptReasoning = ""
+				payload.agentRecoveryAttemptVisibleText = ""
+			}
+			payload.outputContinuationAttemptText = ""
+			payload.outputContinuationAttemptOverflow = false
 			attemptOutputStarted = true
 		}
-		appendAgentRecoveryAttempt(payload, text, reasoning)
+		if agentCompletionProtocolEnabled(payload) {
+			appendAgentRecoveryAttempt(payload, text, reasoning)
+		}
+		if !reasoning && !payload.outputContinuationAttemptOverflow {
+			if len(payload.outputContinuationAttemptText)+len(text) > maxKiroOutputContinuationBytes {
+				payload.outputContinuationAttemptText = ""
+				payload.outputContinuationAttemptOverflow = true
+			} else {
+				payload.outputContinuationAttemptText += text
+			}
+		}
 	}
 	wrapped := *callback
 	wrapped.OnText = func(text string, isThinking bool) {
@@ -421,6 +457,92 @@ func captureAgentRecoveryActionHint(payload *KiroPayload, callback *KiroStreamCa
 		}
 	}
 	return &wrapped
+}
+
+func prepareKiroOutputContinuation(payload *KiroPayload, completedToolNames []string) bool {
+	if payload == nil || payload.OutputContinuations >= maxKiroOutputContinuations ||
+		payload.outputContinuationAttemptOverflow || len(completedToolNames) > 0 {
+		return false
+	}
+	visible := payload.outputContinuationAttemptText
+	if agentCompletionProtocolEnabled(payload) {
+		visible, _ = stripAgentCompletionMarker(visible, payload.AgentCompletionMarker)
+	}
+	if strings.TrimSpace(visible) == "" || looksLikeSerializedAgentToolCall(payload, visible) {
+		return false
+	}
+
+	current := &payload.ConversationState.CurrentMessage.UserInputMessage
+	priorUser := *current
+	var tools []KiroToolWrapper
+	if current.UserInputMessageContext != nil {
+		tools = append(tools, current.UserInputMessageContext.Tools...)
+		if len(current.UserInputMessageContext.ToolResults) > 0 {
+			priorUser.UserInputMessageContext = &UserInputMessageContext{
+				ToolResults: append([]KiroToolResult(nil), current.UserInputMessageContext.ToolResults...),
+			}
+		} else {
+			priorUser.UserInputMessageContext = nil
+		}
+	}
+	payload.ConversationState.History = append(payload.ConversationState.History,
+		KiroHistoryMessage{UserInputMessage: &priorUser},
+		KiroHistoryMessage{AssistantResponseMessage: &KiroAssistantResponseMessage{Content: visible}},
+	)
+	payload.outputContinuationPrefix += visible
+	payload.OutputContinuations++
+	payload.outputContinuationPending = true
+	payload.outputContinuationAttemptText = ""
+	payload.outputContinuationAttemptOverflow = false
+	payload.ConversationState.AgentContinuationId = uuid.NewString()
+	current.Content = outputContinuationInstruction(payload.AgentCompletionMarker)
+	current.Images = nil
+	current.UserInputMessageContext = nil
+	if len(tools) > 0 {
+		current.UserInputMessageContext = &UserInputMessageContext{Tools: tools}
+	}
+	if payload.HistoryMode == kiroHistoryModeNativeActive {
+		finalizeKiroHistoryProtocol(payload)
+	}
+	return payload.HistoryMode != kiroHistoryModeNativeActive || payload.outputContinuationPending
+}
+
+func resolveKiroOutputTruncation(payload *KiroPayload, err error, stopReason, visibleAttempt string, completedToolNames []string) error {
+	if err == nil && normalizeKiroStopReason(stopReason) == "max_tokens" {
+		err = newUpstreamOutputTruncatedError()
+	}
+	if !isUpstreamOutputTruncatedError(err) {
+		return err
+	}
+	if payload != nil && payload.outputContinuationAttemptText == "" && visibleAttempt != "" {
+		if len(visibleAttempt) <= maxKiroOutputContinuationBytes {
+			payload.outputContinuationAttemptText = visibleAttempt
+		} else {
+			payload.outputContinuationAttemptOverflow = true
+		}
+	}
+	if prepareKiroOutputContinuation(payload, completedToolNames) {
+		return err
+	}
+	if payload != nil && agentCompletionProtocolEnabled(payload) {
+		return newUpstreamAgentMarkerMismatchError()
+	}
+	return nil
+}
+
+func takeKiroOutputContinuationRetry(payload *KiroPayload, err error) bool {
+	if payload == nil || !payload.outputContinuationPending || !isUpstreamOutputTruncatedError(err) {
+		return false
+	}
+	payload.outputContinuationPending = false
+	return true
+}
+
+func prependKiroOutputContinuation(payload *KiroPayload, content string) string {
+	if payload == nil || payload.outputContinuationPrefix == "" {
+		return content
+	}
+	return payload.outputContinuationPrefix + content
 }
 
 type agentRecoveryAttemptEvidence struct {
@@ -492,7 +614,7 @@ func replaceAgentRecoveryActionHintInstruction(payload *KiroPayload, message, hi
 // to repeat its plan; preserving the incomplete attempt in history gives the
 // short recovery instruction a concrete assistant turn to continue from.
 func advanceAgentRecoveryTurn(payload *KiroPayload) {
-	if payload == nil || payload.AgentCompletionMarker == "" {
+	if payload == nil || !agentCompletionProtocolEnabled(payload) {
 		return
 	}
 
@@ -549,7 +671,7 @@ func compactLongAgentRecoveryPayload(payload *KiroPayload) bool {
 }
 
 func compactAgentRecoveryPayload(payload *KiroPayload, force, aggressive bool) bool {
-	if payload == nil || payload.AgentCompletionMarker == "" ||
+	if payload == nil || !agentCompletionProtocolEnabled(payload) ||
 		(payload.AgentRecoveryCompacted && (!aggressive || payload.AgentRecoveryAggressive)) {
 		return false
 	}
@@ -1073,7 +1195,7 @@ func newAgentCompletionGateForPayload(payload *KiroPayload) *agentCompletionGate
 	}
 	gate := newAgentCompletionGate(marker)
 	gate.forcedToolChoice = forcedToolChoiceMode(payload)
-	if marker != "" {
+	if marker != "" || forcedToolChoiceMode(payload) {
 		gate.serializedTools = kiroPayloadAllowedToolNames(payload)
 	}
 	return gate
@@ -1524,7 +1646,6 @@ func filterAgentCompletionContent(payload *KiroPayload, content string, toolCoun
 
 func agentCompletionResponseError(payload *KiroPayload, reasoningObserved bool, visibleContent string, markerSeen bool, completedToolNames []string, stopReason string) error {
 	_ = reasoningObserved
-	_ = markerSeen
 	if payload == nil {
 		return nil
 	}
@@ -1552,18 +1673,18 @@ func agentCompletionResponseError(payload *KiroPayload, reasoningObserved bool, 
 	if payload.AgentCompletionMarker == "" {
 		return nil
 	}
-	// A completed structured tool event is its own native terminal signal. A
-	// visible END_TURN is likewise authoritative even when the model omitted the
-	// optional completion marker. The marker is retained only for stripping and
-	// telemetry; it must not override Kiro's native terminal state.
+	// Coding-agent completion has two protocol-level terminal signals: a real
+	// structured tool event, or the private marker prefix on a non-empty final
+	// answer. END_TURN alone is only a transport terminal and cannot prove that a
+	// narrated action actually completed.
 	if len(completedToolNames) > 0 {
 		return nil
 	}
-	if stopReason == "end_turn" && strings.TrimSpace(visibleContent) != "" {
-		if looksLikeSerializedAgentToolCall(payload, visibleContent) {
-			return newUpstreamAgentActionOnlyError()
-		}
+	if stopReason == "end_turn" && markerSeen && strings.TrimSpace(visibleContent) != "" {
 		return nil
+	}
+	if stopReason == "end_turn" && strings.TrimSpace(visibleContent) != "" {
+		return newUpstreamAgentActionOnlyError()
 	}
 	return newUpstreamAgentMarkerMismatchError()
 }
@@ -1577,6 +1698,10 @@ func forcedToolChoiceMode(payload *KiroPayload) bool {
 		return false
 	}
 	return payload.ToolChoiceMode == "required" || payload.ToolChoiceMode == "specific"
+}
+
+func agentCompletionProtocolEnabled(payload *KiroPayload) bool {
+	return payload != nil && (payload.AgentCompletionMarker != "" || payload.AgentCompletionProtocolEnabled)
 }
 
 func kiroPayloadToolNameMatchesOriginal(payload *KiroPayload, observed, original string) bool {
@@ -1625,6 +1750,19 @@ func completedKiroToolNames(toolUses []KiroToolUse) []string {
 	names := make([]string, 0, len(toolUses))
 	for _, toolUse := range toolUses {
 		names = append(names, toolUse.Name)
+	}
+	return names
+}
+
+func completedKiroToolNamesFromOpenAIToolCalls(toolCalls []ToolCall) []string {
+	if len(toolCalls) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(toolCalls))
+	for _, toolCall := range toolCalls {
+		if name := strings.TrimSpace(toolCall.Function.Name); name != "" {
+			names = append(names, name)
+		}
 	}
 	return names
 }
@@ -1678,19 +1816,25 @@ func cloneKiroPayload(payload *KiroPayload) *KiroPayload {
 	clone.HistoryMode = payload.HistoryMode
 	clone.ReasoningSignatureRetry = payload.ReasoningSignatureRetry
 	clone.AgentCompletionMarker = payload.AgentCompletionMarker
+	clone.AgentCompletionProtocolEnabled = payload.AgentCompletionProtocolEnabled
 	clone.AgentCompletionRetries = payload.AgentCompletionRetries
 	clone.AgentActionContinuations = payload.AgentActionContinuations
 	clone.AgentFullContextRecoveries = payload.AgentFullContextRecoveries
 	clone.AgentRecoveryCompacted = payload.AgentRecoveryCompacted
 	clone.AgentRecoveryAggressive = payload.AgentRecoveryAggressive
 	clone.AgentInputTooLongRecoveries = payload.AgentInputTooLongRecoveries
+	clone.OutputContinuations = payload.OutputContinuations
 	clone.agentRecoveryActionHint = payload.agentRecoveryActionHint
 	clone.agentRecoveryAttemptReasoning = payload.agentRecoveryAttemptReasoning
 	clone.agentRecoveryAttemptVisibleText = payload.agentRecoveryAttemptVisibleText
+	clone.outputContinuationAttemptText = payload.outputContinuationAttemptText
+	clone.outputContinuationPrefix = payload.outputContinuationPrefix
+	clone.outputContinuationAttemptOverflow = payload.outputContinuationAttemptOverflow
+	clone.outputContinuationPending = payload.outputContinuationPending
 	clone.agentRecoveryInjectedActionHint = payload.agentRecoveryInjectedActionHint
 	if len(payload.agentRecoveryOriginalPayload) > 0 {
 		clone.agentRecoveryOriginalPayload = append([]byte(nil), payload.agentRecoveryOriginalPayload...)
-	} else if clone.AgentCompletionMarker != "" {
+	} else if agentCompletionProtocolEnabled(&clone) {
 		clone.agentRecoveryOriginalPayload = append([]byte(nil), wire...)
 	}
 	clone.agentFullContextRecoveryPending = payload.agentFullContextRecoveryPending

@@ -379,6 +379,9 @@ func TestClaudeStreamNativeReasoningProtocol(t *testing.T) {
 		ModelID: "claude-sonnet-4.6",
 		Origin:  "AI_EDITOR",
 	}
+	// This test covers one native reasoning response. MAX_TOKENS continuation
+	// has dedicated integration coverage in output_continuation_test.go.
+	payload.OutputContinuations = maxKiroOutputContinuations
 
 	rec := httptest.NewRecorder()
 	h.handleClaudeStream(
@@ -959,6 +962,50 @@ func TestAdminSettingsPromptCacheMaxRatioHotReload(t *testing.T) {
 	}
 	if got := config.GetPromptCacheMaxRatio(); got != 0.95 {
 		t.Fatalf("expected persisted ratio 0.95 after reload, got %v", got)
+	}
+}
+
+func TestAdminSettingsAgentCompletionMarkerHotReload(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	t.Cleanup(func() { _ = config.UpdateAgentCompletionMarkerEnabled(true) })
+	h := &Handler{}
+
+	getSettings := func() map[string]interface{} {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		h.apiGetSettings(rec, httptest.NewRequest(http.MethodGet, "/admin/api/settings", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("get status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		var settings map[string]interface{}
+		if err := json.NewDecoder(rec.Body).Decode(&settings); err != nil {
+			t.Fatalf("decode settings: %v", err)
+		}
+		return settings
+	}
+
+	if got := getSettings()["agentCompletionMarkerEnabled"]; got != true {
+		t.Fatalf("default API marker setting=%#v, want true", got)
+	}
+	updateRec := httptest.NewRecorder()
+	h.apiUpdateSettings(updateRec, httptest.NewRequest(http.MethodPost, "/admin/api/settings", strings.NewReader(`{"agentCompletionMarkerEnabled":false}`)))
+	if updateRec.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s", updateRec.Code, updateRec.Body.String())
+	}
+	if config.GetAgentCompletionMarkerEnabled() {
+		t.Fatal("marker setting did not hot reload")
+	}
+	if got := getSettings()["agentCompletionMarkerEnabled"]; got != false {
+		t.Fatalf("updated API marker setting=%#v, want false", got)
+	}
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("reload persisted config: %v", err)
+	}
+	if config.GetAgentCompletionMarkerEnabled() {
+		t.Fatal("marker setting did not survive reload")
 	}
 }
 

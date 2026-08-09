@@ -86,8 +86,8 @@ func TestForcedToolChoiceProtocolAndRecoveryPreservePrivateState(t *testing.T) {
 	}
 	payload := OpenAIToKiro(req, false)
 	priming := structuredOutputPriming(t, payload)
-	if payload.ToolChoiceMode != "specific" || payload.ToolChoiceName != "shell_command" || payload.AgentCompletionMarker == "" {
-		t.Fatalf("forced private state missing: mode=%q name=%q marker=%q", payload.ToolChoiceMode, payload.ToolChoiceName, payload.AgentCompletionMarker)
+	if payload.ToolChoiceMode != "specific" || payload.ToolChoiceName != "shell_command" || !payload.AgentCompletionProtocolEnabled {
+		t.Fatalf("forced private state missing: mode=%q name=%q protocol=%v", payload.ToolChoiceMode, payload.ToolChoiceName, payload.AgentCompletionProtocolEnabled)
 	}
 	if !strings.Contains(priming, "<forced_tool_choice_completion_protocol>") {
 		t.Fatalf("forced completion protocol missing: %q", priming)
@@ -95,12 +95,12 @@ func TestForcedToolChoiceProtocolAndRecoveryPreservePrivateState(t *testing.T) {
 	if !strings.Contains(priming, `tool named "shell_command"`) || strings.Contains(priming, `tool named "shellCommand"`) {
 		t.Fatalf("OpenAI tool choice instruction does not match the upstream tool specification: %q", priming)
 	}
-	if strings.Contains(priming, payload.AgentCompletionMarker) || strings.Contains(priming, "END_TURN") || strings.Contains(priming, "<agent_completion_protocol>") {
+	if strings.Contains(priming, "<agent_final_") || strings.Contains(priming, "END_TURN") || strings.Contains(priming, "<agent_completion_protocol>") {
 		t.Fatalf("forced prompt exposed a text-terminal escape hatch: %q", priming)
 	}
 
 	clone := cloneKiroPayload(payload)
-	if clone.ToolChoiceMode != payload.ToolChoiceMode || clone.ToolChoiceName != payload.ToolChoiceName || clone.AgentCompletionMarker != payload.AgentCompletionMarker {
+	if clone.ToolChoiceMode != payload.ToolChoiceMode || clone.ToolChoiceName != payload.ToolChoiceName || clone.AgentCompletionProtocolEnabled != payload.AgentCompletionProtocolEnabled {
 		t.Fatalf("clone lost forced state: %#v", clone)
 	}
 	if !captureAgentRecoveryOriginalPayload(clone) {
@@ -114,10 +114,10 @@ func TestForcedToolChoiceProtocolAndRecoveryPreservePrivateState(t *testing.T) {
 	prepareReasoningOnlyRetry(clone, newUpstreamAgentToolChoiceMismatchError("specific", "shell_command", nil))
 	retry := forcedToolChoiceRetryInstructionForPayload(clone)
 	current := clone.ConversationState.CurrentMessage.UserInputMessage.Content
-	if strings.Count(current, retry) != 1 || strings.Contains(current, clone.AgentCompletionMarker) || strings.Contains(retry, "END_TURN") {
+	if strings.Count(current, retry) != 1 || strings.Contains(current, "<agent_final_") || strings.Contains(retry, "END_TURN") {
 		t.Fatalf("forced retry exposed or duplicated a text terminal: %q", current)
 	}
-	if strings.Contains(current, agentCompletionRetryInstruction(clone.AgentCompletionMarker)) {
+	if strings.Contains(current, "<agent_retry>") {
 		t.Fatalf("forced retry included the auto-mode final-answer option: %q", current)
 	}
 	if !strings.Contains(retry, `"shell_command"`) || strings.Contains(retry, `"shellCommand"`) {
@@ -221,8 +221,8 @@ func TestForcedToolChoiceRecoversAcrossPublicResponseFormats(t *testing.T) {
 			calls := 0
 			h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
 				calls++
-				if payload.ToolChoiceMode != "required" || payload.AgentCompletionMarker == "" {
-					t.Fatalf("forced guard missing on call %d: mode=%q marker=%q", calls, payload.ToolChoiceMode, payload.AgentCompletionMarker)
+				if payload.ToolChoiceMode != "required" || !payload.AgentCompletionProtocolEnabled {
+					t.Fatalf("forced guard missing on call %d: mode=%q protocol=%v", calls, payload.ToolChoiceMode, payload.AgentCompletionProtocolEnabled)
 				}
 				if calls == 1 {
 					callback.OnText("premature forced answer", false)
@@ -234,7 +234,7 @@ func TestForcedToolChoiceRecoversAcrossPublicResponseFormats(t *testing.T) {
 					t.Fatalf("unexpected upstream call %d", calls)
 				}
 				current := payload.ConversationState.CurrentMessage.UserInputMessage.Content
-				if !strings.Contains(current, "<forced_tool_choice_retry>") || strings.Contains(current, payload.AgentCompletionMarker) {
+				if !strings.Contains(current, "<forced_tool_choice_retry>") || strings.Contains(current, "<agent_final_") {
 					t.Fatalf("forced retry instruction invalid: %q", current)
 				}
 				callback.OnToolUse(KiroToolUse{ToolUseID: "toolu_forced", Name: "shell_command", Input: map[string]interface{}{"command": "pwd"}})

@@ -2051,6 +2051,7 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 			call = CallKiroAPI
 		}
 		err := call(account, payload, callback)
+		err = resolveKiroOutputTruncation(payload, err, upstreamStopReason, rawContentBuilder.String(), completedKiroToolNames(toolUses))
 		if err == nil {
 			if completionErr := agentCompletionResponseError(
 				payload,
@@ -2093,7 +2094,7 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 					time.Since(reqStart).Milliseconds(),
 				))
 			}
-			if isUpstreamIncompleteResponseError(err) {
+			if isUpstreamIncompleteResponseError(err) || isUpstreamOutputTruncatedError(err) {
 				if eventThinkingOpen {
 					sendText("", 3)
 					eventThinkingOpen = false
@@ -2106,6 +2107,13 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 				return
 			}
 			lastErr = err
+			if takeKiroOutputContinuationRetry(payload, err) {
+				retryUsage.markLastVisibleContinuation()
+				retryUsage.markLastContinuationAttemptOutput()
+				retrySameID = account.ID
+				attemptLimit++
+				continue
+			}
 			if isKiroInputTooLongError(err) {
 				if h.retryAgentRecoveryAfterInputTooLong("Claude stream", payload, account, &retrySameID, err) {
 					attemptLimit++
@@ -2298,7 +2306,8 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 		publicInputTokens := claudePublicInputTokens(payload, model, inputTokens)
 		terminalCacheUsage := claudeTerminalCacheUsage(cacheProfile, payload, model, inputTokens, cacheUsage)
 		publicInputTokens, terminalCacheUsage = retryUsage.apply(publicInputTokens, terminalCacheUsage)
-		finalUsage := buildClaudeTerminalUsageMap(publicInputTokens, outputTokens, terminalCacheUsage)
+		publicOutputTokens := retryUsage.applyOutput(outputTokens)
+		finalUsage := buildClaudeTerminalUsageMap(publicInputTokens, publicOutputTokens, terminalCacheUsage)
 		addKiroContextUsage(finalUsage, payload, model)
 		addClaudeReasoningUsageDetails(finalUsage, ClaudeReasoningResult{
 			Text:      thinkingOutput,
@@ -2696,6 +2705,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			call = CallKiroAPI
 		}
 		err := call(account, payload, callback)
+		err = resolveKiroOutputTruncation(payload, err, upstreamStopReason, content, completedKiroToolNames(toolUses))
 		if err == nil {
 			visibleContent, _ := extractThinkingFromContent(content)
 			visibleContent, markerSeen := filterAgentCompletionContent(payload, visibleContent, len(toolUses))
@@ -2728,6 +2738,12 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 				return
 			}
 			lastErr = err
+			if takeKiroOutputContinuationRetry(payload, err) {
+				retryUsage.markLastContinuationAttemptOutput()
+				retrySameID = account.ID
+				attemptLimit++
+				continue
+			}
 			if isKiroInputTooLongError(err) {
 				if h.retryAgentRecoveryAfterInputTooLong("Claude non-stream", payload, account, &retrySameID, err) {
 					attemptLimit++
@@ -2781,6 +2797,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		thinkingFormat := thinkingOpts.Format
 		finalContent, extractedReasoning := extractThinkingFromContent(content)
 		finalContent, _ = filterAgentCompletionContent(payload, finalContent, len(toolUses))
+		finalContent = prependKiroOutputContinuation(payload, finalContent)
 		if payload.StructuredOutput {
 			finalContent = normalizeStructuredOutputContent(finalContent)
 			if validationErr := validateStructuredOutputContent(
@@ -2858,15 +2875,16 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 
 		// Each attempt settles in its own iteration, so this reports only what this
 		// attempt generated. Client-visible usage stays aligned with the response.
-		h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, credits, cacheUsage)
+		attemptOutputTokens := retryUsage.finalAttemptOutputTokens(outputTokens)
+		h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, attemptOutputTokens, credits, cacheUsage)
 		h.pool.RecordSuccess(account.ID)
 		// h.pool.RecordLatency(account.ID, float64(time.Since(reqStart).Milliseconds()))
 		// ↑ dispatch-only latency EWMA (commit fbc99b1), absent on this cache-only
 		//   branch off main. No-op here; stripped so handler compiles against main's
 		//   pool. Re-added verbatim when dispatch lands.
-		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		h.pool.UpdateStats(account.ID, inputTokens+attemptOutputTokens, credits)
 		promptCacheTrackerForProfile(h.promptCache, cacheProfile).Update(account.ID, cacheProfile)
-		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog("claude", model, account.ID, inputTokens+attemptOutputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		responseThinkingContent := rawThinkingContent
 		includeEmptyThinkingBlock := thinking && thinkingOpts.OmitDisplay && rawThinkingContent != ""
@@ -3697,6 +3715,7 @@ func (h *Handler) handleOpenAIStreamWithCache(w http.ResponseWriter, payload *Ki
 		}
 		cacheState.compute(account.ID)
 		err := call(account, payload, callback)
+		err = resolveKiroOutputTruncation(payload, err, upstreamStopReason, rawContentBuilder.String(), completedKiroToolNamesFromOpenAIToolCalls(toolCalls))
 		if err == nil {
 			if completionErr := agentCompletionResponseError(
 				payload,
@@ -3745,6 +3764,13 @@ func (h *Handler) handleOpenAIStreamWithCache(w http.ResponseWriter, payload *Ki
 				return
 			}
 			lastErr = err
+			if takeKiroOutputContinuationRetry(payload, err) {
+				retryUsage.markLastVisibleContinuation()
+				retryUsage.markLastContinuationAttemptOutput()
+				retrySameID = account.ID
+				attemptLimit++
+				continue
+			}
 			if isKiroInputTooLongError(err) {
 				if h.retryAgentRecoveryAfterInputTooLong("OpenAI stream", payload, account, &retrySameID, err) {
 					attemptLimit++
@@ -3890,7 +3916,8 @@ func (h *Handler) handleOpenAIStreamWithCache(w http.ResponseWriter, payload *Ki
 			publicInputTokens := contextUsageBlendedInputTokens(payload, model, inputTokens)
 			publicCacheUsage := contextUsageBlendedCacheUsage(payload, model, inputTokens, cacheUsage)
 			publicInputTokens, publicCacheUsage = retryUsage.apply(publicInputTokens, publicCacheUsage)
-			terminalUsage := buildOpenAIUsageMap(publicInputTokens, outputTokens, publicCacheUsage)
+			publicOutputTokens := retryUsage.applyOutput(outputTokens)
+			terminalUsage := buildOpenAIUsageMap(publicInputTokens, publicOutputTokens, publicCacheUsage)
 			addKiroContextUsage(terminalUsage, payload, model)
 			writeChunk([]map[string]interface{}{}, terminalUsage)
 		}
@@ -4037,6 +4064,7 @@ func (h *Handler) handleOpenAINonStreamWithCache(w http.ResponseWriter, payload 
 		}
 		cacheState.compute(account.ID)
 		err := call(account, payload, callback)
+		err = resolveKiroOutputTruncation(payload, err, upstreamStopReason, content, completedKiroToolNames(toolUses))
 		if err == nil {
 			visibleContent, _ := extractThinkingFromContent(content)
 			visibleContent, markerSeen := filterAgentCompletionContent(payload, visibleContent, len(toolUses))
@@ -4070,6 +4098,12 @@ func (h *Handler) handleOpenAINonStreamWithCache(w http.ResponseWriter, payload 
 				return
 			}
 			lastErr = err
+			if takeKiroOutputContinuationRetry(payload, err) {
+				retryUsage.markLastContinuationAttemptOutput()
+				retrySameID = account.ID
+				attemptLimit++
+				continue
+			}
 			if isKiroInputTooLongError(err) {
 				if h.retryAgentRecoveryAfterInputTooLong("OpenAI non-stream", payload, account, &retrySameID, err) {
 					attemptLimit++
@@ -4122,6 +4156,7 @@ func (h *Handler) handleOpenAINonStreamWithCache(w http.ResponseWriter, payload 
 
 		finalContent, extractedReasoning := extractThinkingFromContent(content)
 		finalContent, _ = filterAgentCompletionContent(payload, finalContent, len(toolUses))
+		finalContent = prependKiroOutputContinuation(payload, finalContent)
 		finalContent, finalMatchedStopSequence := truncateAtStopSequence(finalContent, payload.StopSequences)
 		if matchedStopSequence == "" {
 			matchedStopSequence = finalMatchedStopSequence
@@ -4145,14 +4180,15 @@ func (h *Handler) handleOpenAINonStreamWithCache(w http.ResponseWriter, payload 
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
 		cacheUsage := cacheState.complete(account.ID, inputTokens)
-		h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, credits, cacheUsage)
+		attemptOutputTokens := retryUsage.finalAttemptOutputTokens(outputTokens)
+		h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, attemptOutputTokens, credits, cacheUsage)
 		h.pool.RecordSuccess(account.ID)
 		// h.pool.RecordLatency(account.ID, float64(time.Since(reqStart).Milliseconds()))
 		// ↑ dispatch-only latency EWMA (commit fbc99b1), absent on this cache-only
 		//   branch off main. No-op here; stripped so handler compiles against main's
 		//   pool. Re-added verbatim when dispatch lands.
-		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.pool.UpdateStats(account.ID, inputTokens+attemptOutputTokens, credits)
+		h.recordSuccessLog("openai", model, account.ID, inputTokens+attemptOutputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 		publicInputTokens := contextUsageBlendedInputTokens(payload, model, inputTokens)
@@ -5682,6 +5718,7 @@ func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 		"functionCache":                    config.GetFunctionCacheConfig(),
 		"reasoningCap":                     config.GetReasoningCapConfig(),
 		"reasoningCapEnvFallbackMode":      reasoningCapModeFromEnvFallback(),
+		"agentCompletionMarkerEnabled":     config.GetAgentCompletionMarkerEnabled(),
 	})
 }
 
@@ -5744,6 +5781,7 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		CacheMode                        *string                       `json:"cacheMode,omitempty"`
 		FunctionCache                    *config.FunctionCacheConfig   `json:"functionCache,omitempty"`
 		ReasoningCap                     *config.ReasoningCapConfig    `json:"reasoningCap,omitempty"`
+		AgentCompletionMarkerEnabled     *bool                         `json:"agentCompletionMarkerEnabled,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -5833,6 +5871,13 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	if req.ReasoningCap != nil {
 		if err := config.UpdateReasoningCapConfig(*req.ReasoningCap); err != nil {
 			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+	if req.AgentCompletionMarkerEnabled != nil {
+		if err := config.UpdateAgentCompletionMarkerEnabled(*req.AgentCompletionMarkerEnabled); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
 		}

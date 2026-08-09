@@ -1,9 +1,6 @@
 package proxy
 
-import (
-	"strings"
-	"testing"
-)
+import "testing"
 
 // TestOpenAIToKiroDoesNotDuplicateToolResultText reproduces the bug where a
 // non-final tool-result history entry was pre-filled with the
@@ -23,17 +20,10 @@ func TestOpenAIToKiroDoesNotDuplicateToolResultText(t *testing.T) {
 
 	payload := OpenAIToKiro(req, false)
 
-	count := 0
-	for _, h := range payload.ConversationState.History {
-		if h.UserInputMessage != nil {
-			count += strings.Count(h.UserInputMessage.Content, "UNIQUE_OUTPUT_MARKER_12345")
-		}
-		if h.AssistantResponseMessage != nil {
-			count += strings.Count(h.AssistantResponseMessage.Content, "UNIQUE_OUTPUT_MARKER_12345")
-		}
-	}
-	if count != 1 {
-		t.Fatalf("expected tool result output to appear exactly once in history, got %d", count)
+	rounds := collectNativeKiroToolRounds(t, payload)
+	if len(rounds) != 1 || len(rounds[0].Results) != 1 ||
+		kiroToolResultText(rounds[0].Results[0]) != "UNIQUE_OUTPUT_MARKER_12345" {
+		t.Fatalf("expected one native tool result with the original output, got %+v", rounds)
 	}
 }
 

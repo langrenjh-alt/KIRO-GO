@@ -2160,6 +2160,7 @@
     const d = await res.json();
     $('requireApiKey').checked = d.requireApiKey;
     $('allowOverUsage').checked = d.allowOverUsage || false;
+	$('agentCompletionMarkerEnabled').checked = d.agentCompletionMarkerEnabled !== false;
     const concurrencyRefreshSeconds = Number(d.accountConcurrencyRefreshSeconds);
     accountConcurrencyRefreshSeconds = Number.isInteger(concurrencyRefreshSeconds) && concurrencyRefreshSeconds >= 5 && concurrencyRefreshSeconds <= 60
       ? concurrencyRefreshSeconds
@@ -2331,6 +2332,19 @@
     await api('/settings', { method: 'POST', body: JSON.stringify({ allowOverUsage }) });
     toast(t('settings.overUsageSaved'), 'success');
   }
+	async function saveAgentCompletionMarkerConfig() {
+		try {
+			const agentCompletionMarkerEnabled = $('agentCompletionMarkerEnabled').checked;
+			const res = await api('/settings', {
+				method: 'POST', body: JSON.stringify({ agentCompletionMarkerEnabled })
+			});
+			const d = await res.json().catch(() => ({}));
+			if (!res.ok || d.success === false) throw new Error(d.error || t('common.saveFailed'));
+			toast(t('settings.agentCompletionMarkerSaved'), 'success');
+		} catch (e) {
+			toast((e && e.message) || t('common.saveFailed'), 'error');
+		}
+	}
   async function saveAccountConcurrencyRefresh() {
     const input = $('accountConcurrencyRefreshSeconds');
     const seconds = Number(input.value);
@@ -4209,6 +4223,7 @@
   function bindSettingsEvents() {
     $('saveRequireApiKeyBtn').addEventListener('click', saveRequireApiKey);
     $('saveOverUsageBtn').addEventListener('click', saveOverUsageConfig);
+	$('saveAgentCompletionMarkerBtn').addEventListener('click', saveAgentCompletionMarkerConfig);
     $('saveAccountConcurrencyRefreshBtn').addEventListener('click', saveAccountConcurrencyRefresh);
 	$('saveDispatchPoliciesBtn').addEventListener('click', saveDispatchPolicies);
 	$('saveReasoningCapBtn').addEventListener('click', saveReasoningCap);

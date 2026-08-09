@@ -273,10 +273,13 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		toolNames = append(toolNames, tool.Name)
 	}
 	recognizedHarness := isCodingAgentSystemPrompt(extractSystemPrompt(req.System))
-	autoCompletionProtocol := codingAgentCompletionProtocolEnabled(toolChoice, recognizedHarness, toolNames)
+	autoCompletionProtocol := config.GetAgentCompletionMarkerEnabled() &&
+		codingAgentCompletionProtocolEnabled(toolChoice, recognizedHarness, toolNames)
 	forcedToolGuard := codingAgentForcedToolChoiceGuardEnabled(toolChoice, recognizedHarness, toolNames)
 	if ((req.OutputConfig == nil || req.OutputConfig.Format == nil) && autoCompletionProtocol) || forcedToolGuard {
-		agentCompletionMarker = newAgentCompletionMarker()
+		if autoCompletionProtocol {
+			agentCompletionMarker = newAgentCompletionMarker()
+		}
 		if forcedToolGuard {
 			systemPrompt = appendSystemInstruction(systemPrompt, forcedToolChoiceCompletionInstruction(toolChoice))
 		} else {
@@ -373,12 +376,14 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		inferredTools, inferredToolNameMap = inferActiveKiroToolConfig(history)
 	}
 
-	// Flatten structured tool calls/results that live in history; upstream only
-	// accepts a single active tool turn (last assistant toolUses ⟺ current toolResults).
-	if keepCurrentToolResults {
-		history = sanitizeKiroHistory(history, currentToolResultIDs)
-	} else {
-		history = sanitizeKiroHistory(history, nil)
+	// Legacy mode flattens structured tool calls/results that live in history;
+	// the native mode below preserves every complete causal tool round.
+	if !nativeActiveHistory {
+		if keepCurrentToolResults {
+			history = sanitizeKiroHistory(history, currentToolResultIDs)
+		} else {
+			history = sanitizeKiroHistory(history, nil)
+		}
 	}
 
 	// 构建最终内容
@@ -386,6 +391,8 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	toolResultsFolded := false
 	if currentContent != "" {
 		finalContent = currentContent
+	} else if nativeActiveHistory && keepCurrentToolResults {
+		finalContent = ""
 	} else if len(currentImages) > 0 {
 		finalContent = normalizeUserContent("", true)
 	} else if len(currentToolResults) > 0 {
@@ -399,9 +406,9 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	}
 
 	// Orphaned current tool results (no matching assistant tool turn in history)
-	// cannot stay structured — upstream accepts only a single active tool turn and
-	// these have none to answer — so fold their text into the message instead of
-	// losing it (e.g. a tool's textual output alongside an extracted image).
+	// cannot stay structured when no matching assistant tool round exists, so
+	// fold their text into the message instead of losing it (e.g. a tool's
+	// textual output alongside an extracted image).
 	if !keepCurrentToolResults && len(currentToolResults) > 0 && !toolResultsFolded {
 		if nativeFallbackEvidence != "" {
 			finalContent = joinHistoryText(finalContent, nativeFallbackEvidence)
@@ -417,11 +424,10 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		toolNameMap = inferredToolNameMap
 	}
 	// Bedrock requires a toolConfig whenever toolUse/toolResult blocks are
-	// present. Some clients omit `tools` when posting the result of a previous
-	// tool call; in that case the structured result cannot be sent upstream even
-	// if the history still contains the matching assistant toolUse. Rebuild the
-	// history in flattened form and keep the result text in the current turn.
-	if keepCurrentToolResults && len(kiroTools) == 0 {
+	// present. In legacy mode, clients that omit `tools` when posting the result of
+	// a previous tool call cannot send a structured result; rebuild that history
+	// in flattened form and keep the result text in the current turn.
+	if keepCurrentToolResults && len(kiroTools) == 0 && !nativeActiveHistory {
 		keepCurrentToolResults = false
 		history = sanitizeKiroHistory(history, nil)
 		if len(currentToolResults) > 0 && !toolResultsFolded {
@@ -443,6 +449,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	payload.ToolChoiceName = toolChoice.Name
 	payload.HistoryMode = historyMode
 	payload.AgentCompletionMarker = agentCompletionMarker
+	payload.AgentCompletionProtocolEnabled = autoCompletionProtocol || forcedToolGuard
 	payload.ConversationState.ChatTriggerType = "MANUAL"
 	payload.ConversationState.AgentTaskType = "vibe"
 	payload.ConversationState.AgentContinuationId = uuid.New().String()
@@ -1663,10 +1670,13 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		(strings.EqualFold(strings.TrimSpace(req.ResponseFormat.Type), "json_object") ||
 			strings.EqualFold(strings.TrimSpace(req.ResponseFormat.Type), "json_schema"))
 	recognizedHarness := isCodingAgentSystemPrompt(systemPrompt)
-	autoCompletionProtocol := codingAgentCompletionProtocolEnabled(toolChoice, recognizedHarness, toolNames)
+	autoCompletionProtocol := config.GetAgentCompletionMarkerEnabled() &&
+		codingAgentCompletionProtocolEnabled(toolChoice, recognizedHarness, toolNames)
 	forcedToolGuard := codingAgentForcedToolChoiceGuardEnabled(toolChoice, recognizedHarness, toolNames)
 	if (!structuredOutput && autoCompletionProtocol) || forcedToolGuard {
-		agentCompletionMarker = newAgentCompletionMarker()
+		if autoCompletionProtocol {
+			agentCompletionMarker = newAgentCompletionMarker()
+		}
 		if forcedToolGuard {
 			systemPrompt = appendSystemInstruction(systemPrompt, forcedToolChoiceCompletionInstruction(toolChoice))
 		} else {
@@ -1795,7 +1805,8 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	}
 
 	// Decide whether current tool results form a valid active tool turn; if not,
-	// flatten them into the current message text (see ClaudeToKiro for rationale).
+	// flatten them into the current message text in legacy mode (see ClaudeToKiro
+	// for rationale).
 	currentToolResultIDs := collectToolResultIDs(currentToolResults)
 	keepCurrentToolResults := currentToolResultsMatchLastAssistant(history, currentToolResultIDs)
 	if nativeActiveHistory {
@@ -1813,17 +1824,21 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		inferredTools, inferredToolNameMap = inferActiveKiroToolConfig(history)
 	}
 
-	if keepCurrentToolResults {
-		history = sanitizeKiroHistory(history, currentToolResultIDs)
-	} else {
-		history = sanitizeKiroHistory(history, nil)
+	if !nativeActiveHistory {
+		if keepCurrentToolResults {
+			history = sanitizeKiroHistory(history, currentToolResultIDs)
+		} else {
+			history = sanitizeKiroHistory(history, nil)
+		}
 	}
 
 	// 构建最终内容
 	finalContent := currentContent
 	toolResultsFolded := false
 	if finalContent == "" {
-		if len(currentImages) > 0 {
+		if nativeActiveHistory && keepCurrentToolResults {
+			finalContent = ""
+		} else if len(currentImages) > 0 {
 			finalContent = normalizeUserContent("", true)
 		} else if len(currentToolResults) > 0 {
 			finalContent = nativeFallbackEvidence
@@ -1853,9 +1868,9 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	}
 	// Bedrock requires a toolConfig whenever toolUse/toolResult blocks are
 	// present. OpenAI-compatible clients commonly omit `tools` on the follow-up
-	// tool-result request, so flatten the result instead of sending a malformed
-	// structured Kiro message.
-	if keepCurrentToolResults && len(kiroTools) == 0 {
+	// tool-result request, so legacy mode flattens the result instead of sending
+	// a malformed structured Kiro message.
+	if keepCurrentToolResults && len(kiroTools) == 0 && !nativeActiveHistory {
 		keepCurrentToolResults = false
 		history = sanitizeKiroHistory(history, nil)
 		if len(currentToolResults) > 0 && !toolResultsFolded {
@@ -1879,7 +1894,9 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	payload.ToolChoiceName = toolChoice.Name
 	payload.HistoryMode = historyMode
 	payload.AgentCompletionMarker = agentCompletionMarker
+	payload.AgentCompletionProtocolEnabled = autoCompletionProtocol || forcedToolGuard
 	payload.ConversationState.ChatTriggerType = "MANUAL"
+	payload.ConversationState.AgentTaskType = "vibe"
 	payload.ConversationState.ConversationID = buildConversationID(modelID, stableSystemPrompt, firstOpenAIConversationAnchor(nonSystemMessages))
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
 		Content: finalContent,

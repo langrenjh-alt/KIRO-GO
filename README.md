@@ -112,7 +112,7 @@ The setting takes effect immediately without restarting.
 |----------|-------------|---------|
 | `CONFIG_PATH` | Config file path | `data/config.json` |
 | `ADMIN_PASSWORD` | Admin panel password (overrides config) | - |
-| `KIRO_NATIVE_STRUCTURED_HISTORY` | Preserve the active Kiro tool round as native structured history; set to `off` or `legacy` to disable | enabled |
+| `KIRO_NATIVE_STRUCTURED_HISTORY` | Preserve every complete Kiro `assistant.toolUse`/`user.toolResult` round as native structured history and keep historical tools defined in the current request; set to `off` or `legacy` to disable | enabled |
 
 ## Contributing
 

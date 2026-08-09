@@ -85,6 +85,46 @@ func TestResponsesParallelToolResultStatusesReachKiro(t *testing.T) {
 	}
 }
 
+func TestResponsesCompletedToolRoundsStayNativeAndKeepToolDefinitions(t *testing.T) {
+	items := []json.RawMessage{
+		mustRaw(`{"type":"message","role":"user","content":[{"type":"input_text","text":"inspect the project"}]}`),
+		mustRaw(`{"type":"function_call","call_id":"call_read","name":"read_file","arguments":"{\"path\":\"main.go\"}"}`),
+		mustRaw(`{"type":"function_call_output","call_id":"call_read","output":"package main"}`),
+		mustRaw(`{"type":"message","role":"user","content":[{"type":"input_text","text":"inspect the tests"}]}`),
+		mustRaw(`{"type":"function_call","call_id":"call_search","name":"search_files","arguments":"{\"query\":\"TestMain\"}"}`),
+		mustRaw(`{"type":"function_call_output","call_id":"call_search","output":"main_test.go:10"}`),
+		mustRaw(`{"type":"message","role":"user","content":[{"type":"input_text","text":"summarize"}]}`),
+	}
+
+	messages, err := convertResponsesInputItems(items)
+	if err != nil {
+		t.Fatalf("convert Responses input: %v", err)
+	}
+	payload := OpenAIToKiro(&OpenAIRequest{Model: "claude-opus-4.8", Messages: messages}, false)
+	if payload.HistoryMode != kiroHistoryModeNativeActive || payload.ConversationState.AgentTaskType != "vibe" {
+		t.Fatalf("Responses protocol mode=%q task=%q", payload.HistoryMode, payload.ConversationState.AgentTaskType)
+	}
+	rounds := collectNativeKiroToolRounds(t, payload)
+	if len(rounds) != 2 || rounds[0].Uses[0].ToolUseID != "call_read" ||
+		kiroToolResultText(rounds[0].Results[0]) != "package main" ||
+		rounds[1].Uses[0].ToolUseID != "call_search" ||
+		kiroToolResultText(rounds[1].Results[0]) != "main_test.go:10" {
+		t.Fatalf("Responses native history changed: %+v", rounds)
+	}
+
+	context := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+	if context == nil || len(context.Tools) != 2 {
+		t.Fatalf("historical Responses tools were not restored: %+v", context)
+	}
+	names := map[string]bool{}
+	for _, tool := range context.Tools {
+		names[tool.ToolSpecification.Name] = true
+	}
+	if !names["readFile"] || !names["searchFiles"] {
+		t.Fatalf("restored Responses tools=%v", names)
+	}
+}
+
 func mustRaw(s string) json.RawMessage {
 	return json.RawMessage(s)
 }

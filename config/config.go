@@ -274,6 +274,10 @@ type Config struct {
 	// occupy an account slot indefinitely.
 	ReasoningCap ReasoningCapConfig `json:"reasoningCap,omitempty"`
 
+	// AgentCompletionMarkerEnabled controls the private coding-agent final-answer
+	// marker protocol. Nil defaults to enabled for backward compatibility.
+	AgentCompletionMarkerEnabled *bool `json:"agentCompletionMarkerEnabled,omitempty"`
+
 	// Region defaults for accounts that omit per-account region/authRegion/apiRegion.
 	// Defaults to "us-east-1" when empty (see GetGlobalRegion* / Account.Effective*Region).
 	Region     string `json:"region,omitempty"`
@@ -1497,6 +1501,32 @@ func UpdateAllowOverUsage(allow bool) error {
 	defer cfgLock.Unlock()
 	cfg.AllowOverUsage = allow
 	return Save()
+}
+
+// GetAgentCompletionMarkerEnabled reports whether automatic coding-agent turns
+// use the private final-answer marker protocol. Unset legacy configs default on.
+func GetAgentCompletionMarkerEnabled() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	return cfg == nil || cfg.AgentCompletionMarkerEnabled == nil || *cfg.AgentCompletionMarkerEnabled
+}
+
+// UpdateAgentCompletionMarkerEnabled persists the marker setting. Translators
+// read this value for every request, so a successful update takes effect at once.
+func UpdateAgentCompletionMarkerEnabled(enabled bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg == nil {
+		return fmt.Errorf("config is not initialized")
+	}
+	previous := cfg.AgentCompletionMarkerEnabled
+	value := enabled
+	cfg.AgentCompletionMarkerEnabled = &value
+	if err := Save(); err != nil {
+		cfg.AgentCompletionMarkerEnabled = previous
+		return err
+	}
+	return nil
 }
 
 const (

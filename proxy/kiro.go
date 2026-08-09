@@ -39,6 +39,8 @@ const (
 	maxKiroAgentActionContinuations    = 2
 	maxKiroAgentFullContextRecoveries  = 1
 	maxKiroAgentInputTooLongRecoveries = 1
+	maxKiroOutputContinuations         = 2
+	maxKiroOutputContinuationBytes     = 256 << 10
 	kiroInitialAgentThinkingTimeout    = 0
 	kiroStreamKeepAliveInterval        = 25 * time.Second
 	kiroDialTimeout                    = 30 * time.Second
@@ -325,10 +327,13 @@ type KiroPayload struct {
 	// Kiro rejects a replayed native reasoning signature.
 	ReasoningSignatureRetry bool `json:"-"`
 
-	// AgentCompletionMarker enables the internal completion protocol for a
+	// AgentCompletionMarker is the optional private final-answer prefix for a
 	// recognized tool-enabled coding harness. It is stripped from final output
 	// and never serialized as a top-level Kiro request field.
 	AgentCompletionMarker string `json:"-"`
+	// AgentCompletionProtocolEnabled binds completion lifecycle handling to this
+	// request and keeps forced tool-choice validation independent of the marker.
+	AgentCompletionProtocolEnabled bool `json:"-"`
 	// AgentCompletionRetries counts semantic repair attempts independently from
 	// transport/account retries. It is private to the handler's cloned payload.
 	AgentCompletionRetries int `json:"-"`
@@ -347,6 +352,9 @@ type KiroPayload struct {
 	// AgentInputTooLongRecoveries counts the one bounded fallback allowed after
 	// an agent recovery attempt receives Kiro's HTTP 400 input-too-long error.
 	AgentInputTooLongRecoveries int `json:"-"`
+	// OutputContinuations counts bounded continuations after Kiro explicitly
+	// terminates visible output with MAX_TOKENS.
+	OutputContinuations int `json:"-"`
 	// agentRecoveryActionHint retains only the UTF-8-safe tail of the current
 	// failed attempt. It is injected as untrusted diagnostic context only when
 	// constructing a semantic recovery request and is never serialized directly.
@@ -355,6 +363,12 @@ type KiroPayload struct {
 	// never replayed as if it were visible assistant text.
 	agentRecoveryAttemptReasoning   string
 	agentRecoveryAttemptVisibleText string
+	// Output continuation keeps the complete visible prefix separately from the
+	// bounded diagnostic excerpt used by agent-action recovery.
+	outputContinuationAttemptText     string
+	outputContinuationPrefix          string
+	outputContinuationAttemptOverflow bool
+	outputContinuationPending         bool
 	// agentRecoveryInjectedActionHint records the exact generated suffix so a
 	// later semantic retry can replace it without scanning or altering user text.
 	agentRecoveryInjectedActionHint string
@@ -609,6 +623,9 @@ type KiroStreamCallback struct {
 	// AgentCompletionMarker is copied from the request by CallKiroAPI so the
 	// frame parser does not mistake uncommitted narration for a final answer.
 	AgentCompletionMarker string
+	// AgentCompletionRequired enables completion lifecycle handling for forced
+	// tool-choice requests without requiring a text marker.
+	AgentCompletionRequired bool
 	// AgentThinkingTimeout limits only the initial agent attempt after native
 	// reasoning begins and before a completion marker or tool call is observed.
 	// Recovery attempts and ordinary non-agent streams leave it disabled.
@@ -648,6 +665,7 @@ const (
 	upstreamBodyIdleTimeoutCode          = "upstream_body_idle_timeout"
 	upstreamGenerationTimeoutCode        = "upstream_generation_timeout"
 	upstreamReasoningCapCode             = "upstream_reasoning_cap_exceeded"
+	upstreamOutputTruncatedCode          = "upstream_output_truncated"
 	upstreamRecoveryTimeoutCode          = "upstream_recovery_timeout"
 	upstreamAgentContinuationTimeoutCode = "upstream_agent_continuation_timeout"
 )
@@ -656,6 +674,7 @@ var errUpstreamIncompleteResponse = errors.New("upstream did not complete the ag
 var errUpstreamAgentMarkerMismatch = errors.New("upstream did not complete the agent turn: completion marker prefix mismatch")
 var errUpstreamAgentActionOnly = errors.New("upstream END_TURN had neither a completion marker nor a structured tool call")
 var errUpstreamAgentToolChoiceMismatch = errors.New("upstream did not satisfy the required tool choice")
+var errUpstreamOutputTruncated = errors.New("upstream output reached the token limit")
 
 type KiroHTTPError struct {
 	StatusCode int
@@ -730,6 +749,17 @@ func newUpstreamAgentToolChoiceMismatchError(mode, selected string, observed []s
 			detail,
 		),
 	}
+}
+
+func newUpstreamOutputTruncatedError() error {
+	return &KiroStreamProtocolError{
+		Code: upstreamOutputTruncatedCode,
+		Err:  errUpstreamOutputTruncated,
+	}
+}
+
+func isUpstreamOutputTruncatedError(err error) bool {
+	return errors.Is(err, errUpstreamOutputTruncated)
 }
 
 func newUpstreamAgentInterruptedError(cause error) error {
@@ -849,7 +879,7 @@ func kiroPayloadHasTools(payload *KiroPayload) bool {
 }
 
 func initialAgentThinkingTimeout(payload *KiroPayload) time.Duration {
-	if !kiroPayloadHasTools(payload) || payload.AgentCompletionMarker == "" || payload.AgentCompletionRetries != 0 {
+	if !kiroPayloadHasTools(payload) || !agentCompletionProtocolEnabled(payload) || payload.AgentCompletionRetries != 0 {
 		return 0
 	}
 	return kiroInitialAgentThinkingTimeout
@@ -859,7 +889,7 @@ func recordAgentCompletionFailure(payload *KiroPayload, causes ...error) {
 	if !kiroPayloadHasTools(payload) {
 		return
 	}
-	if payload.AgentCompletionMarker != "" {
+	if agentCompletionProtocolEnabled(payload) {
 		payload.AgentCompletionRetries++
 		if len(causes) > 0 && isUpstreamAgentActionOnlyError(causes[0]) {
 			payload.AgentActionContinuations++
@@ -868,7 +898,7 @@ func recordAgentCompletionFailure(payload *KiroPayload, causes ...error) {
 }
 
 func prepareReasoningOnlyRetry(payload *KiroPayload, causes ...error) {
-	if !kiroPayloadHasTools(payload) || payload.AgentCompletionMarker == "" {
+	if !kiroPayloadHasTools(payload) || !agentCompletionProtocolEnabled(payload) {
 		return
 	}
 	captureAgentRecoveryOriginalPayload(payload)
@@ -925,7 +955,7 @@ func prepareReasoningOnlyRetry(payload *KiroPayload, causes ...error) {
 }
 
 func agentCompletionRetryAllowed(payload *KiroPayload, causes ...error) bool {
-	if payload == nil || payload.AgentCompletionMarker == "" {
+	if payload == nil || !agentCompletionProtocolEnabled(payload) {
 		return false
 	}
 	if payload.agentTerminalRecoveryExhausted {
@@ -1235,10 +1265,11 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		}
 		callback = &wrapped
 	}
-	if payload != nil && payload.AgentCompletionMarker != "" {
+	if payload != nil && agentCompletionProtocolEnabled(payload) {
 		if callback.AgentCompletionMarker == "" {
 			callback.AgentCompletionMarker = payload.AgentCompletionMarker
 		}
+		callback.AgentCompletionRequired = true
 		callback.AgentThinkingTimeout = initialAgentThinkingTimeout(payload)
 		// The cap applies to any client that reaches the marker protocol, so it
 		// does not depend on harness recognition or tool-name matching.
@@ -1466,6 +1497,7 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 	if callback == nil {
 		callback = &KiroStreamCallback{}
 	}
+	agentCompletionRequired := callback.AgentCompletionRequired || callback.AgentCompletionMarker != ""
 
 	// io.ReadFull must wait for a complete upstream frame. Read it on a dedicated
 	// goroutine so the parser can keep the downstream SSE connection alive while
@@ -1563,7 +1595,7 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 	firstEventReported := false
 	toolUses := newToolUseAccumulator()
 	reportFrameError := func(err error) error {
-		if callback.AgentCompletionMarker != "" && agentOutputObserved &&
+		if agentCompletionRequired && agentOutputObserved &&
 			markerState != agentCompletionPrefixComplete && !toolObserved {
 			err = newUpstreamAgentInterruptedError(err)
 		}
@@ -1603,7 +1635,7 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 			break
 		}
 		if frame.err != nil {
-			if callback.AgentCompletionMarker != "" && toolObserved && errors.Is(frame.err, io.ErrUnexpectedEOF) {
+			if agentCompletionRequired && toolObserved && errors.Is(frame.err, io.ErrUnexpectedEOF) {
 				if len(toolUses.states) > 0 {
 					return reportKiroStreamError(callback, &KiroStreamProtocolError{
 						Code: "upstream_tool_json_error",
@@ -1693,7 +1725,7 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 		// Dispatch by event type.
 		switch eventType {
 		case "assistantResponseEvent":
-			if toolObserved && callback.AgentCompletionMarker != "" {
+			if toolObserved && agentCompletionRequired {
 				// A structured tool call must terminate the assistant content for
 				// agent clients. Kiro occasionally emits late narration after the
 				// tool event; forwarding it after tool_use can stop the client's
@@ -1728,7 +1760,7 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 				}
 			}
 		case "reasoningContentEvent":
-			if toolObserved && callback.AgentCompletionMarker != "" {
+			if toolObserved && agentCompletionRequired {
 				continue
 			}
 			reasoning := KiroReasoningContentEvent{
@@ -1822,9 +1854,11 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 	if callback.OnComplete != nil {
 		callback.OnComplete(inputTokens, outputTokens)
 	}
+	if upstreamStopReason == "max_tokens" {
+		return reportKiroStreamError(callback, newUpstreamOutputTruncatedError())
+	}
 	if callback.AgentCompletionMarker != "" {
-		if upstreamStopReason == "max_tokens" ||
-			(!toolObserved && (upstreamStopReason != "end_turn" || !agentVisibleTextObserved)) {
+		if !toolObserved && (upstreamStopReason != "end_turn" || !agentVisibleTextObserved) {
 			return reportKiroStreamError(callback, newUpstreamAgentMarkerMismatchError())
 		}
 	}

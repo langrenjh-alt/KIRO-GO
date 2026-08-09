@@ -242,6 +242,7 @@ func (h *Handler) handleAdvisorRequest(
 	totalOutputTokens := advisorResult.OutputTokens + estimateClaudeOutputTokensWithRedacted(
 		finalContent, reasoning.Text, reasoning.Redacted, executorResult.ToolUses,
 	)
+	accountedOutputTokens := retryUsage.finalAttemptOutputTokens(totalOutputTokens)
 	resp := KiroToClaudeResponseWithReasoning(
 		finalContent, responseReasoning, includeEmptyThinkingBlock, executorResult.ToolUses,
 		publicInputTokens, totalOutputTokens, responseModel,
@@ -266,13 +267,13 @@ func (h *Handler) handleAdvisorRequest(
 	resp.Usage.OutputTokensDetails = claudeReasoningUsageDetails(reasoning, includeEmptyThinkingBlock)
 
 	totalCredits := advisorResult.Credits + executorResult.Credits
-	h.recordSuccessForApiKeyWithCache(apiKeyID, totalInputTokens, totalOutputTokens, totalCredits, cacheUsage)
+	h.recordSuccessForApiKeyWithCache(apiKeyID, totalInputTokens, accountedOutputTokens, totalCredits, cacheUsage)
 	retryUsage.recordForAPIKey(apiKeyID)
 	accountID := ""
 	if executorResult.Account != nil {
 		accountID = executorResult.Account.ID
 	}
-	h.recordSuccessLog("claude", req.Model, accountID, totalInputTokens+totalOutputTokens, totalCredits, time.Since(started).Milliseconds())
+	h.recordSuccessLog("claude", req.Model, accountID, totalInputTokens+accountedOutputTokens, totalCredits, time.Since(started).Milliseconds())
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
@@ -427,6 +428,7 @@ func (h *Handler) callClaudeBuffered(
 		}
 		attemptStarted := time.Now()
 		err := call(account, payload, callback)
+		err = resolveKiroOutputTruncation(payload, err, result.UpstreamStopReason, content.String(), completedKiroToolNames(result.ToolUses))
 		if err == nil {
 			visibleContent, _ := extractThinkingFromContent(content.String())
 			visibleContent, markerSeen := filterAgentCompletionContent(payload, visibleContent, len(result.ToolUses))
@@ -459,6 +461,12 @@ func (h *Handler) callClaudeBuffered(
 				return nil, err
 			}
 			lastErr = err
+			if takeKiroOutputContinuationRetry(payload, err) {
+				retryUsage.markLastContinuationAttemptOutput()
+				retrySameID = account.ID
+				attemptLimit++
+				continue
+			}
 			if isKiroInputTooLongError(err) {
 				if h.retryAgentRecoveryAfterInputTooLong("buffered Claude", payload, account, &retrySameID, err) {
 					attemptLimit++
@@ -503,6 +511,7 @@ func (h *Handler) callClaudeBuffered(
 
 		result.Content, _ = extractThinkingFromContent(content.String())
 		result.Content, _ = filterAgentCompletionContent(payload, result.Content, len(result.ToolUses))
+		result.Content = prependKiroOutputContinuation(payload, result.Content)
 		result.Reasoning.Text = reasoning.String()
 		result.ContextInputTokens = currentKiroContextUsageTokens(payload, model)
 		// Upstream token counters can use the same Kiro context domain as
@@ -514,7 +523,7 @@ func (h *Handler) callClaudeBuffered(
 		)
 		result.RetryUsage = retryUsage
 		h.pool.RecordSuccess(account.ID)
-		h.pool.UpdateStats(account.ID, result.InputTokens+result.OutputTokens, result.Credits)
+		h.pool.UpdateStats(account.ID, result.InputTokens+retryUsage.finalAttemptOutputTokens(result.OutputTokens), result.Credits)
 		return result, nil
 	}
 	if lastErr == nil {

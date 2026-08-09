@@ -5,13 +5,8 @@ import (
 	"testing"
 )
 
-// TestClaudeToKiroFlattensHistoryToolCyclesForCompaction reproduces the context
-// compaction scenario that triggered upstream HTTP 400 "Improperly formed
-// request": a long conversation whose history contains completed tool cycles
-// (assistant tool_use + user tool_result), followed by a plain-text instruction.
-// The generated payload must NOT carry any structured toolUses/toolResults in
-// history, since Kiro's upstream rejects those.
-func TestClaudeToKiroFlattensHistoryToolCyclesForCompaction(t *testing.T) {
+// Completed tool cycles survive compaction in Kiro's native causal structure.
+func TestClaudeToKiroPreservesHistoryToolCyclesForCompaction(t *testing.T) {
 	req := &ClaudeRequest{
 		Model: "claude-opus-4.8",
 		Messages: []ClaudeMessage{
@@ -36,18 +31,6 @@ func TestClaudeToKiroFlattensHistoryToolCyclesForCompaction(t *testing.T) {
 
 	payload := ClaudeToKiro(req, false)
 
-	// No history entry may carry structured tool calls or tool results.
-	for i, h := range payload.ConversationState.History {
-		if h.AssistantResponseMessage != nil && len(h.AssistantResponseMessage.ToolUses) > 0 {
-			t.Fatalf("history[%d] still has structured toolUses; upstream rejects this", i)
-		}
-		if h.UserInputMessage != nil && h.UserInputMessage.UserInputMessageContext != nil {
-			if len(h.UserInputMessage.UserInputMessageContext.ToolResults) > 0 {
-				t.Fatalf("history[%d] still has structured toolResults; upstream rejects this", i)
-			}
-		}
-	}
-
 	// Current message is plain text, so it must not carry structured tool results.
 	cur := payload.ConversationState.CurrentMessage.UserInputMessage
 	if cur.UserInputMessageContext != nil && len(cur.UserInputMessageContext.ToolResults) > 0 {
@@ -57,24 +40,19 @@ func TestClaudeToKiroFlattensHistoryToolCyclesForCompaction(t *testing.T) {
 		t.Fatalf("expected current content to be the compaction instruction, got %q", cur.Content)
 	}
 
-	// The narrated tool activity should survive somewhere in history as text.
-	var historyText strings.Builder
-	for _, h := range payload.ConversationState.History {
-		if h.AssistantResponseMessage != nil {
-			historyText.WriteString(h.AssistantResponseMessage.Content)
-			historyText.WriteString("\n")
-		}
-		if h.UserInputMessage != nil {
-			historyText.WriteString(h.UserInputMessage.Content)
-			historyText.WriteString("\n")
-		}
+	rounds := collectNativeKiroToolRounds(t, payload)
+	if len(rounds) != 2 {
+		t.Fatalf("structured tool rounds=%d, want 2", len(rounds))
 	}
-	combined := historyText.String()
-	if !strings.Contains(combined, "exec_command") {
-		t.Fatalf("expected narrated tool calls to mention exec_command, got:\n%s", combined)
-	}
-	if !strings.Contains(combined, "tests pass") {
-		t.Fatalf("expected narrated tool results to retain output, got:\n%s", combined)
+	for i, want := range []struct{ id, command, output string }{
+		{"t1", "make", "build ok"},
+		{"t2", "test", "tests pass"},
+	} {
+		if rounds[i].Uses[0].ToolUseID != want.id || rounds[i].Uses[0].Name != "execCommand" ||
+			rounds[i].Uses[0].Input["cmd"] != want.command ||
+			kiroToolResultText(rounds[i].Results[0]) != want.output {
+			t.Fatalf("round %d changed: %+v", i, rounds[i])
+		}
 	}
 
 	// Regression guard: assistant turns must NOT contain tool-invocation-looking
@@ -86,13 +64,9 @@ func TestClaudeToKiroFlattensHistoryToolCyclesForCompaction(t *testing.T) {
 			}
 		}
 	}
-	// Tool identity must be attributed on the user (result) side, never authored
-	// by the assistant.
-	if !strings.Contains(combined, `<tool_result name="exec_command">`) {
-		t.Fatalf("expected tool results to be attributed to exec_command on the user side, got:\n%s", combined)
-	}
-	if strings.Contains(combined, "Tool results:") {
-		t.Fatalf("history retained the mimicable legacy carrier, got:\n%s", combined)
+	context := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+	if context == nil || len(context.Tools) != 1 || context.Tools[0].ToolSpecification.Name != "execCommand" {
+		t.Fatalf("historical tool definition was not retained in current tools: %+v", context)
 	}
 }
 

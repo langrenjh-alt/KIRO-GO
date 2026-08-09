@@ -798,8 +798,8 @@ func TestParseEventStreamTreatsContentLengthExceededAsMaxTokens(t *testing.T) {
 		OnStopReason: func(reason string) { stopReason = reason },
 		OnComplete:   func(_, _ int) { completed = true },
 	})
-	if err != nil {
-		t.Fatalf("content length termination returned error: %v", err)
+	if !isUpstreamOutputTruncatedError(err) {
+		t.Fatalf("content length termination was not classified for continuation: %v", err)
 	}
 	if content != "partial answer" || stopReason != "max_tokens" || !completed {
 		t.Fatalf("content=%q stop=%q completed=%v", content, stopReason, completed)
@@ -953,7 +953,7 @@ func TestParseEventStreamMaxTokensStillRequiresAgentRecovery(t *testing.T) {
 		AgentCompletionMarker: marker,
 		OnStopReason:          func(reason string) { stopReason = reason },
 	})
-	if stopReason != "max_tokens" || !isUpstreamIncompleteResponseError(err) || !isUpstreamAgentMarkerMismatchError(err) {
+	if stopReason != "max_tokens" || !isUpstreamOutputTruncatedError(err) {
 		t.Fatalf("max-token truncation was not routed to recovery: stop=%q err=%v", stopReason, err)
 	}
 }

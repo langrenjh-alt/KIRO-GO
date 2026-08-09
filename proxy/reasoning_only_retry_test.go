@@ -249,7 +249,7 @@ func TestClaudeFailedToolResultSurvivesRecoveryInputTooLong(t *testing.T) {
 	}
 }
 
-func TestStreamingNativeEndTurnDoesNotStartAgentContinuation(t *testing.T) {
+func TestStreamingMarkedEndTurnDoesNotStartAgentContinuation(t *testing.T) {
 	tests := []struct {
 		name      string
 		invoke    func(*Handler, *httptest.ResponseRecorder)
@@ -299,15 +299,15 @@ func TestStreamingNativeEndTurnDoesNotStartAgentContinuation(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			calls := 0
-			h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
+			h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, attempt *KiroPayload, callback *KiroStreamCallback) error {
 				calls++
 				if calls > 1 {
-					t.Fatalf("native END_TURN unexpectedly started continuation call %d", calls)
+					t.Fatalf("marked END_TURN unexpectedly started continuation call %d", calls)
 				}
 				if callback.OnReasoning != nil {
 					callback.OnReasoning(KiroReasoningContentEvent{Text: "The answer is ready."})
 				}
-				callback.OnText("All core modules confirmed.", false)
+				callback.OnText(attempt.AgentCompletionMarker+"All core modules confirmed.", false)
 				callback.OnStopReason("END_TURN")
 				callback.OnComplete(10, 4)
 				return nil
@@ -318,7 +318,7 @@ func TestStreamingNativeEndTurnDoesNotStartAgentContinuation(t *testing.T) {
 
 			body := rec.Body.String()
 			if calls != 1 || !strings.Contains(body, "All core modules confirmed.") || !strings.Contains(body, test.terminal) {
-				t.Fatalf("native END_TURN did not finish directly: calls=%d body=%s", calls, body)
+				t.Fatalf("marked END_TURN did not finish directly: calls=%d body=%s", calls, body)
 			}
 			if strings.Contains(body, test.forbidden) || strings.Contains(body, upstreamAgentContinuationTimeoutCode) {
 				t.Fatalf("native END_TURN produced a continuation error: %s", body)
@@ -1209,22 +1209,29 @@ func completionProtocolTestPayload() *KiroPayload {
 	return payload
 }
 
-func TestAgentMaxTokenMissingMarkerRetriesWithCorrection(t *testing.T) {
+func TestAgentMaxTokenContinuesFromPartialAssistantOutput(t *testing.T) {
 	calls := 0
 	h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
 		calls++
-		retryInstruction := agentCompletionRetryInstruction(payload.AgentCompletionMarker)
-		if calls == 1 && strings.Contains(payload.ConversationState.CurrentMessage.UserInputMessage.Content, retryInstruction) {
-			t.Fatal("retry instruction was present on the initial attempt")
+		if calls == 1 && strings.Contains(payload.ConversationState.CurrentMessage.UserInputMessage.Content, "<output_continuation>") {
+			t.Fatal("continuation instruction was present on the initial attempt")
 		}
-		if calls == 2 && strings.Count(payload.ConversationState.CurrentMessage.UserInputMessage.Content, retryInstruction) != 1 {
-			t.Fatalf("retry instruction missing or duplicated: %q", payload.ConversationState.CurrentMessage.UserInputMessage.Content)
+		if calls == 2 {
+			if strings.Count(payload.ConversationState.CurrentMessage.UserInputMessage.Content, "<output_continuation>") != 1 {
+				t.Fatalf("continuation instruction missing or duplicated: %q", payload.ConversationState.CurrentMessage.UserInputMessage.Content)
+			}
+			history := payload.ConversationState.History
+			if len(history) < 2 || history[len(history)-1].AssistantResponseMessage == nil ||
+				history[len(history)-1].AssistantResponseMessage.Content != "partial answer: " {
+				t.Fatalf("partial assistant output was not replayed natively: %+v", history)
+			}
 		}
 		callback.OnReasoning(KiroReasoningContentEvent{Text: fmt.Sprintf("reasoning attempt %d", calls)})
 		if calls == 1 {
+			callback.OnText("partial answer: ", false)
 			callback.OnStopReason("max_tokens")
 		} else {
-			callback.OnText(payload.AgentCompletionMarker+"final answer", false)
+			callback.OnText(payload.AgentCompletionMarker+"completed", false)
 			callback.OnStopReason("END_TURN")
 		}
 		callback.OnComplete(10, 4)
@@ -1243,11 +1250,13 @@ func TestAgentMaxTokenMissingMarkerRetriesWithCorrection(t *testing.T) {
 
 	h.handleOpenAIResponses(rec, req)
 
-	if calls != 2 || rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "final answer") {
+	body := rec.Body.String()
+	if calls != 2 || rec.Code != http.StatusOK || strings.Count(body, "partial answer: ") == 0 ||
+		strings.Count(body, "completed") == 0 {
 		t.Fatalf("calls=%d status=%d body=%s", calls, rec.Code, rec.Body.String())
 	}
-	if strings.Contains(rec.Body.String(), upstreamIncompleteResponseCode) {
-		t.Fatalf("recovered max-token attempt surfaced an error: %s", rec.Body.String())
+	if strings.Contains(body, upstreamIncompleteResponseCode) || strings.Contains(body, "<agent_final_") {
+		t.Fatalf("recovered max-token attempt surfaced an error or marker: %s", body)
 	}
 }
 
@@ -1337,11 +1346,15 @@ func TestUnmarkedEndTurnStripsOrphanToolTailAcrossProtocols(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			calls := 0
-			h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
+			h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, attempt *KiroPayload, callback *KiroStreamCallback) error {
 				calls++
-				callback.OnText("final answer", false)
-				callback.OnText("\n</para", false)
-				callback.OnText("meter>", false)
+				if calls == 1 {
+					callback.OnText("draft answer", false)
+				} else {
+					callback.OnText(attempt.AgentCompletionMarker+"final answer", false)
+					callback.OnText("\n</para", false)
+					callback.OnText("meter>", false)
+				}
 				callback.OnStopReason("END_TURN")
 				callback.OnComplete(10, 4)
 				return nil
@@ -1351,7 +1364,7 @@ func TestUnmarkedEndTurnStripsOrphanToolTailAcrossProtocols(t *testing.T) {
 			test.invoke(h, rec)
 
 			body := rec.Body.String()
-			if calls != 1 || rec.Code != http.StatusOK || !strings.Contains(body, "final answer") || !strings.Contains(body, test.terminal) {
+			if calls != 2 || rec.Code != http.StatusOK || !strings.Contains(body, "final answer") || !strings.Contains(body, test.terminal) {
 				t.Fatalf("calls=%d status=%d terminal=%q body=%s", calls, rec.Code, test.terminal, body)
 			}
 			if strings.Contains(body, test.forbidden) || strings.Contains(body, "<agent_final_") ||

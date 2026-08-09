@@ -88,6 +88,55 @@ func TestAccountConcurrencyRefreshSettings(t *testing.T) {
 	}
 }
 
+func TestAgentCompletionMarkerSettingDefaultsEnabledAndPersists(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := Init(path); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+	if !GetAgentCompletionMarkerEnabled() {
+		t.Fatal("marker setting should default enabled when omitted")
+	}
+	if err := UpdateAgentCompletionMarkerEnabled(false); err != nil {
+		t.Fatalf("disable marker setting: %v", err)
+	}
+	if GetAgentCompletionMarkerEnabled() {
+		t.Fatal("marker setting remained enabled after update")
+	}
+	if err := Init(path); err != nil {
+		t.Fatalf("reload config: %v", err)
+	}
+	if GetAgentCompletionMarkerEnabled() {
+		t.Fatal("disabled marker setting was not persisted")
+	}
+}
+
+func TestAgentCompletionMarkerSettingRollsBackOnSaveFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := Init(path); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+	if err := UpdateAgentCompletionMarkerEnabled(false); err != nil {
+		t.Fatalf("seed marker setting: %v", err)
+	}
+
+	cfgLock.Lock()
+	originalPath := cfgPath
+	cfgPath = t.TempDir()
+	cfgLock.Unlock()
+	t.Cleanup(func() {
+		cfgLock.Lock()
+		cfgPath = originalPath
+		cfgLock.Unlock()
+	})
+
+	if err := UpdateAgentCompletionMarkerEnabled(true); err == nil {
+		t.Fatal("expected marker setting persistence failure")
+	}
+	if GetAgentCompletionMarkerEnabled() {
+		t.Fatal("failed update changed the in-memory marker setting")
+	}
+}
+
 func TestPromptCacheConfigClampsLegacyOutOfRangeValues(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(path, []byte(`{"promptCacheMaxRatio":0.001,"promptCacheMaxEntries":2097152,"promptCacheTTLSeconds":600}`), 0600); err != nil {

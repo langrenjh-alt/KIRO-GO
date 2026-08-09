@@ -219,6 +219,113 @@ func TestKiroNativeStructuredHistoryKeepsOnlyCompleteActiveRound(t *testing.T) {
 	}
 }
 
+func TestKiroNativeStructuredHistoryPreservesEveryCompletedToolRound(t *testing.T) {
+	t.Setenv("KIRO_NATIVE_STRUCTURED_HISTORY", "true")
+	req := &ClaudeRequest{
+		Model: "claude-opus-5",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "inspect the repository"},
+			{Role: "assistant", Content: []interface{}{
+				map[string]interface{}{"type": "redacted_thinking", "data": "opaque-old-reasoning"},
+				nativeHistoryToolUse("toolu_read", "read_file"),
+			}},
+			{Role: "user", Content: []interface{}{nativeHistoryToolResult("toolu_read", "package proxy")}},
+			{Role: "assistant", Content: "I need the test file next."},
+			{Role: "user", Content: "inspect the tests"},
+			{Role: "assistant", Content: []interface{}{
+				map[string]interface{}{"type": "redacted_thinking", "data": "opaque-active-reasoning"},
+				nativeHistoryToolUse("toolu_search", "search_files"),
+			}},
+			{Role: "user", Content: []interface{}{nativeHistoryToolResult("toolu_search", "test match")}},
+		},
+		// Deliberately omit search_files so the native history path must add a
+		// broad placeholder schema for a tool that occurred in history.
+		Tools: []ClaudeTool{{Name: "read_file", InputSchema: map[string]interface{}{"type": "object"}}},
+	}
+
+	payload := ClaudeToKiro(req, false)
+	if payload.HistoryMode != kiroHistoryModeNativeActive {
+		t.Fatalf("history mode=%q, want native", payload.HistoryMode)
+	}
+	if payload.ConversationState.AgentTaskType != "vibe" {
+		t.Fatalf("agentTaskType=%q, want vibe", payload.ConversationState.AgentTaskType)
+	}
+	if payload.ConversationState.CurrentMessage.UserInputMessage.Content != "" {
+		t.Fatalf("tool-result continuation content=%q, want empty", payload.ConversationState.CurrentMessage.UserInputMessage.Content)
+	}
+
+	toolRounds := 0
+	resultRounds := 0
+	for i, message := range payload.ConversationState.History {
+		if assistant := message.AssistantResponseMessage; assistant != nil {
+			if assistant.MessageID == "" {
+				t.Fatalf("assistant history[%d] has no stable messageId", i)
+			}
+			if len(assistant.ToolUses) > 0 {
+				toolRounds++
+				if assistant.ToolUses[0].ToolUseID == "toolu_read" && assistant.ReasoningContent != nil {
+					t.Fatalf("old reasoning was replayed: %+v", assistant.ReasoningContent)
+				}
+				if assistant.ToolUses[0].ToolUseID == "toolu_search" &&
+					(assistant.ReasoningContent == nil || assistant.ReasoningContent.RedactedContent != "opaque-active-reasoning") {
+					t.Fatalf("active reasoning was not replayed: %+v", assistant.ReasoningContent)
+				}
+			}
+		}
+		if user := message.UserInputMessage; user != nil && user.UserInputMessageContext != nil &&
+			len(user.UserInputMessageContext.ToolResults) > 0 {
+			resultRounds++
+		}
+	}
+	if toolRounds != 2 || resultRounds != 1 {
+		// The second result is currentMessage; only the first result belongs to history.
+		t.Fatalf("structured rounds in history: tool=%d result=%d", toolRounds, resultRounds)
+	}
+	context := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+	if context == nil || len(context.ToolResults) != 1 || len(context.Tools) != 2 {
+		t.Fatalf("current native context=%+v, want one result and two tool definitions", context)
+	}
+	toolNames := map[string]bool{}
+	for _, tool := range context.Tools {
+		toolNames[tool.ToolSpecification.Name] = true
+	}
+	if !toolNames["readFile"] || !toolNames["searchFiles"] {
+		t.Fatalf("historical tool definitions=%v", toolNames)
+	}
+}
+
+func TestNormalizeNativeKiroHistoryDoesNotMergeOrdinaryUserTurns(t *testing.T) {
+	history := []KiroHistoryMessage{
+		{UserInputMessage: &KiroUserInputMessage{Content: "first user turn"}},
+		{UserInputMessage: &KiroUserInputMessage{Content: "second user turn"}},
+	}
+
+	normalized := normalizeNativeKiroHistory(history)
+	if len(normalized) != 2 || normalized[0].UserInputMessage == nil || normalized[1].UserInputMessage == nil {
+		t.Fatalf("ordinary user turns were merged: %+v", normalized)
+	}
+	if normalized[0].UserInputMessage.Content != "first user turn" ||
+		normalized[1].UserInputMessage.Content != "second user turn" {
+		t.Fatalf("ordinary user content changed: %+v", normalized)
+	}
+
+	toolResultTurn := []KiroHistoryMessage{
+		{UserInputMessage: &KiroUserInputMessage{
+			UserInputMessageContext: &UserInputMessageContext{
+				ToolResults: []KiroToolResult{{ToolUseID: "toolu_1"}},
+			},
+		}},
+		{UserInputMessage: &KiroUserInputMessage{Content: "continue after the tool"}},
+	}
+	coalesced := normalizeNativeKiroHistory(toolResultTurn)
+	if len(coalesced) != 1 || coalesced[0].UserInputMessage == nil ||
+		coalesced[0].UserInputMessage.Content != "continue after the tool" ||
+		coalesced[0].UserInputMessage.UserInputMessageContext == nil ||
+		len(coalesced[0].UserInputMessage.UserInputMessageContext.ToolResults) != 1 {
+		t.Fatalf("tool-result continuation was not coalesced: %+v", coalesced)
+	}
+}
+
 func TestKiroNativeStructuredHistoryFallsBackOnPartialRound(t *testing.T) {
 	t.Setenv("KIRO_NATIVE_STRUCTURED_HISTORY", "on")
 	req := nativeHistoryClaudeRequest(

@@ -11,8 +11,8 @@ import (
 // "[Called tool X with input ...]" inside assistant turns, the model learned to
 // emit that literal text instead of issuing real structured tool calls.
 //
-// After the fix, assistant history turns must never contain tool-invocation
-// syntax. Tool identity is attributed only on the user "Tool results" side.
+// After the fix, assistant prose must never contain narrated invocation syntax;
+// real tool calls remain in Kiro's structured toolUses field.
 func TestNoToolInvocationTextInAssistantHistory(t *testing.T) {
 	// Build a long OpenAI conversation with many completed tool cycles.
 	msgs := []OpenAIMessage{{Role: "user", Content: "start a multi-step task"}}
@@ -40,33 +40,20 @@ func TestNoToolInvocationTextInAssistantHistory(t *testing.T) {
 				t.Fatalf("history[%d] assistant content contains mimicable tool text %q: %q", i, bad, a.Content)
 			}
 		}
-		// No assistant turn may carry structured tool calls (rejected upstream).
-		if len(a.ToolUses) > 0 {
-			t.Fatalf("history[%d] assistant retains %d structured toolUses", i, len(a.ToolUses))
-		}
 	}
 
-	// Tool outputs must still be preserved (on the user side) for context.
-	var allText strings.Builder
-	for _, h := range payload.ConversationState.History {
-		if h.UserInputMessage != nil {
-			allText.WriteString(h.UserInputMessage.Content)
-			allText.WriteString("\n")
-		}
+	rounds := collectNativeKiroToolRounds(t, payload)
+	if len(rounds) != 8 {
+		t.Fatalf("structured tool rounds=%d, want 8", len(rounds))
 	}
-	combined := allText.String()
 	for i := 0; i < 8; i++ {
 		marker := fmt.Sprintf("OUTPUT_%d", i)
-		if !strings.Contains(combined, marker) {
-			t.Fatalf("tool output %q lost from history", marker)
+		if got := kiroToolResultText(rounds[i].Results[0]); got != marker {
+			t.Fatalf("tool output %d=%q, want %q", i, got, marker)
 		}
 	}
-	// Tool identity should be attributed inside a data-only result envelope.
-	if !strings.Contains(combined, `<tool_result name="exec_command">`) {
-		t.Fatalf("expected tool results attributed to exec_command on the user side")
-	}
-	if strings.Contains(combined, "Tool results:") {
-		t.Fatalf("history retained the mimicable legacy tool-results carrier: %q", combined)
+	if payload.HistoryMode != kiroHistoryModeNativeActive || payload.ConversationState.AgentTaskType != "vibe" {
+		t.Fatalf("native agent protocol not selected: mode=%q task=%q", payload.HistoryMode, payload.ConversationState.AgentTaskType)
 	}
 }
 
@@ -77,9 +64,46 @@ func newPollToolCall(id, name, args string) ToolCall {
 	return tc
 }
 
-// TestCollapsesConsecutiveIdenticalToolResults covers a literal client replay:
-// the tool-use ID, name, arguments, status, and result are all identical. This
-// is the only flattened tool cycle eligible for collapse.
+type observedKiroToolRound struct {
+	Uses    []KiroToolUse
+	Results []KiroToolResult
+}
+
+func collectNativeKiroToolRounds(t *testing.T, payload *KiroPayload) []observedKiroToolRound {
+	t.Helper()
+	var rounds []observedKiroToolRound
+	history := payload.ConversationState.History
+	for i, message := range history {
+		assistant := message.AssistantResponseMessage
+		if assistant == nil || len(assistant.ToolUses) == 0 {
+			continue
+		}
+		var results []KiroToolResult
+		if i+1 < len(history) {
+			next := history[i+1].UserInputMessage
+			if next != nil && next.UserInputMessageContext != nil {
+				results = next.UserInputMessageContext.ToolResults
+			}
+		} else if context := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext; context != nil {
+			results = context.ToolResults
+		}
+		if !toolResultsExactlyMatchUses(assistant.ToolUses, results) {
+			t.Fatalf("history[%d] tool round is not paired: uses=%+v results=%+v", i, assistant.ToolUses, results)
+		}
+		rounds = append(rounds, observedKiroToolRound{Uses: assistant.ToolUses, Results: results})
+	}
+	return rounds
+}
+
+func kiroToolResultText(result KiroToolResult) string {
+	parts := make([]string, 0, len(result.Content))
+	for _, content := range result.Content {
+		parts = append(parts, content.Text)
+	}
+	return strings.Join(parts, "\n")
+}
+
+// Even byte-identical tool rounds are causal history and remain distinct.
 func TestCollapsesConsecutiveIdenticalToolResults(t *testing.T) {
 	msgs := []OpenAIMessage{{Role: "user", Content: "start"}}
 	// Five exact replays of one tool cycle.
@@ -95,16 +119,14 @@ func TestCollapsesConsecutiveIdenticalToolResults(t *testing.T) {
 
 	payload := OpenAIToKiro(&OpenAIRequest{Model: "claude-opus-4.8", Messages: msgs}, false)
 
-	var combined strings.Builder
-	for _, h := range payload.ConversationState.History {
-		if h.UserInputMessage != nil {
-			combined.WriteString(h.UserInputMessage.Content)
-			combined.WriteByte('\n')
-		}
+	rounds := collectNativeKiroToolRounds(t, payload)
+	if len(rounds) != 5 {
+		t.Fatalf("identical tool rounds=%d, want 5", len(rounds))
 	}
-	count := strings.Count(combined.String(), "SAME_ERROR_OUTPUT")
-	if count != 1 {
-		t.Fatalf("expected 5 identical tool results collapsed to 1 occurrence, got %d in %q", count, combined.String())
+	for i, round := range rounds {
+		if round.Uses[0].ToolUseID != "same_call" || kiroToolResultText(round.Results[0]) != "SAME_ERROR_OUTPUT" {
+			t.Fatalf("round %d changed: %+v", i, round)
+		}
 	}
 }
 
@@ -119,19 +141,14 @@ func TestDoesNotCollapseSameToolOutputWithDifferentIDs(t *testing.T) {
 	}
 
 	payload := OpenAIToKiro(&OpenAIRequest{Model: "claude-opus-4.8", Messages: msgs}, false)
-	var combined strings.Builder
-	for _, h := range payload.ConversationState.History {
-		if h.UserInputMessage != nil {
-			combined.WriteString(h.UserInputMessage.Content)
-		}
+	rounds := collectNativeKiroToolRounds(t, payload)
+	if len(rounds) != 2 {
+		t.Fatalf("tool rounds=%d, want 2", len(rounds))
 	}
-	got := combined.String()
-	if count := strings.Count(got, "SAME_OUTPUT_DIFFERENT_ID"); count != 2 {
-		t.Fatalf("different tool-use IDs were collapsed: count=%d history=%q", count, got)
-	}
-	for _, id := range []string{"call_a", "call_b"} {
-		if !strings.Contains(got, id) {
-			t.Fatalf("flattened history lost tool-use ID %q: %q", id, got)
+	for i, id := range []string{"call_a", "call_b"} {
+		if rounds[i].Uses[0].ToolUseID != id || rounds[i].Results[0].ToolUseID != id ||
+			kiroToolResultText(rounds[i].Results[0]) != "SAME_OUTPUT_DIFFERENT_ID" {
+			t.Fatalf("round %d lost ID/output: %+v", i, rounds[i])
 		}
 	}
 }
@@ -147,19 +164,14 @@ func TestDoesNotCollapseSameToolIDWithDifferentInputs(t *testing.T) {
 	}
 
 	payload := OpenAIToKiro(&OpenAIRequest{Model: "claude-opus-4.8", Messages: msgs}, false)
-	var combined strings.Builder
-	for _, h := range payload.ConversationState.History {
-		if h.UserInputMessage != nil {
-			combined.WriteString(h.UserInputMessage.Content)
-		}
+	rounds := collectNativeKiroToolRounds(t, payload)
+	if len(rounds) != 2 {
+		t.Fatalf("tool rounds=%d, want 2", len(rounds))
 	}
-	got := combined.String()
-	if count := strings.Count(got, "SAME_OUTPUT_DIFFERENT_INPUT"); count != 2 {
-		t.Fatalf("same ID with different inputs was collapsed: count=%d history=%q", count, got)
-	}
-	for _, input := range []string{"first", "second"} {
-		if !strings.Contains(got, input) {
-			t.Fatalf("flattened history lost tool input %q: %q", input, got)
+	for i, input := range []string{"first", "second"} {
+		if rounds[i].Uses[0].Input["cmd"] != input ||
+			kiroToolResultText(rounds[i].Results[0]) != "SAME_OUTPUT_DIFFERENT_INPUT" {
+			t.Fatalf("round %d lost input/output: %+v", i, rounds[i])
 		}
 	}
 }
@@ -187,30 +199,31 @@ func TestDoesNotCollapseSameToolCycleWithDifferentAssistantReasoning(t *testing.
 	}
 
 	payload := OpenAIToKiro(req, false)
-	var combined strings.Builder
-	for _, h := range payload.ConversationState.History {
-		if h.UserInputMessage != nil {
-			combined.WriteString(h.UserInputMessage.Content)
-		}
-		if h.AssistantResponseMessage != nil {
-			combined.WriteString(h.AssistantResponseMessage.Content)
-		}
+	rounds := collectNativeKiroToolRounds(t, payload)
+	if len(rounds) != 2 {
+		t.Fatalf("tool rounds=%d, want 2", len(rounds))
 	}
-	got := combined.String()
-	if count := strings.Count(got, "SAME_OUTPUT_DIFFERENT_REASONING"); count != 2 {
-		t.Fatalf("cycles with different assistant reasoning were collapsed: count=%d history=%q", count, got)
-	}
-	for _, reasoning := range []string{"first rationale", "second rationale"} {
-		if !strings.Contains(got, reasoning) {
-			t.Fatalf("assistant reasoning %q was lost: %q", reasoning, got)
+	for i, reasoning := range []string{"first rationale", "second rationale"} {
+		if kiroToolResultText(rounds[i].Results[0]) != "SAME_OUTPUT_DIFFERENT_REASONING" {
+			t.Fatalf("round %d lost result: %+v", i, rounds[i])
+		}
+		found := false
+		for _, history := range payload.ConversationState.History {
+			if assistant := history.AssistantResponseMessage; assistant != nil &&
+				len(assistant.ToolUses) > 0 && assistant.ToolUses[0].ToolUseID == "reused_id" &&
+				strings.Contains(assistant.Content, reasoning) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("assistant reasoning %q was lost", reasoning)
 		}
 	}
 }
 
-// TestMergesUserTurnsAfterToolHistoryScrub ensures that removing historical
-// assistant toolUses does not leave an invalid run of consecutive user turns.
-// The tool output remains in the merged user content, while the assistant-side
-// invocation syntax stays absent so the model cannot imitate it.
+// A separate user continuation is merged into the preceding structured result
+// turn without flattening the call/result pair.
 func TestMergesUserTurnsAfterToolHistoryScrub(t *testing.T) {
 	msgs := []OpenAIMessage{{Role: "user", Content: "start"}}
 	for i := 0; i < 3; i++ {
@@ -233,21 +246,14 @@ func TestMergesUserTurnsAfterToolHistoryScrub(t *testing.T) {
 		}
 	}
 
-	var merged strings.Builder
-	for _, h := range history {
-		if h.UserInputMessage != nil {
-			merged.WriteString(h.UserInputMessage.Content)
-			merged.WriteByte('\n')
-		}
+	rounds := collectNativeKiroToolRounds(t, payload)
+	if len(rounds) != 3 {
+		t.Fatalf("structured rounds=%d, want 3", len(rounds))
 	}
-	for i := 0; i < 3; i++ {
-		if !strings.Contains(merged.String(), fmt.Sprintf("OUTPUT_%d", i)) {
-			t.Fatalf("merged history lost OUTPUT_%d: %q", i, merged.String())
-		}
-	}
-	for _, h := range history {
-		if a := h.AssistantResponseMessage; a != nil && len(a.ToolUses) > 0 {
-			t.Fatalf("historical assistant retained structured toolUses: %#v", a.ToolUses)
+	for i, round := range rounds {
+		if round.Uses[0].ToolUseID != fmt.Sprintf("call_%d", i) ||
+			kiroToolResultText(round.Results[0]) != fmt.Sprintf("OUTPUT_%d", i) {
+			t.Fatalf("round %d changed: %+v", i, round)
 		}
 	}
 }
@@ -276,22 +282,19 @@ func TestClaudeMergesUserTurnsAfterToolHistoryScrub(t *testing.T) {
 
 	payload := ClaudeToKiro(&ClaudeRequest{Model: "claude-opus-4.8", Messages: msgs}, false)
 	history := payload.ConversationState.History
-	var merged strings.Builder
 	for i, h := range history {
 		if i > 0 && history[i-1].UserInputMessage != nil && h.UserInputMessage != nil {
 			t.Fatalf("history contains consecutive user turns at %d/%d", i-1, i)
 		}
-		if h.UserInputMessage != nil {
-			merged.WriteString(h.UserInputMessage.Content)
-			merged.WriteByte('\n')
-		}
-		if a := h.AssistantResponseMessage; a != nil && len(a.ToolUses) > 0 {
-			t.Fatalf("historical assistant retained structured toolUses: %#v", a.ToolUses)
-		}
 	}
-	for i := 0; i < 3; i++ {
-		if !strings.Contains(merged.String(), fmt.Sprintf("CLAUDE_OUTPUT_%d", i)) {
-			t.Fatalf("merged Claude history lost output %d: %q", i, merged.String())
+	rounds := collectNativeKiroToolRounds(t, payload)
+	if len(rounds) != 3 {
+		t.Fatalf("structured rounds=%d, want 3", len(rounds))
+	}
+	for i, round := range rounds {
+		if round.Uses[0].ToolUseID != fmt.Sprintf("toolu_%d", i) ||
+			kiroToolResultText(round.Results[0]) != fmt.Sprintf("CLAUDE_OUTPUT_%d", i) {
+			t.Fatalf("round %d changed: %+v", i, round)
 		}
 	}
 }
@@ -422,7 +425,6 @@ func TestHistoricalCmdUsesNeutralUserEnvelope(t *testing.T) {
 	}
 	payload := OpenAIToKiro(&OpenAIRequest{Model: "claude-opus-4.8", Messages: msgs}, false)
 
-	var userText strings.Builder
 	seenOriginalAssistant := false
 	for i, h := range payload.ConversationState.History {
 		if a := h.AssistantResponseMessage; a != nil {
@@ -435,18 +437,18 @@ func TestHistoricalCmdUsesNeutralUserEnvelope(t *testing.T) {
 				seenOriginalAssistant = true
 			}
 		}
-		if u := h.UserInputMessage; u != nil {
-			userText.WriteString(u.Content)
-		}
 	}
 	if !seenOriginalAssistant {
 		t.Fatal("original assistant content was dropped or rewritten")
 	}
-	got := userText.String()
-	for _, want := range []string{"cmd_call", "exec_command", "go test ./proxy", "CMD_OUTPUT"} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("neutral user-side envelope lost %q: %q", want, got)
-		}
+	rounds := collectNativeKiroToolRounds(t, payload)
+	if len(rounds) != 1 {
+		t.Fatalf("structured rounds=%d, want 1", len(rounds))
+	}
+	round := rounds[0]
+	if round.Uses[0].ToolUseID != "cmd_call" || round.Uses[0].Name != "execCommand" ||
+		round.Uses[0].Input["cmd"] != "go test ./proxy" || kiroToolResultText(round.Results[0]) != "CMD_OUTPUT" {
+		t.Fatalf("structured command exchange changed: %+v", round)
 	}
 }
 
