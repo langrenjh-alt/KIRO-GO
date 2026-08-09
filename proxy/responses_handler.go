@@ -194,6 +194,7 @@ func (h *Handler) handleResponsesNonStream(
 	var lastErr error
 	reqStart := time.Now()
 	preResponseRetryCount := 0
+	var retryUsage retryBillingUsage
 
 	attemptLimit := h.maxAccountAttempts()
 	for attempt := 0; attempt < attemptLimit; attempt++ {
@@ -282,6 +283,15 @@ func (h *Handler) handleResponsesNonStream(
 		}
 		h.releaseAccount(account)
 		if err != nil {
+			discarded := estimateOpenAIOutputTokens(content, reasoningContent, toolUses)
+			discarded = discardedAttemptOutputTokens(discarded, outputTokens)
+			if discarded > 0 || inputTokens > 0 || credits > 0 {
+				retryUsage.add(h.settleDiscardedAttempt(
+					"responses", model, account.ID, apiKeyID,
+					clampClaudeInputTokensToModelWindow(model, discardedAttemptInputTokens(estimatedInputTokens, inputTokens)), discarded, credits,
+					time.Since(reqStart).Milliseconds(),
+				))
+			}
 			if isDownstreamRequestCanceled(payload, err) {
 				return
 			}
@@ -373,6 +383,7 @@ func (h *Handler) handleResponsesNonStream(
 
 		publicInputTokens := contextUsageBlendedInputTokens(payload, model, inputTokens)
 		publicCacheUsage := contextUsageBlendedCacheUsage(payload, model, inputTokens, cacheUsage)
+		publicInputTokens, publicCacheUsage = retryUsage.apply(publicInputTokens, publicCacheUsage)
 		respObj := buildResponsesObjectWithReasoning(respID, responseModel, finalContent, reasoningContent, toolUses, publicInputTokens, outputTokens, req)
 		applyResponsesPromptCacheUsage(respObj, publicCacheUsage)
 		respObj.Usage.KiroContextUsage = kiroContextUsage(payload, model)
@@ -588,6 +599,7 @@ func (h *Handler) handleResponsesStream(
 	var streamOutput []ResponseOutputItem
 	var fullReasoningText strings.Builder
 	outputIndex := 0
+	var retryUsage retryBillingUsage
 
 	attemptLimit := h.maxAccountAttempts()
 	for attempt := 0; attempt < attemptLimit; attempt++ {
@@ -1064,6 +1076,15 @@ func (h *Handler) handleResponsesStream(
 		}
 		h.releaseAccount(account)
 		if err != nil {
+			discarded := estimateOpenAIOutputTokens(fullText.String(), fullReasoningText.String(), toolUses)
+			discarded = discardedAttemptOutputTokens(discarded, outputTokens)
+			if discarded > 0 || inputTokens > 0 || credits > 0 {
+				retryUsage.add(h.settleDiscardedAttempt(
+					"responses", model, account.ID, apiKeyID,
+					clampClaudeInputTokensToModelWindow(model, discardedAttemptInputTokens(estimatedInputTokens, inputTokens)), discarded, credits,
+					time.Since(reqStart).Milliseconds(),
+				))
+			}
 			if isUpstreamIncompleteResponseError(err) {
 				closeReasoning()
 				closeMessage()
@@ -1226,6 +1247,7 @@ func (h *Handler) handleResponsesStream(
 
 		publicInputTokens := contextUsageBlendedInputTokens(payload, model, inputTokens)
 		publicCacheUsage := contextUsageBlendedCacheUsage(payload, model, inputTokens, cacheUsage)
+		publicInputTokens, publicCacheUsage = retryUsage.apply(publicInputTokens, publicCacheUsage)
 		respObj := buildResponsesObjectWithReasoning(respID, responseModel, finalContent, reasoning, toolUses, publicInputTokens, outputTokens, req)
 		applyResponsesPromptCacheUsage(respObj, publicCacheUsage)
 		respObj.Usage.KiroContextUsage = kiroContextUsage(payload, model)

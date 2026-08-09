@@ -263,7 +263,38 @@ func TestBufferedClaudeUsageSeparatesUpstreamCountersFromKiroContext(t *testing.
 	}
 }
 
-func TestClaudeRecoveryUsageKeepsClientInputAndPeakKiroOccupancy(t *testing.T) {
+func TestBufferedClaudeRecoveryKeepsPeakKiroContext(t *testing.T) {
+	calls := 0
+	h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
+		calls++
+		if calls == 1 {
+			callback.OnContextUsage(80)
+			callback.OnComplete(800_000, 11)
+			return newUpstreamAgentMarkerMismatchError()
+		}
+		callback.OnText(payload.AgentCompletionMarker+"done", false)
+		callback.OnStopReason("END_TURN")
+		callback.OnComplete(10, 1)
+		return nil
+	})
+
+	result, err := h.callClaudeBuffered("claude-opus-5", completionProtocolTestPayload(), false, 250_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("calls=%d, want one recovery attempt", calls)
+	}
+	if result.ContextInputTokens != 800_000 {
+		t.Fatalf("buffered Kiro context tokens=%d, want retry-chain peak 800000", result.ContextInputTokens)
+	}
+	usagePayload := contextUsagePayloadFromTokens("claude-opus-5", result.ContextInputTokens)
+	if got := claudePublicInputTokens(usagePayload, "claude-opus-5", result.InputTokens); got <= result.InputTokens {
+		t.Fatalf("public input tokens=%d, want 28%% mapping to increase client input %d", got, result.InputTokens)
+	}
+}
+
+func TestClaudeRecoveryUsageAddsDiscardedAttemptAsCacheReadAndKeepsPeakKiroOccupancy(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		t.Run(map[bool]string{false: "non-stream", true: "stream"}[stream], func(t *testing.T) {
 			calls := 0
@@ -303,8 +334,8 @@ func TestClaudeRecoveryUsageKeepsClientInputAndPeakKiroOccupancy(t *testing.T) {
 				if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
 					t.Fatalf("decode response: %v body=%s", err, rec.Body.String())
 				}
-				if totalInput := response.Usage.InputTokens + response.Usage.CacheCreationInputTokens + response.Usage.CacheReadInputTokens; totalInput != 5 {
-					t.Fatalf("terminal input total=%d, want client-visible estimate 5", totalInput)
+				if response.Usage.InputTokens != 5 || response.Usage.CacheCreationInputTokens != 0 || response.Usage.CacheReadInputTokens <= 0 {
+					t.Fatalf("terminal usage=%+v, want final input 5 and discarded attempt only in cache read", response.Usage)
 				}
 				assertKiroContextUsageValue(t, response.Usage.KiroContextUsage, 800_000, 1_000_000, 80, false)
 				return
@@ -316,9 +347,14 @@ func TestClaudeRecoveryUsageKeepsClientInputAndPeakKiroOccupancy(t *testing.T) {
 					terminalUsage = responseContractMap(t, event.Data["usage"], "message_delta.usage")
 				}
 			}
-			terminalTotal := int(terminalUsage["input_tokens"].(float64) + terminalUsage["cache_creation_input_tokens"].(float64) + terminalUsage["cache_read_input_tokens"].(float64))
-			if terminalTotal != 5 {
-				t.Fatalf("terminal input total=%d, want client-visible estimate 5; usage=%#v", terminalTotal, terminalUsage)
+			if input := int(terminalUsage["input_tokens"].(float64)); input != 5 {
+				t.Fatalf("terminal uncached input=%d, want final input 5; usage=%#v", input, terminalUsage)
+			}
+			if creation := int(terminalUsage["cache_creation_input_tokens"].(float64)); creation != 0 {
+				t.Fatalf("terminal cache creation=%d, want 0; usage=%#v", creation, terminalUsage)
+			}
+			if read := int(terminalUsage["cache_read_input_tokens"].(float64)); read <= 0 {
+				t.Fatalf("terminal cache read=%d, want discarded attempt cost; usage=%#v", read, terminalUsage)
 			}
 			assertKiroContextUsageJSON(t, terminalUsage["kiro_context_usage"], 800_000, 1_000_000, 80, false)
 		})

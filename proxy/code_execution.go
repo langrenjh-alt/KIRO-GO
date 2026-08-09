@@ -127,16 +127,19 @@ func (h *Handler) handleCodeExecutionRequest(
 		cacheUsage = reanchorClaudeCacheUsage(cacheProfile, cacheUsage, inputTokens)
 		cacheTracker.Update(result.Account.ID, cacheProfile)
 	}
-	publicInputTokens := claudePublicInputTokens(payload, req.Model, inputTokens)
+	usagePayload := contextUsagePayloadFromTokens(req.Model, result.ContextInputTokens)
+	publicInputTokens := claudePublicInputTokens(usagePayload, req.Model, inputTokens)
 	responseCacheUsage := cacheUsage
 	contextUsage := kiroContextUsage(payload, req.Model)
-	// ContextInputTokens is Kiro's raw window occupancy and includes Kiro-owned
-	// instructions. Keep it diagnostic-only; public usage stays client-visible.
-	responseCacheUsage = claudeTerminalCacheUsage(cacheProfile, payload, req.Model, inputTokens, cacheUsage)
+	// ContextInputTokens includes Kiro-owned instructions. Use it for the gradual
+	// public usage lift after 28%, while retaining the exact value diagnostically.
+	responseCacheUsage = claudeTerminalCacheUsage(cacheProfile, usagePayload, req.Model, inputTokens, cacheUsage)
+	publicInputTokens, responseCacheUsage = result.RetryUsage.apply(publicInputTokens, responseCacheUsage)
 	if result.ContextInputTokens > 0 {
 		contextUsage = kiroContextUsageFromTokens(req.Model, result.ContextInputTokens)
 	}
 	h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, result.Credits, cacheUsage)
+	result.RetryUsage.recordForAPIKey(apiKeyID)
 	accountID := ""
 	if result.Account != nil {
 		accountID = result.Account.ID

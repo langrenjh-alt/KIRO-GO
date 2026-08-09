@@ -14,29 +14,23 @@ package proxy
 // client-visible bytes are unchanged, and any lift is bounded by the observed
 // overhead, so this can never invent tokens beyond what upstream really holds.
 // Parity lands at 90% rather than 100%: a client that only learns the truth at
-// 100% has no room left to act on it. contextUsageMaxWindowShare then keeps the
-// reported total just under the window so the lift can never itself look like an
-// overflow to a client that validates against its own limit.
+// 100% has no room left to act on it.
 //
 // The band is deliberately wide. An early, low threshold spreads the lift over
 // many turns, which reads as a slowly rising counter rather than a jump.
 // Starting at 28% keeps the ramp gradual across a much wider band, so the lift
-// is spread over many turns instead of arriving as a step in the middle of a
-// session. The quadratic first half means the early part of that band moves the
-// reported total by a few hundred tokens at most.
+// is spread evenly over many turns instead of arriving as a step late in the
+// session.
 const (
 	contextUsageBlendStartPercent  = 28.0
 	contextUsageBlendParityPercent = 90.0
-	contextUsageMaxWindowShare     = 0.98
 	contextUsageMinComparableShare = 0.25
 )
 
-// contextUsageBlendWeight ramps 0 -> 1 across the blend band. The first half of
-// the band is eased in quadratically so a request that briefly crosses the
-// threshold shows no visible jump, then the ramp straightens out and reaches
-// parity by contextUsageBlendParityPercent. Staying quadratic all the way would
-// still report only ~67% of the window at 85% real occupancy, which is below
-// where clients decide to compact -- exactly the failure this is meant to avoid.
+// contextUsageBlendWeight ramps linearly from 0 -> 1 across the blend band.
+// Starting at zero prevents a step at 28%, while a constant slope recovers the
+// hidden-context cost throughout ordinary sessions instead of deferring most of
+// it until the window is nearly full.
 func contextUsageBlendWeight(percentage float64) float64 {
 	if percentage <= contextUsageBlendStartPercent {
 		return 0
@@ -44,14 +38,8 @@ func contextUsageBlendWeight(percentage float64) float64 {
 	if percentage >= contextUsageBlendParityPercent {
 		return 1
 	}
-	span := contextUsageBlendParityPercent - contextUsageBlendStartPercent
-	linear := (percentage - contextUsageBlendStartPercent) / span
-	if linear < 0.5 {
-		// Quadratic through (0.5, 0.25) so the two segments meet without a step.
-		return linear * linear
-	}
-	// Straight line from (0.5, 0.25) to (1, 1).
-	return 0.25 + (linear-0.5)*1.5
+	return (percentage - contextUsageBlendStartPercent) /
+		(contextUsageBlendParityPercent - contextUsageBlendStartPercent)
 }
 
 // contextUsageComparabilityWeight avoids treating a tiny follow-up estimate as
@@ -84,9 +72,9 @@ func contextUsageComparabilityWeight(clientInputTokens, parityOccupancy int) flo
 // multi-turn session, since Kiro's percentage spans the whole upstream
 // conversation while the client total covers just this request. Below the
 // threshold the weight is zero and the client number passes through untouched;
-// past it the squared ramp eases the gap in, reaching parity only when upstream
-// is genuinely full. Anything less lets Claude Code believe it has headroom
-// upstream no longer has, which is what makes Kiro reject the next turn.
+// past it the linear ramp closes the gap, reaching parity at 90%. Anything less
+// lets Claude Code believe it has headroom upstream no longer has, which is what
+// makes Kiro reject the next turn.
 func contextUsageBlendedInputTokens(payload *KiroPayload, model string, clientInputTokens int) int {
 	if payload == nil || clientInputTokens <= 0 {
 		return clientInputTokens
@@ -111,15 +99,7 @@ func contextUsageBlendedInputTokens(payload *KiroPayload, model string, clientIn
 	if weight <= 0 {
 		return clientInputTokens
 	}
-	// Cap the target below the window before weighting. Upstream occupancy counts
-	// Kiro's own preamble, so a small request against a nearly full conversation
-	// would otherwise be lifted by orders of magnitude.
 	target := occupied
-	if window := getContextWindowSize(model); window > 0 {
-		if ceiling := int(float64(window) * contextUsageMaxWindowShare); target > ceiling {
-			target = ceiling
-		}
-	}
 	if target <= clientInputTokens {
 		return clientInputTokens
 	}
@@ -131,6 +111,16 @@ func contextUsageBlendedInputTokens(payload *KiroPayload, model string, clientIn
 		return blended
 	}
 	return target
+}
+
+func contextUsagePayloadFromTokens(model string, occupiedTokens int) *KiroPayload {
+	window := getContextWindowSize(model)
+	if occupiedTokens <= 0 || window <= 0 {
+		return nil
+	}
+	return &KiroPayload{
+		maxContextUsagePercentage: 100 * float64(occupiedTokens) / float64(window),
+	}
 }
 
 // claudePublicInputTokens returns the client-visible input total used by the

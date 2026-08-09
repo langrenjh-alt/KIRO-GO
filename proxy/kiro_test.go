@@ -840,6 +840,33 @@ func TestParseEventStreamUsesMeteringAsEnterpriseTerminalFallback(t *testing.T) 
 	}
 }
 
+func TestParseEventStreamPublishesMeteringBeforeAgentMarkerFailure(t *testing.T) {
+	stream := bytes.NewReader(bytes.Join([][]byte{
+		awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{
+			"stopReason": "END_TURN",
+			"tokenUsage": map[string]interface{}{"inputTokens": 37, "outputTokens": 11},
+		}),
+		awsEventStreamFrame(t, "meteringEvent", map[string]interface{}{"usage": 1.25}),
+	}, nil))
+
+	var credits float64
+	var inputTokens, outputTokens int
+	err := parseEventStream(stream, &KiroStreamCallback{
+		AgentCompletionMarker: "<agent_final_0123456789abcdef>",
+		OnCredits:             func(value float64) { credits = value },
+		OnComplete: func(input, output int) {
+			inputTokens = input
+			outputTokens = output
+		},
+	})
+	if !isUpstreamIncompleteResponseError(err) || !isUpstreamAgentMarkerMismatchError(err) {
+		t.Fatalf("expected marker mismatch, got %v", err)
+	}
+	if credits != 1.25 || inputTokens != 37 || outputTokens != 11 {
+		t.Fatalf("terminal metering was lost: credits=%v input=%d output=%d", credits, inputTokens, outputTokens)
+	}
+}
+
 func TestParseEventStreamNativeEndTurnAcceptsVisibleAssistantText(t *testing.T) {
 	stream := bytes.NewReader(bytes.Join([][]byte{
 		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "planning only"}),

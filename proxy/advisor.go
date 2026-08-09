@@ -36,6 +36,7 @@ type bufferedClaudeCall struct {
 	UpstreamStopReason    string
 	ContextWindowExceeded bool
 	ContextInputTokens    int
+	RetryUsage            retryBillingUsage
 }
 
 var errNoAdvisorAccounts = errors.New("no available accounts for advisor request")
@@ -175,6 +176,7 @@ func (h *Handler) handleAdvisorRequest(
 				InputTokens:  advisorResult.InputTokens,
 				OutputTokens: advisorResult.OutputTokens,
 				Credits:      advisorResult.Credits,
+				RetryUsage:   advisorResult.RetryUsage,
 			},
 		)
 		return
@@ -229,10 +231,14 @@ func (h *Handler) handleAdvisorRequest(
 		cacheUsage,
 		minInt(executorResult.InputTokens, totalInputTokens),
 	)
-	// Kiro's context occupancy includes its hidden system prompt. It is kept in
-	// the diagnostic field below, while public usage/cache remains client-visible.
-	publicInputTokens := totalInputTokens
+	usagePayload := contextUsagePayloadFromTokens(req.Model, executorResult.ContextInputTokens)
+	publicInputTokens := claudePublicInputTokens(usagePayload, req.Model, totalInputTokens)
 	responseCacheUsage := reanchorClaudeCacheUsage(cacheProfile, cacheUsage, totalInputTokens)
+	responseCacheUsage = claudeTerminalCacheUsage(cacheProfile, usagePayload, req.Model, totalInputTokens, responseCacheUsage)
+	var retryUsage retryBillingUsage
+	retryUsage.merge(advisorResult.RetryUsage)
+	retryUsage.merge(executorResult.RetryUsage)
+	publicInputTokens, responseCacheUsage = retryUsage.apply(publicInputTokens, responseCacheUsage)
 	totalOutputTokens := advisorResult.OutputTokens + estimateClaudeOutputTokensWithRedacted(
 		finalContent, reasoning.Text, reasoning.Redacted, executorResult.ToolUses,
 	)
@@ -261,6 +267,7 @@ func (h *Handler) handleAdvisorRequest(
 
 	totalCredits := advisorResult.Credits + executorResult.Credits
 	h.recordSuccessForApiKeyWithCache(apiKeyID, totalInputTokens, totalOutputTokens, totalCredits, cacheUsage)
+	retryUsage.recordForAPIKey(apiKeyID)
 	accountID := ""
 	if executorResult.Account != nil {
 		accountID = executorResult.Account.ID
@@ -341,6 +348,7 @@ func (h *Handler) callClaudeBuffered(
 	retrySameID := ""
 	var lastErr error
 	preResponseRetryCount := 0
+	var retryUsage retryBillingUsage
 
 	attemptLimit := h.maxAccountAttempts()
 	for attempt := 0; attempt < attemptLimit; attempt++ {
@@ -417,6 +425,7 @@ func (h *Handler) callClaudeBuffered(
 				}
 			},
 		}
+		attemptStarted := time.Now()
 		err := call(account, payload, callback)
 		if err == nil {
 			visibleContent, _ := extractThinkingFromContent(content.String())
@@ -435,6 +444,17 @@ func (h *Handler) callClaudeBuffered(
 		}
 		if err != nil {
 			h.releaseAccount(account)
+			discarded := estimateClaudeOutputTokensWithRedacted(
+				content.String(), reasoning.String(), result.Reasoning.Redacted, result.ToolUses,
+			)
+			discarded = discardedAttemptOutputTokens(discarded, result.OutputTokens)
+			if discarded > 0 || result.InputTokens > 0 || result.Credits > 0 {
+				retryUsage.add(h.settleDiscardedAttempt(
+					"claude", model, account.ID, "",
+					clampClaudeInputTokensToModelWindow(model, discardedAttemptInputTokens(estimatedInputTokens, result.InputTokens)), discarded, result.Credits,
+					time.Since(attemptStarted).Milliseconds(),
+				))
+			}
 			if isDownstreamRequestCanceled(payload, err) {
 				return nil, err
 			}
@@ -484,6 +504,7 @@ func (h *Handler) callClaudeBuffered(
 		result.Content, _ = extractThinkingFromContent(content.String())
 		result.Content, _ = filterAgentCompletionContent(payload, result.Content, len(result.ToolUses))
 		result.Reasoning.Text = reasoning.String()
+		result.ContextInputTokens = currentKiroContextUsageTokens(payload, model)
 		// Upstream token counters can use the same Kiro context domain as
 		// contextUsagePercentage. Anchor public and internal accounting to the
 		// request estimate; raw occupancy remains in ContextInputTokens.
@@ -491,6 +512,7 @@ func (h *Handler) callClaudeBuffered(
 		result.OutputTokens = estimateClaudeOutputTokensWithRedacted(
 			result.Content, result.Reasoning.Text, result.Reasoning.Redacted, result.ToolUses,
 		)
+		result.RetryUsage = retryUsage
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, result.InputTokens+result.OutputTokens, result.Credits)
 		return result, nil

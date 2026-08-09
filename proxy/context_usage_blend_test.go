@@ -34,24 +34,28 @@ func TestContextUsageBlendRampsMonotonically(t *testing.T) {
 		}
 		previous = got
 	}
-	// At full occupancy the client must see essentially the whole window, or it
-	// keeps believing there is headroom and never compacts. The reported total
-	// stops just short of the limit so the lift itself never reads as an overflow.
-	if want := int(200_000 * contextUsageMaxWindowShare); previous != want {
+	// At full occupancy the client must see the whole window, or it keeps
+	// believing there is headroom and never compacts.
+	if want := 200_000; previous != want {
 		t.Fatalf("full occupancy public input tokens=%d, want %d", previous, want)
 	}
 }
 
-// Easing in squared keeps the first steps past the threshold small enough that a
-// user watching the token counter does not see a jump. Anchored just past the
-// threshold rather than at a fixed percentage, since the band moves with it.
-func TestContextUsageBlendEasesInGently(t *testing.T) {
-	const client = 101_000
-	payload := &KiroPayload{}
-	observeKiroContextUsage(payload, "glm-5", contextUsageBlendStartPercent+2)
-	got := claudePublicInputTokens(payload, "glm-5", client)
-	if lift := got - client; lift > 1_000 {
-		t.Fatalf("lift just past the threshold=%d tokens, want a barely visible nudge", lift)
+func TestContextUsageBlendWeightIsLinear(t *testing.T) {
+	span := contextUsageBlendParityPercent - contextUsageBlendStartPercent
+	for _, tc := range []struct {
+		percentage float64
+		want       float64
+	}{
+		{contextUsageBlendStartPercent, 0},
+		{contextUsageBlendStartPercent + span*0.25, 0.25},
+		{contextUsageBlendStartPercent + span*0.50, 0.50},
+		{contextUsageBlendStartPercent + span*0.75, 0.75},
+		{contextUsageBlendParityPercent, 1},
+	} {
+		if got := contextUsageBlendWeight(tc.percentage); got != tc.want {
+			t.Fatalf("percentage=%v weight=%v, want linear weight %v", tc.percentage, got, tc.want)
+		}
 	}
 }
 
@@ -147,13 +151,12 @@ func TestContextUsageBlendScalesCacheSplit(t *testing.T) {
 	profile := &promptCacheProfile{TotalInputTokens: client, Model: model}
 	scaled := claudeTerminalCacheUsage(profile, payload, model, client, usage)
 
-	// 100k client lifted to the 98% ceiling of a 200k window scales every bucket
-	// by 196000/100000.
-	if scaled.CacheReadInputTokens != 78_400 {
-		t.Fatalf("cache read=%d, want 78400 after the lift to parity", scaled.CacheReadInputTokens)
+	// 100k client lifted to the full 200k window scales every bucket by 2.
+	if scaled.CacheReadInputTokens != 80_000 {
+		t.Fatalf("cache read=%d, want 80000 after the lift to parity", scaled.CacheReadInputTokens)
 	}
-	if scaled.CacheCreationInputTokens != 78_400 {
-		t.Fatalf("cache creation=%d, want 78400 after the lift to parity", scaled.CacheCreationInputTokens)
+	if scaled.CacheCreationInputTokens != 80_000 {
+		t.Fatalf("cache creation=%d, want 80000 after the lift to parity", scaled.CacheCreationInputTokens)
 	}
 	if scaled.CacheCreation5mInputTokens+scaled.CacheCreation1hInputTokens != scaled.CacheCreationInputTokens {
 		t.Fatalf("TTL buckets do not sum to the creation total: %+v", scaled)

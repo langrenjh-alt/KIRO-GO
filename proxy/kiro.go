@@ -1813,6 +1813,15 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 			callback.OnStopReason(upstreamStopReason)
 		}
 	}
+	// Terminal metering belongs to the attempt even when the agent completion
+	// protocol rejects its output. Publish it before marker validation so the
+	// handler can charge a discarded recovery attempt accurately.
+	if callback.OnCredits != nil && totalCredits > 0 {
+		callback.OnCredits(totalCredits)
+	}
+	if callback.OnComplete != nil {
+		callback.OnComplete(inputTokens, outputTokens)
+	}
 	if callback.AgentCompletionMarker != "" {
 		if upstreamStopReason == "max_tokens" ||
 			(!toolObserved && (upstreamStopReason != "end_turn" || !agentVisibleTextObserved)) {
@@ -1820,13 +1829,6 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 		}
 	}
 
-	if callback.OnCredits != nil && totalCredits > 0 {
-		callback.OnCredits(totalCredits)
-	}
-
-	if callback.OnComplete != nil {
-		callback.OnComplete(inputTokens, outputTokens)
-	}
 	return nil
 }
 

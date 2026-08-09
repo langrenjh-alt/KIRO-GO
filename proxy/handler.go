@@ -1307,6 +1307,10 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 	cacheTracker := promptCacheTrackerForProfile(h.promptCache, cacheProfile)
 	cacheUsage := promptCacheUsage{}
 	cacheComputed := false
+	var retryUsage retryBillingUsage
+	if prelude != nil {
+		retryUsage.merge(prelude.RetryUsage)
+	}
 
 	ensureMessageStart := func() {
 		if preludeSent {
@@ -2075,15 +2079,19 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 			// Bill whatever this attempt already produced before deciding how to
 			// recover. Every branch below either retries or returns, so a later
 			// settlement would never see these tokens.
-			if discarded := estimateClaudeOutputTokensWithRedacted(
+			discarded := estimateClaudeOutputTokensWithRedacted(
 				rawContentBuilder.String(), rawThinkingBuilder.String(), redactedThinking, toolUses,
-			); discarded > 0 {
-				discardedInput := clampClaudeInputTokensToModelWindow(model, estimatedInputTokens)
-				h.settleDiscardedAttempt(
+			)
+			discarded = discardedAttemptOutputTokens(discarded, outputTokens)
+			if discarded > 0 || inputTokens > 0 || credits > 0 {
+				discardedInput := clampClaudeInputTokensToModelWindow(
+					model, discardedAttemptInputTokens(estimatedInputTokens, inputTokens),
+				)
+				retryUsage.add(h.settleDiscardedAttempt(
 					"claude", model, account.ID, apiKeyID,
 					discardedInput, discarded, credits,
 					time.Since(reqStart).Milliseconds(),
-				)
+				))
 			}
 			if isUpstreamIncompleteResponseError(err) {
 				if eventThinkingOpen {
@@ -2265,6 +2273,9 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 		}
 
 		h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, credits, cacheUsage)
+		if prelude != nil {
+			prelude.RetryUsage.recordForAPIKey(apiKeyID)
+		}
 		h.pool.RecordSuccess(account.ID)
 		// h.pool.RecordLatency(account.ID, float64(time.Since(reqStart).Milliseconds()))
 		// ↑ dispatch-only latency EWMA (commit fbc99b1), absent on this cache-only
@@ -2286,6 +2297,7 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 		sendInitialPing()
 		publicInputTokens := claudePublicInputTokens(payload, model, inputTokens)
 		terminalCacheUsage := claudeTerminalCacheUsage(cacheProfile, payload, model, inputTokens, cacheUsage)
+		publicInputTokens, terminalCacheUsage = retryUsage.apply(publicInputTokens, terminalCacheUsage)
 		finalUsage := buildClaudeTerminalUsageMap(publicInputTokens, outputTokens, terminalCacheUsage)
 		addKiroContextUsage(finalUsage, payload, model)
 		addClaudeReasoningUsageDetails(finalUsage, ClaudeReasoningResult{
@@ -2422,20 +2434,16 @@ func estimateOpenAIDiscardedOutput(content, reasoning string, toolCalls []ToolCa
 // marker or tool call. Kiro has already produced these tokens upstream, so
 // skipping them understates usage and lets a reasoning loop burn quota that no
 // counter or quota gate can observe. It settles inside the attempt's own loop
-// iteration, against the account that produced it, so the client-visible usage
-// of a later attempt never absorbs tokens it did not generate.
-func (h *Handler) settleDiscardedAttempt(endpoint, model, accountID, apiKeyID string, inputTokens, outputTokens int, credits float64, elapsedMs int64) {
-	if inputTokens <= 0 {
-		inputTokens = 1
-	}
-	if outputTokens < 0 {
-		outputTokens = 0
-	}
-	h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+// iteration against the account that produced it. The returned usage is also
+// carried into a later successful response as cache-read input.
+func (h *Handler) settleDiscardedAttempt(endpoint, model, accountID, apiKeyID string, inputTokens, outputTokens int, credits float64, elapsedMs int64) discardedAttemptUsage {
+	attempt := newDiscardedAttemptUsage(inputTokens, outputTokens, credits)
+	h.recordSuccessForApiKey(apiKeyID, attempt.InputTokens, attempt.OutputTokens, attempt.Credits)
 	if h.pool != nil {
-		h.pool.UpdateStats(accountID, inputTokens+outputTokens, credits)
+		h.pool.UpdateStats(accountID, attempt.totalTokens(), attempt.Credits)
 	}
-	h.recordSuccessLog(endpoint, model, accountID, inputTokens+outputTokens, credits, elapsedMs)
+	h.recordSuccessLog(endpoint, model, accountID, attempt.totalTokens(), attempt.Credits, elapsedMs)
+	return attempt
 }
 
 func (h *Handler) recordSuccessForApiKeyWithCache(apiKeyID string, inputTokens, outputTokens int, credits float64, cacheUsage promptCacheUsage) {
@@ -2583,6 +2591,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 	cacheTracker := promptCacheTrackerForProfile(h.promptCache, cacheProfile)
 	cacheUsage := promptCacheUsage{}
 	cacheComputed := false
+	var retryUsage retryBillingUsage
 
 	attemptLimit := h.maxAccountAttempts()
 	for attempt := 0; attempt < attemptLimit; attempt++ {
@@ -2704,6 +2713,17 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 		h.releaseAccount(account)
 		if err != nil {
+			discarded := estimateClaudeOutputTokensWithRedacted(
+				content, thinkingContent, redactedThinking, toolUses,
+			)
+			discarded = discardedAttemptOutputTokens(discarded, outputTokens)
+			if discarded > 0 || inputTokens > 0 || credits > 0 {
+				retryUsage.add(h.settleDiscardedAttempt(
+					"claude", model, account.ID, apiKeyID,
+					clampClaudeInputTokensToModelWindow(model, discardedAttemptInputTokens(estimatedInputTokens, inputTokens)), discarded, credits,
+					time.Since(reqStart).Milliseconds(),
+				))
+			}
 			if isDownstreamRequestCanceled(payload, err) {
 				return
 			}
@@ -2771,18 +2791,21 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 				// in this iteration. Deferring it to the successful attempt made the
 				// final turn report tokens it never generated, and lost the usage
 				// entirely whenever the retry chain ended in an error response.
-				discardedInput := clampClaudeInputTokensToModelWindow(model, estimatedInputTokens)
+				discardedInput := clampClaudeInputTokensToModelWindow(
+					model, discardedAttemptInputTokens(estimatedInputTokens, inputTokens),
+				)
 				if discardedInput <= 0 {
 					discardedInput = 1
 				}
 				discardedOutput := estimateClaudeOutputTokensWithRedacted(
 					finalContent, thinkingContent, redactedThinking, toolUses,
 				)
-				h.settleDiscardedAttempt(
+				discardedOutput = discardedAttemptOutputTokens(discardedOutput, outputTokens)
+				retryUsage.add(h.settleDiscardedAttempt(
 					"claude", model, account.ID, apiKeyID,
 					discardedInput, discardedOutput, credits,
 					time.Since(reqStart).Milliseconds(),
-				)
+				))
 				retrySameID = account.ID
 				logger.Warnf(
 					"[KiroAPI] structured output validation failed endpoint=claude model=%s account_id=%s; retrying once: %v",
@@ -2870,6 +2893,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 		publicInputTokens := claudePublicInputTokens(payload, model, inputTokens)
 		responseCacheUsage := claudeTerminalCacheUsage(cacheProfile, payload, model, inputTokens, cacheUsage)
+		publicInputTokens, responseCacheUsage = retryUsage.apply(publicInputTokens, responseCacheUsage)
 		resp := KiroToClaudeResponseWithReasoning(finalContent, reasoningResult, includeEmptyThinkingBlock, toolUses, publicInputTokens, outputTokens, responseModel)
 		if thinking {
 			resp.Usage.OutputTokensDetails = claudeReasoningUsageDetails(ClaudeReasoningResult{
@@ -3178,6 +3202,7 @@ func (h *Handler) handleOpenAIStreamWithCache(w http.ResponseWriter, payload *Ki
 	preludeSent := false
 	earlyPreludeEnabled := earlyStreamPreludeEnabled()
 	cacheState := newOpenAIPromptCacheState(h.promptCache, cacheProfile)
+	var retryUsage retryBillingUsage
 	finishWithStreamError := func(errType string, err error) {
 		message := "upstream stream failed"
 		if err != nil {
@@ -3700,14 +3725,16 @@ func (h *Handler) handleOpenAIStreamWithCache(w http.ResponseWriter, payload *Ki
 			// Bill whatever this attempt already produced before deciding how to
 			// recover. Every branch below either retries or returns, so a later
 			// settlement would never see these tokens.
-			if discarded := estimateOpenAIDiscardedOutput(
+			discarded := estimateOpenAIDiscardedOutput(
 				rawContentBuilder.String(), rawReasoningBuilder.String(), toolCalls,
-			); discarded > 0 {
-				h.settleDiscardedAttempt(
+			)
+			discarded = discardedAttemptOutputTokens(discarded, outputTokens)
+			if discarded > 0 || inputTokens > 0 || credits > 0 {
+				retryUsage.add(h.settleDiscardedAttempt(
 					"openai", model, account.ID, apiKeyID,
-					clampClaudeInputTokensToModelWindow(model, estimatedInputTokens), discarded, credits,
+					clampClaudeInputTokensToModelWindow(model, discardedAttemptInputTokens(estimatedInputTokens, inputTokens)), discarded, credits,
 					time.Since(reqStart).Milliseconds(),
-				)
+				))
 			}
 			if isUpstreamIncompleteResponseError(err) && eventThinkingOpen {
 				sendChunk("", 3)
@@ -3862,6 +3889,7 @@ func (h *Handler) handleOpenAIStreamWithCache(w http.ResponseWriter, payload *Ki
 		if includeUsage {
 			publicInputTokens := contextUsageBlendedInputTokens(payload, model, inputTokens)
 			publicCacheUsage := contextUsageBlendedCacheUsage(payload, model, inputTokens, cacheUsage)
+			publicInputTokens, publicCacheUsage = retryUsage.apply(publicInputTokens, publicCacheUsage)
 			terminalUsage := buildOpenAIUsageMap(publicInputTokens, outputTokens, publicCacheUsage)
 			addKiroContextUsage(terminalUsage, payload, model)
 			writeChunk([]map[string]interface{}{}, terminalUsage)
@@ -3929,6 +3957,7 @@ func (h *Handler) handleOpenAINonStreamWithCache(w http.ResponseWriter, payload 
 	reqStart := time.Now()
 	preResponseRetryCount := 0
 	cacheState := newOpenAIPromptCacheState(h.promptCache, cacheProfile)
+	var retryUsage retryBillingUsage
 
 	attemptLimit := h.maxAccountAttempts()
 	for attempt := 0; attempt < attemptLimit; attempt++ {
@@ -4028,12 +4057,14 @@ func (h *Handler) handleOpenAINonStreamWithCache(w http.ResponseWriter, payload 
 			// Bill whatever this attempt already produced before deciding how to
 			// recover. Every branch below either retries or returns, so a later
 			// settlement would never see these tokens.
-			if discarded := estimateOpenAIOutputTokens(content, reasoningContent, toolUses); discarded > 0 {
-				h.settleDiscardedAttempt(
+			discarded := estimateOpenAIOutputTokens(content, reasoningContent, toolUses)
+			discarded = discardedAttemptOutputTokens(discarded, outputTokens)
+			if discarded > 0 || inputTokens > 0 || credits > 0 {
+				retryUsage.add(h.settleDiscardedAttempt(
 					"openai", model, account.ID, apiKeyID,
-					clampClaudeInputTokensToModelWindow(model, estimatedInputTokens), discarded, credits,
+					clampClaudeInputTokensToModelWindow(model, discardedAttemptInputTokens(estimatedInputTokens, inputTokens)), discarded, credits,
 					time.Since(reqStart).Milliseconds(),
-				)
+				))
 			}
 			if isDownstreamRequestCanceled(payload, err) {
 				return
@@ -4126,6 +4157,7 @@ func (h *Handler) handleOpenAINonStreamWithCache(w http.ResponseWriter, payload 
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 		publicInputTokens := contextUsageBlendedInputTokens(payload, model, inputTokens)
 		publicCacheUsage := contextUsageBlendedCacheUsage(payload, model, inputTokens, cacheUsage)
+		publicInputTokens, publicCacheUsage = retryUsage.apply(publicInputTokens, publicCacheUsage)
 		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, publicInputTokens, outputTokens, responseModel, thinkingFormat)
 		usage := buildOpenAIUsageMap(publicInputTokens, outputTokens, publicCacheUsage)
 		addKiroContextUsage(usage, payload, model)
