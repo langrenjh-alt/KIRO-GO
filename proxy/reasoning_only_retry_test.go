@@ -1251,7 +1251,7 @@ func TestAgentMaxTokenMissingMarkerRetriesWithCorrection(t *testing.T) {
 	}
 }
 
-func TestUnmarkedEndTurnWithVisibleTextSkipsRecoveryAcrossProtocols(t *testing.T) {
+func TestUnmarkedEndTurnStripsOrphanToolTailAcrossProtocols(t *testing.T) {
 	tests := []struct {
 		name      string
 		invoke    func(*Handler, *httptest.ResponseRecorder)
@@ -1340,6 +1340,8 @@ func TestUnmarkedEndTurnWithVisibleTextSkipsRecoveryAcrossProtocols(t *testing.T
 			h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
 				calls++
 				callback.OnText("final answer", false)
+				callback.OnText("\n</para", false)
+				callback.OnText("meter>", false)
 				callback.OnStopReason("END_TURN")
 				callback.OnComplete(10, 4)
 				return nil
@@ -1352,7 +1354,9 @@ func TestUnmarkedEndTurnWithVisibleTextSkipsRecoveryAcrossProtocols(t *testing.T
 			if calls != 1 || rec.Code != http.StatusOK || !strings.Contains(body, "final answer") || !strings.Contains(body, test.terminal) {
 				t.Fatalf("calls=%d status=%d terminal=%q body=%s", calls, rec.Code, test.terminal, body)
 			}
-			if strings.Contains(body, test.forbidden) || strings.Contains(body, "<agent_final_") || strings.Contains(body, upstreamIncompleteResponseCode) {
+			if strings.Contains(body, test.forbidden) || strings.Contains(body, "<agent_final_") ||
+				strings.Contains(body, "</parameter>") || strings.Contains(body, `\u003c/para`) ||
+				strings.Contains(body, upstreamIncompleteResponseCode) {
 				t.Fatalf("visible END_TURN produced an invalid terminal response: %s", body)
 			}
 		})

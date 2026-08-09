@@ -346,7 +346,8 @@ func agentRecoveryVisibleAttempt(payload *KiroPayload) string {
 			visible = ""
 		}
 	}
-	return strings.TrimSpace(stripAgentToolTranscriptPollution(visible))
+	visible = stripAgentToolTranscriptPollution(visible)
+	return strings.TrimSpace(stripOrphanSerializedToolClosingTail(visible))
 }
 
 func refreshAgentRecoveryActionHint(payload *KiroPayload) {
@@ -1058,6 +1059,7 @@ type agentCompletionGate struct {
 	serializedProbe  strings.Builder
 	serializedCall   bool
 	serializedDone   bool
+	terminalTail     strings.Builder
 }
 
 func newAgentCompletionGate(marker string) *agentCompletionGate {
@@ -1083,6 +1085,137 @@ var (
 	serializedInvokeTagPattern    = regexp.MustCompile(`(?is)^<invoke[\t\r\n ]+[^>]*\bname[\t\r\n ]*=[\t\r\n ]*["']([^"']+)["'][^>]*>`)
 	serializedParameterTagPattern = regexp.MustCompile(`(?is)^<parameter[\t\r\n ]+[^>]*\bname[\t\r\n ]*=[\t\r\n ]*["'][^"']+["'][^>]*>`)
 )
+
+type serializedToolClosingTag struct {
+	open  string
+	close string
+}
+
+var serializedToolClosingTags = []serializedToolClosingTag{
+	{open: "<parameter", close: "</parameter>"},
+	{open: "<invoke", close: "</invoke>"},
+}
+
+// splitPossibleSerializedToolClosingTail withholds only a complete or partial
+// legacy closing tag at the end of a stream chunk. Ordinary text is still
+// released immediately; a held tag is released on the next non-tail byte.
+func splitPossibleSerializedToolClosingTail(content string) (string, string) {
+	if content == "" {
+		return "", ""
+	}
+	coreEnd := len(content)
+	for coreEnd > 0 {
+		r, size := utf8.DecodeLastRuneInString(content[:coreEnd])
+		if !unicode.IsSpace(r) {
+			break
+		}
+		coreEnd -= size
+	}
+	if coreEnd == 0 {
+		return content, ""
+	}
+
+	pendingStart := len(content)
+	scanEnd := coreEnd
+	for {
+		matched := false
+		for _, tag := range serializedToolClosingTags {
+			if scanEnd < len(tag.close) ||
+				!strings.EqualFold(content[scanEnd-len(tag.close):scanEnd], tag.close) {
+				continue
+			}
+			pendingStart = scanEnd - len(tag.close)
+			scanEnd = pendingStart
+			for scanEnd > 0 {
+				r, size := utf8.DecodeLastRuneInString(content[:scanEnd])
+				if !unicode.IsSpace(r) {
+					break
+				}
+				scanEnd -= size
+			}
+			matched = true
+			break
+		}
+		if !matched {
+			break
+		}
+	}
+	if pendingStart != len(content) {
+		return content[:pendingStart], content[pendingStart:]
+	}
+
+	for _, tag := range serializedToolClosingTags {
+		limit := minInt(coreEnd, len(tag.close)-1)
+		for size := limit; size > 0; size-- {
+			if strings.EqualFold(content[coreEnd-size:coreEnd], tag.close[:size]) {
+				start := coreEnd - size
+				if start < pendingStart {
+					pendingStart = start
+				}
+				break
+			}
+		}
+	}
+	if pendingStart == len(content) {
+		return content, ""
+	}
+	scanEnd = pendingStart
+	for scanEnd > 0 {
+		r, size := utf8.DecodeLastRuneInString(content[:scanEnd])
+		if !unicode.IsSpace(r) {
+			break
+		}
+		scanEnd -= size
+	}
+	for {
+		matched := false
+		for _, tag := range serializedToolClosingTags {
+			if scanEnd < len(tag.close) ||
+				!strings.EqualFold(content[scanEnd-len(tag.close):scanEnd], tag.close) {
+				continue
+			}
+			pendingStart = scanEnd - len(tag.close)
+			scanEnd = pendingStart
+			for scanEnd > 0 {
+				r, size := utf8.DecodeLastRuneInString(content[:scanEnd])
+				if !unicode.IsSpace(r) {
+					break
+				}
+				scanEnd -= size
+			}
+			matched = true
+			break
+		}
+		if !matched {
+			break
+		}
+	}
+	return content[:pendingStart], content[pendingStart:]
+}
+
+// stripOrphanSerializedToolClosingTail removes only unmatched legacy closing
+// tags at the absolute end of coding-agent output. Paired XML and embedded or
+// fenced examples remain byte-for-byte intact.
+func stripOrphanSerializedToolClosingTail(content string) string {
+	cleaned := content
+	for {
+		trimmed := strings.TrimRightFunc(cleaned, unicode.IsSpace)
+		lower := strings.ToLower(trimmed)
+		removed := false
+		for _, tag := range serializedToolClosingTags {
+			if !strings.HasSuffix(lower, tag.close) ||
+				strings.Count(lower, tag.close) <= strings.Count(lower, tag.open) {
+				continue
+			}
+			cleaned = strings.TrimRightFunc(trimmed[:len(trimmed)-len(tag.close)], unicode.IsSpace)
+			removed = true
+			break
+		}
+		if !removed {
+			return cleaned
+		}
+	}
+}
 
 func allowedSerializedToolName(allowed map[string]bool, name string) bool {
 	name = strings.TrimSpace(name)
@@ -1166,13 +1299,43 @@ func looksLikeSerializedAgentToolCall(payload *KiroPayload, content string) bool
 	return classifySerializedToolCallPrefix(content, kiroPayloadAllowedToolNames(payload)) == agentCompletionPrefixComplete
 }
 
+func (g *agentCompletionGate) pushTerminalTail(text string) string {
+	if text == "" {
+		return ""
+	}
+	g.terminalTail.WriteString(text)
+	ready, pending := splitPossibleSerializedToolClosingTail(g.terminalTail.String())
+	g.terminalTail.Reset()
+	g.terminalTail.WriteString(pending)
+	return ready
+}
+
+func (g *agentCompletionGate) commitTerminalTail() string {
+	if g == nil || g.terminalTail.Len() == 0 {
+		return ""
+	}
+	tail := g.terminalTail.String()
+	g.terminalTail.Reset()
+	full := g.visible.String()
+	cleaned := stripOrphanSerializedToolClosingTail(full)
+	releasedPrefixBytes := len(full) - len(tail)
+	if len(cleaned) < releasedPrefixBytes {
+		return ""
+	}
+	return cleaned[releasedPrefixBytes:]
+}
+
 func (g *agentCompletionGate) pushVisible(text string) string {
 	if text == "" {
 		return ""
 	}
-	if len(g.serializedTools) == 0 || g.serializedDone {
+	if len(g.serializedTools) == 0 {
 		g.visible.WriteString(text)
 		return text
+	}
+	if g.serializedDone {
+		g.visible.WriteString(text)
+		return g.pushTerminalTail(text)
 	}
 	if g.serializedCall {
 		g.visible.WriteString(text)
@@ -1193,7 +1356,7 @@ func (g *agentCompletionGate) pushVisible(text string) string {
 		g.serializedDone = true
 		g.serializedProbe.Reset()
 		g.visible.WriteString(probe)
-		return probe
+		return g.pushTerminalTail(probe)
 	}
 }
 
@@ -1260,15 +1423,17 @@ func (g *agentCompletionGate) VisibleText() string {
 	return g.visible.String()
 }
 
-// CommitPendingForTool discards an unfinished marker prefix. Ordinary text has
-// already streamed as soon as it diverged from the marker, so this method never
-// replays a buffered narration block ahead of the tool event.
+// CommitPendingForTool discards an unfinished marker or serialized-call prefix.
+// It releases any ordinary text withheld only to classify a possible orphan
+// closing tag before the real tool event.
 func (g *agentCompletionGate) CommitPendingForTool() string {
 	if g != nil && (g.serializedCall || g.serializedProbe.Len() > 0) {
 		g.serializedProbe.Reset()
+		g.terminalTail.Reset()
 		g.visible.Reset()
 		g.serializedCall = false
 		g.serializedDone = true
+		return ""
 	}
 	if g != nil && g.forcedToolChoice {
 		g.pending.Reset()
@@ -1278,7 +1443,7 @@ func (g *agentCompletionGate) CommitPendingForTool() string {
 	if g != nil && !g.marked {
 		g.pending.Reset()
 	}
-	return ""
+	return g.commitTerminalTail()
 }
 
 // CommitPendingForTerminal discards unvalidated narration and unfinished
@@ -1286,6 +1451,7 @@ func (g *agentCompletionGate) CommitPendingForTool() string {
 func (g *agentCompletionGate) CommitPendingForTerminal() string {
 	if g != nil && (g.serializedCall || g.serializedProbe.Len() > 0) {
 		g.serializedProbe.Reset()
+		g.terminalTail.Reset()
 		g.visible.Reset()
 		g.serializedCall = false
 		g.serializedDone = true
@@ -1299,12 +1465,13 @@ func (g *agentCompletionGate) CommitPendingForTerminal() string {
 	if g != nil && !g.marked {
 		g.pending.Reset()
 	}
-	return ""
+	return g.commitTerminalTail()
 }
 
 func (g *agentCompletionGate) DiscardPending() {
 	if g != nil && (g.serializedCall || g.serializedProbe.Len() > 0) {
 		g.serializedProbe.Reset()
+		g.terminalTail.Reset()
 		g.visible.Reset()
 		g.serializedCall = false
 		g.serializedDone = true
@@ -1316,6 +1483,9 @@ func (g *agentCompletionGate) DiscardPending() {
 	}
 	if g != nil && !g.marked {
 		g.pending.Reset()
+	}
+	if g != nil {
+		g.terminalTail.Reset()
 	}
 }
 
@@ -1348,6 +1518,7 @@ func filterAgentCompletionContent(payload *KiroPayload, content string, toolCoun
 		}
 		filtered = stripPollutedToolCallText(filtered)
 	}
+	filtered = stripOrphanSerializedToolClosingTail(filtered)
 	return filtered, marked
 }
 

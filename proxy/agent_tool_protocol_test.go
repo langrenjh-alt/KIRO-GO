@@ -280,8 +280,77 @@ func TestAgentCompletionGateBuffersSerializedToolCarrier(t *testing.T) {
 
 	ordinary := newAgentCompletionGateForPayload(payload)
 	content := `<invoke name="unknown"><parameter name="file_path">main.go</parameter></invoke>`
-	if got := ordinary.Push(content); got != content {
+	if got := ordinary.Push(content) + ordinary.CommitPendingForTerminal(); got != content {
 		t.Fatalf("unknown-tool XML was buffered as a tool carrier: %q", got)
+	}
+}
+
+func TestStripOrphanSerializedToolClosingTail(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "reported orphan parameter tail",
+			input: "Review complete. Tests passed.\n</parameter>",
+			want:  "Review complete. Tests passed.",
+		},
+		{
+			name:  "multiple orphan closers",
+			input: "done\n</parameter>\n</invoke>\n",
+			want:  "done",
+		},
+		{
+			name:  "paired XML",
+			input: `<parameter name="example">value</parameter>`,
+			want:  `<parameter name="example">value</parameter>`,
+		},
+		{
+			name:  "fenced example",
+			input: "```xml\n<parameter name=\"example\">value</parameter>\n```",
+			want:  "```xml\n<parameter name=\"example\">value</parameter>\n```",
+		},
+		{
+			name:  "embedded closing tag",
+			input: "The literal </parameter> tag appears before this sentence.",
+			want:  "The literal </parameter> tag appears before this sentence.",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := stripOrphanSerializedToolClosingTail(test.input); got != test.want {
+				t.Fatalf("cleaned tail mismatch:\nwant: %q\n got: %q", test.want, got)
+			}
+		})
+	}
+}
+
+func TestAgentCompletionGateBuffersSplitOrphanToolTail(t *testing.T) {
+	payload := completionProtocolTestPayload()
+	gate := newAgentCompletionGateForPayload(payload)
+	var output strings.Builder
+	for _, part := range []string{"Review complete.\n", "</para", "meter>"} {
+		output.WriteString(gate.Push(part))
+	}
+	output.WriteString(gate.CommitPendingForTerminal())
+	if got := output.String(); strings.TrimSpace(got) != "Review complete." || strings.Contains(got, "</parameter>") {
+		t.Fatalf("orphan closing tag leaked from completion gate: %q", got)
+	}
+
+	chain := newAgentCompletionGateForPayload(payload)
+	chainOutput := chain.Push("Done.\n</parameter>\n</inv")
+	chainOutput += chain.Push("oke>") + chain.CommitPendingForTerminal()
+	if got := strings.TrimSpace(chainOutput); got != "Done." {
+		t.Fatalf("orphan closing-tag chain leaked from completion gate: %q", chainOutput)
+	}
+
+	paired := newAgentCompletionGateForPayload(payload)
+	content := `<parameter name="example">value</parameter>`
+	reconstructed := paired.Push(content) + paired.CommitPendingForTerminal()
+	if reconstructed != content {
+		t.Fatalf("paired XML was changed by completion gate: %q", reconstructed)
 	}
 }
 
