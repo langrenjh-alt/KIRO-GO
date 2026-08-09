@@ -77,19 +77,18 @@ func newPollToolCall(id, name, args string) ToolCall {
 	return tc
 }
 
-// TestCollapsesConsecutiveIdenticalToolResults covers a client retry loop that
-// sends the same failing tool result many times. After hollow assistant turns
-// are dropped, those identical user "Tool results" turns become adjacent
-// duplicates; the proxy collapses each run to a single copy.
+// TestCollapsesConsecutiveIdenticalToolResults covers a literal client replay:
+// the tool-use ID, name, arguments, status, and result are all identical. This
+// is the only flattened tool cycle eligible for collapse.
 func TestCollapsesConsecutiveIdenticalToolResults(t *testing.T) {
 	msgs := []OpenAIMessage{{Role: "user", Content: "start"}}
-	// 5 identical failing cycles in a row (model retrying the same tool).
+	// Five exact replays of one tool cycle.
 	for i := 0; i < 5; i++ {
 		msgs = append(msgs,
 			OpenAIMessage{Role: "assistant", Content: "", ToolCalls: []ToolCall{
-				newPollToolCall(fmt.Sprintf("c%d", i), "exec_command", `{"cmd":"x"}`),
+				newPollToolCall("same_call", "exec_command", `{"cmd":"x"}`),
 			}},
-			OpenAIMessage{Role: "tool", ToolCallID: fmt.Sprintf("c%d", i), Content: "SAME_ERROR_OUTPUT"},
+			OpenAIMessage{Role: "tool", ToolCallID: "same_call", Content: "SAME_ERROR_OUTPUT"},
 		)
 	}
 	msgs = append(msgs, OpenAIMessage{Role: "user", Content: "final"})
@@ -106,6 +105,105 @@ func TestCollapsesConsecutiveIdenticalToolResults(t *testing.T) {
 	count := strings.Count(combined.String(), "SAME_ERROR_OUTPUT")
 	if count != 1 {
 		t.Fatalf("expected 5 identical tool results collapsed to 1 occurrence, got %d in %q", count, combined.String())
+	}
+}
+
+func TestDoesNotCollapseSameToolOutputWithDifferentIDs(t *testing.T) {
+	msgs := []OpenAIMessage{
+		{Role: "user", Content: "start"},
+		{Role: "assistant", ToolCalls: []ToolCall{newPollToolCall("call_a", "exec_command", `{"cmd":"x"}`)}},
+		{Role: "tool", ToolCallID: "call_a", Content: "SAME_OUTPUT_DIFFERENT_ID"},
+		{Role: "assistant", ToolCalls: []ToolCall{newPollToolCall("call_b", "exec_command", `{"cmd":"x"}`)}},
+		{Role: "tool", ToolCallID: "call_b", Content: "SAME_OUTPUT_DIFFERENT_ID"},
+		{Role: "user", Content: "final"},
+	}
+
+	payload := OpenAIToKiro(&OpenAIRequest{Model: "claude-opus-4.8", Messages: msgs}, false)
+	var combined strings.Builder
+	for _, h := range payload.ConversationState.History {
+		if h.UserInputMessage != nil {
+			combined.WriteString(h.UserInputMessage.Content)
+		}
+	}
+	got := combined.String()
+	if count := strings.Count(got, "SAME_OUTPUT_DIFFERENT_ID"); count != 2 {
+		t.Fatalf("different tool-use IDs were collapsed: count=%d history=%q", count, got)
+	}
+	for _, id := range []string{"call_a", "call_b"} {
+		if !strings.Contains(got, id) {
+			t.Fatalf("flattened history lost tool-use ID %q: %q", id, got)
+		}
+	}
+}
+
+func TestDoesNotCollapseSameToolIDWithDifferentInputs(t *testing.T) {
+	msgs := []OpenAIMessage{
+		{Role: "user", Content: "start"},
+		{Role: "assistant", ToolCalls: []ToolCall{newPollToolCall("reused_id", "exec_command", `{"cmd":"first"}`)}},
+		{Role: "tool", ToolCallID: "reused_id", Content: "SAME_OUTPUT_DIFFERENT_INPUT"},
+		{Role: "assistant", ToolCalls: []ToolCall{newPollToolCall("reused_id", "exec_command", `{"cmd":"second"}`)}},
+		{Role: "tool", ToolCallID: "reused_id", Content: "SAME_OUTPUT_DIFFERENT_INPUT"},
+		{Role: "user", Content: "final"},
+	}
+
+	payload := OpenAIToKiro(&OpenAIRequest{Model: "claude-opus-4.8", Messages: msgs}, false)
+	var combined strings.Builder
+	for _, h := range payload.ConversationState.History {
+		if h.UserInputMessage != nil {
+			combined.WriteString(h.UserInputMessage.Content)
+		}
+	}
+	got := combined.String()
+	if count := strings.Count(got, "SAME_OUTPUT_DIFFERENT_INPUT"); count != 2 {
+		t.Fatalf("same ID with different inputs was collapsed: count=%d history=%q", count, got)
+	}
+	for _, input := range []string{"first", "second"} {
+		if !strings.Contains(got, input) {
+			t.Fatalf("flattened history lost tool input %q: %q", input, got)
+		}
+	}
+}
+
+func TestDoesNotCollapseSameToolCycleWithDifferentAssistantReasoning(t *testing.T) {
+	toolUse := func(reasoning string) OpenAIMessage {
+		return OpenAIMessage{
+			Role:             "assistant",
+			ReasoningContent: reasoning,
+			ToolCalls: []ToolCall{
+				newPollToolCall("reused_id", "exec_command", `{"cmd":"x"}`),
+			},
+		}
+	}
+	req := &OpenAIRequest{
+		Model: "claude-opus-4.8",
+		Messages: []OpenAIMessage{
+			{Role: "user", Content: "start"},
+			toolUse("first rationale"),
+			{Role: "tool", ToolCallID: "reused_id", Content: "SAME_OUTPUT_DIFFERENT_REASONING"},
+			toolUse("second rationale"),
+			{Role: "tool", ToolCallID: "reused_id", Content: "SAME_OUTPUT_DIFFERENT_REASONING"},
+			{Role: "user", Content: "final"},
+		},
+	}
+
+	payload := OpenAIToKiro(req, false)
+	var combined strings.Builder
+	for _, h := range payload.ConversationState.History {
+		if h.UserInputMessage != nil {
+			combined.WriteString(h.UserInputMessage.Content)
+		}
+		if h.AssistantResponseMessage != nil {
+			combined.WriteString(h.AssistantResponseMessage.Content)
+		}
+	}
+	got := combined.String()
+	if count := strings.Count(got, "SAME_OUTPUT_DIFFERENT_REASONING"); count != 2 {
+		t.Fatalf("cycles with different assistant reasoning were collapsed: count=%d history=%q", count, got)
+	}
+	for _, reasoning := range []string{"first rationale", "second rationale"} {
+		if !strings.Contains(got, reasoning) {
+			t.Fatalf("assistant reasoning %q was lost: %q", reasoning, got)
+		}
 	}
 }
 
@@ -295,6 +393,59 @@ func TestScrubsClientReplayedRoleToolTranscript(t *testing.T) {
 	for _, leaked := range []string{"user Tool results:", "[Bash]", "CSS 缺失", "\nassistant\n"} {
 		if strings.Contains(cleaned, leaked) {
 			t.Fatalf("pseudo tool transcript leaked %q: %q", leaked, cleaned)
+		}
+	}
+}
+
+func TestStripPollutedToolCallTextPreservesLiteralInvokeXML(t *testing.T) {
+	input := "  Protocol example:\n\n\n<invoke name=\"Edit\"><parameter name=\"file_path\">main.go</parameter></invoke>\nKeep this example.  \n"
+	if got := stripPollutedToolCallText(input); got != input {
+		t.Fatalf("literal invoke XML was rewritten:\nwant: %q\n got: %q", input, got)
+	}
+}
+
+func TestStripPollutedToolCallTextPreservesUnclosedInvokeXML(t *testing.T) {
+	input := "\nPartial response:\n<thinking>retain this reasoning</thinking>\n<invoke name=\"Edit\"><parameter name=\"file_path\">main.go\n"
+	if got := stripPollutedToolCallText(input); got != input {
+		t.Fatalf("unfinished invoke XML was rewritten:\nwant: %q\n got: %q", input, got)
+	}
+}
+
+func TestHistoricalCmdUsesNeutralUserEnvelope(t *testing.T) {
+	msgs := []OpenAIMessage{
+		{Role: "user", Content: "run it"},
+		{Role: "assistant", Content: "Preparing the command.", ToolCalls: []ToolCall{
+			newPollToolCall("cmd_call", "exec_command", `{"cmd":"go test ./proxy"}`),
+		}},
+		{Role: "tool", ToolCallID: "cmd_call", Content: "CMD_OUTPUT"},
+		{Role: "user", Content: "continue"},
+	}
+	payload := OpenAIToKiro(&OpenAIRequest{Model: "claude-opus-4.8", Messages: msgs}, false)
+
+	var userText strings.Builder
+	seenOriginalAssistant := false
+	for i, h := range payload.ConversationState.History {
+		if a := h.AssistantResponseMessage; a != nil {
+			for _, fabricated := range []string{"I already inspected", "I already ran", "I performed"} {
+				if strings.Contains(a.Content, fabricated) {
+					t.Fatalf("history[%d] contains fabricated assistant narration %q: %q", i, fabricated, a.Content)
+				}
+			}
+			if a.Content == "Preparing the command." {
+				seenOriginalAssistant = true
+			}
+		}
+		if u := h.UserInputMessage; u != nil {
+			userText.WriteString(u.Content)
+		}
+	}
+	if !seenOriginalAssistant {
+		t.Fatal("original assistant content was dropped or rewritten")
+	}
+	got := userText.String()
+	for _, want := range []string{"cmd_call", "exec_command", "go test ./proxy", "CMD_OUTPUT"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("neutral user-side envelope lost %q: %q", want, got)
 		}
 	}
 }

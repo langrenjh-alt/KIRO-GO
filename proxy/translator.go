@@ -254,6 +254,8 @@ const maxToolDescLen = 10237
 func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	modelID := MapModel(req.Model)
 	origin := "AI_EDITOR"
+	historyMode := configuredKiroHistoryMode()
+	nativeActiveHistory := historyMode == kiroHistoryModeNativeActive
 
 	// 提取系统提示
 	systemPrompt := buildClaudeSystemPrompt(req, thinking)
@@ -270,13 +272,16 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	for _, tool := range req.Tools {
 		toolNames = append(toolNames, tool.Name)
 	}
-	if (req.OutputConfig == nil || req.OutputConfig.Format == nil) && codingAgentCompletionProtocolEnabled(
-		toolChoice,
-		isCodingAgentSystemPrompt(extractSystemPrompt(req.System)),
-		toolNames,
-	) {
+	recognizedHarness := isCodingAgentSystemPrompt(extractSystemPrompt(req.System))
+	autoCompletionProtocol := codingAgentCompletionProtocolEnabled(toolChoice, recognizedHarness, toolNames)
+	forcedToolGuard := codingAgentForcedToolChoiceGuardEnabled(toolChoice, recognizedHarness, toolNames)
+	if ((req.OutputConfig == nil || req.OutputConfig.Format == nil) && autoCompletionProtocol) || forcedToolGuard {
 		agentCompletionMarker = newAgentCompletionMarker()
-		systemPrompt = appendSystemInstruction(systemPrompt, agentCompletionProtocolInstruction(agentCompletionMarker))
+		if forcedToolGuard {
+			systemPrompt = appendSystemInstruction(systemPrompt, forcedToolChoiceCompletionInstruction(toolChoice))
+		} else {
+			systemPrompt = appendSystemInstruction(systemPrompt, agentCompletionProtocolInstruction(agentCompletionMarker))
+		}
 	}
 
 	// 构建历史消息
@@ -315,11 +320,12 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 				})
 			}
 		} else if msg.Role == "assistant" {
-			content, toolUses := extractClaudeAssistantContent(msg.Content)
+			content, toolUses, reasoningContent := extractClaudeAssistantHistoryContent(msg.Content, nativeActiveHistory)
 			history = append(history, KiroHistoryMessage{
 				AssistantResponseMessage: &KiroAssistantResponseMessage{
-					Content:  content,
-					ToolUses: toolUses,
+					Content:          content,
+					ToolUses:         toolUses,
+					ReasoningContent: reasoningContent,
 				},
 			})
 		}
@@ -352,6 +358,20 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	// the current message text so the upstream does not reject the request.
 	currentToolResultIDs := collectToolResultIDs(currentToolResults)
 	keepCurrentToolResults := currentToolResultsMatchLastAssistant(history, currentToolResultIDs)
+	if nativeActiveHistory {
+		keepCurrentToolResults = currentToolResultsExactlyMatchLastAssistant(history, currentToolResults)
+	}
+	nativeFallbackEvidence := ""
+	if nativeActiveHistory && !keepCurrentToolResults && len(currentToolResults) > 0 && len(history) > 0 {
+		if assistant := history[len(history)-1].AssistantResponseMessage; assistant != nil {
+			nativeFallbackEvidence = formatLegacyKiroToolExchange(assistant.ToolUses, currentToolResults)
+		}
+	}
+	var inferredTools []KiroToolWrapper
+	var inferredToolNameMap map[string]string
+	if nativeActiveHistory && keepCurrentToolResults {
+		inferredTools, inferredToolNameMap = inferActiveKiroToolConfig(history)
+	}
 
 	// Flatten structured tool calls/results that live in history; upstream only
 	// accepts a single active tool turn (last assistant toolUses ⟺ current toolResults).
@@ -369,7 +389,10 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	} else if len(currentImages) > 0 {
 		finalContent = normalizeUserContent("", true)
 	} else if len(currentToolResults) > 0 {
-		finalContent = buildToolResultsContinuation(currentToolResults)
+		finalContent = nativeFallbackEvidence
+		if finalContent == "" {
+			finalContent = buildToolResultsContinuation(currentToolResults)
+		}
 		toolResultsFolded = true
 	} else {
 		finalContent = minimalFallbackUserContent
@@ -380,11 +403,19 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	// these have none to answer — so fold their text into the message instead of
 	// losing it (e.g. a tool's textual output alongside an extracted image).
 	if !keepCurrentToolResults && len(currentToolResults) > 0 && !toolResultsFolded {
-		finalContent = joinHistoryText(finalContent, buildToolResultsContinuation(currentToolResults))
+		if nativeFallbackEvidence != "" {
+			finalContent = joinHistoryText(finalContent, nativeFallbackEvidence)
+		} else {
+			finalContent = joinHistoryText(finalContent, buildToolResultsContinuation(currentToolResults))
+		}
 	}
 
 	// 转换工具
 	kiroTools, toolNameMap := convertClaudeTools(filterClaudeToolsForChoice(req.Tools, toolChoice))
+	if nativeActiveHistory && keepCurrentToolResults && len(kiroTools) == 0 && len(inferredTools) > 0 {
+		kiroTools = inferredTools
+		toolNameMap = inferredToolNameMap
+	}
 	// Bedrock requires a toolConfig whenever toolUse/toolResult blocks are
 	// present. Some clients omit `tools` when posting the result of a previous
 	// tool call; in that case the structured result cannot be sent upstream even
@@ -409,6 +440,8 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		payload.StructuredOutputSchema = append(json.RawMessage(nil), req.OutputConfig.Format.Schema...)
 	}
 	payload.ToolChoiceMode = toolChoice.Mode
+	payload.ToolChoiceName = toolChoice.Name
+	payload.HistoryMode = historyMode
 	payload.AgentCompletionMarker = agentCompletionMarker
 	payload.ConversationState.ChatTriggerType = "MANUAL"
 	payload.ConversationState.AgentTaskType = "vibe"
@@ -437,6 +470,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	if len(history) > 0 {
 		payload.ConversationState.History = history
 	}
+	finalizeKiroHistoryProtocol(payload)
 
 	if req.MaxTokens > 0 || req.Temperature > 0 || req.TopP > 0 {
 		payload.InferenceConfig = &InferenceConfig{
@@ -1144,11 +1178,17 @@ func appendClaudeServerReadableParts(value interface{}, parts *[]string) {
 }
 
 func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse) {
+	text, toolUses, _ := extractClaudeAssistantHistoryContent(content, false)
+	return text, toolUses
+}
+
+func extractClaudeAssistantHistoryContent(content interface{}, nativeReasoning bool) (string, []KiroToolUse, *KiroReasoningContent) {
 	var text string
 	var toolUses []KiroToolUse
+	var reasoningContent *KiroReasoningContent
 
 	if s, ok := content.(string); ok {
-		return s, nil
+		return s, nil, nil
 	}
 
 	if blocks, ok := content.([]interface{}); ok {
@@ -1169,8 +1209,23 @@ func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse) 
 					}
 				}
 			case "thinking":
-				if thinking, ok := block["thinking"].(string); ok && strings.TrimSpace(thinking) != "" {
-					text = joinHistoryText(text, "<thinking>"+thinking+"</thinking>")
+				thinking, _ := block["thinking"].(string)
+				if strings.TrimSpace(thinking) == "" {
+					continue
+				}
+				// Plaintext thinking and its signature are client-facing history, not
+				// a Kiro-issued opaque continuation token. Keep the rationale as text;
+				// native replay is limited to redacted_thinking from the active tool
+				// round so a stale or foreign signature cannot poison the request.
+				text = joinHistoryText(text, "<thinking>"+thinking+"</thinking>")
+			case "redacted_thinking":
+				if nativeReasoning {
+					data, _ := block["data"].(string)
+					if data != "" {
+						// Anthropic's data field already carries the opaque base64 wire
+						// value expected by Kiro. Preserve it without re-encoding.
+						reasoningContent = &KiroReasoningContent{RedactedContent: data}
+					}
 				}
 			case "tool_use":
 				id, _ := block["id"].(string)
@@ -1192,7 +1247,7 @@ func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse) 
 		}
 	}
 
-	return text, toolUses
+	return text, toolUses, reasoningContent
 }
 
 func convertClaudeTools(tools []ClaudeTool) ([]KiroToolWrapper, map[string]string) {
@@ -1451,6 +1506,7 @@ type OpenAIStreamOptions struct {
 type OpenAIMessage struct {
 	Role              string      `json:"role"`
 	Content           interface{} `json:"content"`
+	ReasoningContent  string      `json:"reasoning_content,omitempty"`
 	ToolCalls         []ToolCall  `json:"tool_calls,omitempty"`
 	ToolCallID        string      `json:"tool_call_id,omitempty"`
 	ToolResultStatus  string      `json:"status,omitempty"`
@@ -1570,6 +1626,8 @@ type OpenAIUsage struct {
 func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	modelID := MapModel(req.Model)
 	origin := "AI_EDITOR"
+	historyMode := configuredKiroHistoryMode()
+	nativeActiveHistory := historyMode == kiroHistoryModeNativeActive
 
 	// 提取系统提示
 	var systemPrompt string
@@ -1591,7 +1649,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	}
 	systemPrompt = appendSystemInstruction(systemPrompt, openAIStructuredOutputInstruction(req.ResponseFormat))
 	toolChoice, _ := resolveToolChoice(req.ToolChoice)
-	systemPrompt = appendSystemInstruction(systemPrompt, toolChoiceInstruction(toolChoice))
+	systemPrompt = appendSystemInstruction(systemPrompt, openAIToolChoiceInstruction(toolChoice))
 	systemPrompt = appendSystemInstruction(systemPrompt, openAIAgentToolProtocolInstruction(req, toolChoice))
 	stopSequences, _ := resolveOpenAIStopSequences(req.Stop)
 	systemPrompt = appendSystemInstruction(systemPrompt, stopSequencesInstruction(stopSequences))
@@ -1604,13 +1662,16 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	structuredOutput := req.ResponseFormat != nil &&
 		(strings.EqualFold(strings.TrimSpace(req.ResponseFormat.Type), "json_object") ||
 			strings.EqualFold(strings.TrimSpace(req.ResponseFormat.Type), "json_schema"))
-	if !structuredOutput && codingAgentCompletionProtocolEnabled(
-		toolChoice,
-		isCodingAgentSystemPrompt(systemPrompt),
-		toolNames,
-	) {
+	recognizedHarness := isCodingAgentSystemPrompt(systemPrompt)
+	autoCompletionProtocol := codingAgentCompletionProtocolEnabled(toolChoice, recognizedHarness, toolNames)
+	forcedToolGuard := codingAgentForcedToolChoiceGuardEnabled(toolChoice, recognizedHarness, toolNames)
+	if (!structuredOutput && autoCompletionProtocol) || forcedToolGuard {
 		agentCompletionMarker = newAgentCompletionMarker()
-		systemPrompt = appendSystemInstruction(systemPrompt, agentCompletionProtocolInstruction(agentCompletionMarker))
+		if forcedToolGuard {
+			systemPrompt = appendSystemInstruction(systemPrompt, forcedToolChoiceCompletionInstruction(toolChoice))
+		} else {
+			systemPrompt = appendSystemInstruction(systemPrompt, agentCompletionProtocolInstruction(agentCompletionMarker))
+		}
 	}
 
 	// 构建历史消息
@@ -1643,6 +1704,12 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 
 		case "assistant":
 			content := extractOpenAIMessageText(msg.Content)
+			if reasoning := strings.TrimSpace(msg.ReasoningContent); reasoning != "" {
+				// OpenAI/Responses reasoning summaries do not carry a Kiro-issued
+				// signature, so they cannot use native reasoningContent. Keep the
+				// client-supplied rationale in ordinary assistant history instead.
+				content = joinHistoryText("<thinking>"+reasoning+"</thinking>", content)
+			}
 
 			var toolUses []KiroToolUse
 			for _, tc := range msg.ToolCalls {
@@ -1731,6 +1798,20 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	// flatten them into the current message text (see ClaudeToKiro for rationale).
 	currentToolResultIDs := collectToolResultIDs(currentToolResults)
 	keepCurrentToolResults := currentToolResultsMatchLastAssistant(history, currentToolResultIDs)
+	if nativeActiveHistory {
+		keepCurrentToolResults = currentToolResultsExactlyMatchLastAssistant(history, currentToolResults)
+	}
+	nativeFallbackEvidence := ""
+	if nativeActiveHistory && !keepCurrentToolResults && len(currentToolResults) > 0 && len(history) > 0 {
+		if assistant := history[len(history)-1].AssistantResponseMessage; assistant != nil {
+			nativeFallbackEvidence = formatLegacyKiroToolExchange(assistant.ToolUses, currentToolResults)
+		}
+	}
+	var inferredTools []KiroToolWrapper
+	var inferredToolNameMap map[string]string
+	if nativeActiveHistory && keepCurrentToolResults {
+		inferredTools, inferredToolNameMap = inferActiveKiroToolConfig(history)
+	}
 
 	if keepCurrentToolResults {
 		history = sanitizeKiroHistory(history, currentToolResultIDs)
@@ -1745,7 +1826,10 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		if len(currentImages) > 0 {
 			finalContent = normalizeUserContent("", true)
 		} else if len(currentToolResults) > 0 {
-			finalContent = buildToolResultsContinuation(currentToolResults)
+			finalContent = nativeFallbackEvidence
+			if finalContent == "" {
+				finalContent = buildToolResultsContinuation(currentToolResults)
+			}
 			toolResultsFolded = true
 		} else {
 			finalContent = minimalFallbackUserContent
@@ -1754,11 +1838,19 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	// Orphaned current tool results: see ClaudeToKiro — fold them into the message
 	// text instead of dropping them when an image placeholder or user text was chosen.
 	if !keepCurrentToolResults && len(currentToolResults) > 0 && !toolResultsFolded {
-		finalContent = joinHistoryText(finalContent, buildToolResultsContinuation(currentToolResults))
+		if nativeFallbackEvidence != "" {
+			finalContent = joinHistoryText(finalContent, nativeFallbackEvidence)
+		} else {
+			finalContent = joinHistoryText(finalContent, buildToolResultsContinuation(currentToolResults))
+		}
 	}
 
 	// 转换工具
 	kiroTools, toolNameMap := convertOpenAIToolsWithNameMap(filterOpenAIToolsForChoice(req.Tools, toolChoice))
+	if nativeActiveHistory && keepCurrentToolResults && len(kiroTools) == 0 && len(inferredTools) > 0 {
+		kiroTools = inferredTools
+		toolNameMap = inferredToolNameMap
+	}
 	// Bedrock requires a toolConfig whenever toolUse/toolResult blocks are
 	// present. OpenAI-compatible clients commonly omit `tools` on the follow-up
 	// tool-result request, so flatten the result instead of sending a malformed
@@ -1784,6 +1876,8 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		}
 	}
 	payload.ToolChoiceMode = toolChoice.Mode
+	payload.ToolChoiceName = toolChoice.Name
+	payload.HistoryMode = historyMode
 	payload.AgentCompletionMarker = agentCompletionMarker
 	payload.ConversationState.ChatTriggerType = "MANUAL"
 	payload.ConversationState.ConversationID = buildConversationID(modelID, stableSystemPrompt, firstOpenAIConversationAnchor(nonSystemMessages))
@@ -1808,6 +1902,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	if len(history) > 0 {
 		payload.ConversationState.History = history
 	}
+	finalizeKiroHistoryProtocol(payload)
 
 	if req.MaxTokens > 0 || req.Temperature > 0 || req.TopP > 0 {
 		payload.InferenceConfig = &InferenceConfig{
@@ -1962,12 +2057,20 @@ func currentToolResultsMatchLastAssistant(history []KiroHistoryMessage, currentT
 // and the model can recover within an ongoing session.
 var pollutedToolCallTextPattern = regexp.MustCompile(`\[Called tool [^\]]*\]`)
 
-// stripPollutedToolCallText removes legacy tool-call narration from text and
-// tidies up the leftover whitespace.
+// stripPollutedToolCallText removes only the legacy proxy-authored narration.
+// XML-looking text is user/model content and must remain byte-for-byte intact;
+// treating generic <invoke>/<parameter> tags as pollution corrupts code samples,
+// protocol documentation, and unfinished responses.
 func stripPollutedToolCallText(content string) string {
 	cleaned := stripAgentToolTranscriptPollution(content)
+	changed := cleaned != content
 	if strings.Contains(cleaned, "[Called tool ") {
-		cleaned = pollutedToolCallTextPattern.ReplaceAllString(cleaned, "")
+		withoutLegacyNarration := pollutedToolCallTextPattern.ReplaceAllString(cleaned, "")
+		changed = changed || withoutLegacyNarration != cleaned
+		cleaned = withoutLegacyNarration
+	}
+	if !changed {
+		return content
 	}
 	// Collapse blank lines left behind by removed markers.
 	cleaned = regexp.MustCompile(`\n{3,}`).ReplaceAllString(cleaned, "\n\n")
@@ -1979,17 +2082,38 @@ func stripPollutedToolCallText(content string) string {
 // when that mapping is known, so the model retains the tool's identity without
 // any assistant-side tool-invocation syntax to imitate.
 //
-// IMPORTANT: tool activity must never be narrated into ASSISTANT turns. Earlier
-// versions wrote "[Called tool X with input ...]" into assistant content, which
-// trained the model (via dozens of in-context examples) to emit that literal
-// text instead of issuing real structured tool calls. All tool narration lives
-// in user "Tool results" turns, which the model reads but never authors, so it
-// has no invocation pattern to copy.
-func narrateToolResults(toolResults []KiroToolResult, names map[string]string) string {
+// Tool activity is represented only on the user/result side. The envelope keeps
+// the original tool-use ID, name, arguments, status, and output together without
+// making the proxy author first-person assistant claims about actions it did not
+// perform. The returned collapse key is non-empty only when every result has a
+// complete, serializable matching tool use.
+func narrateToolResults(toolResults []KiroToolResult, toolUses []KiroToolUse) (string, string) {
 	if len(toolResults) == 0 {
-		return ""
+		return "", ""
+	}
+	type historicalToolExchange struct {
+		ToolUse    KiroToolUse    `json:"tool_use"`
+		ToolResult KiroToolResult `json:"tool_result"`
+	}
+	toolUsesByID := make(map[string]KiroToolUse, len(toolUses))
+	ambiguousToolUseIDs := make(map[string]bool)
+	for _, toolUse := range toolUses {
+		if toolUse.ToolUseID == "" || ambiguousToolUseIDs[toolUse.ToolUseID] {
+			continue
+		}
+		if _, duplicate := toolUsesByID[toolUse.ToolUseID]; duplicate {
+			delete(toolUsesByID, toolUse.ToolUseID)
+			ambiguousToolUseIDs[toolUse.ToolUseID] = true
+			continue
+		}
+		toolUsesByID[toolUse.ToolUseID] = toolUse
 	}
 	parts := make([]string, 0, len(toolResults))
+	exchanges := make([]historicalToolExchange, 0, len(toolResults))
+	// Be deliberately conservative: parallel/partial tool rounds are preserved
+	// verbatim in the envelope but never folded because ordering and unmatched
+	// calls are part of their causal history.
+	complete := len(toolResults) == 1 && len(toolUses) == 1
 	for _, tr := range toolResults {
 		var texts []string
 		for _, c := range tr.Content {
@@ -2001,12 +2125,71 @@ func narrateToolResults(toolResults []KiroToolResult, names map[string]string) s
 		if strings.TrimSpace(body) == "" {
 			body = "(no output)"
 		}
-		parts = append(parts, formatHistoricalToolResult(names[tr.ToolUseID], tr.Status, body))
+		toolUse, matched := toolUsesByID[tr.ToolUseID]
+		part, fullyRepresented := formatHistoricalToolResultEnvelope(tr, toolUse, matched, body)
+		parts = append(parts, part)
+		complete = complete && fullyRepresented
+		if fullyRepresented {
+			exchanges = append(exchanges, historicalToolExchange{ToolUse: toolUse, ToolResult: tr})
+		}
 	}
 	if len(parts) == 0 {
-		return ""
+		return "", ""
 	}
-	return wrapHistoricalToolResults(parts, 0)
+	narrated := wrapHistoricalToolResults(parts, 0)
+	if !complete {
+		return narrated, ""
+	}
+	encoded, err := json.Marshal(exchanges)
+	if err != nil {
+		return narrated, ""
+	}
+	return narrated, string(encoded)
+}
+
+func formatHistoricalToolResultEnvelope(
+	result KiroToolResult,
+	toolUse KiroToolUse,
+	matched bool,
+	body string,
+) (string, bool) {
+	name := ""
+	if matched {
+		name = toolUse.Name
+	}
+	base := formatHistoricalToolResult(name, result.Status, body)
+	openingEnd := strings.IndexByte(base, '\n')
+	if openingEnd < 0 || !strings.HasSuffix(base, "\n</tool_result>") {
+		return base, false
+	}
+
+	complete := matched && result.ToolUseID != "" && toolUse.ToolUseID == result.ToolUseID &&
+		strings.TrimSpace(toolUse.Name) != ""
+	metadata := make([]string, 0, 2)
+	if result.ToolUseID != "" {
+		metadata = append(metadata,
+			"<tool_use_id>"+html.EscapeString(result.ToolUseID)+"</tool_use_id>",
+		)
+	} else {
+		complete = false
+	}
+	if matched {
+		encoded, err := json.Marshal(toolUse.Input)
+		if err != nil {
+			complete = false
+		} else {
+			metadata = append(metadata,
+				"<tool_input_json>"+html.EscapeString(string(encoded))+"</tool_input_json>",
+			)
+		}
+	} else {
+		complete = false
+	}
+
+	if len(metadata) == 0 {
+		return base, false
+	}
+	return base[:openingEnd+1] + strings.Join(metadata, "\n") + "\n" + base[openingEnd+1:], complete
 }
 
 func formatHistoricalToolResult(name, status, body string) string {
@@ -2110,18 +2293,22 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 		return history
 	}
 
-	// Map every tool-use ID to its tool name across all assistant turns, so a
-	// user "Tool results" turn can attribute each result to its originating tool
-	// even after the structured toolUses are stripped from the assistant turn.
-	toolNames := make(map[string]string)
+	// Pair each historical result turn only with its immediately preceding
+	// assistant tool turn. A global map keyed by toolUseId is unsafe because some
+	// clients reuse IDs; a later retry would then overwrite the earlier call's
+	// arguments and falsify history.
+	toolUsesByResultIndex := make(map[int][]KiroToolUse)
 	for i := range history {
-		if a := history[i].AssistantResponseMessage; a != nil {
-			for _, tu := range a.ToolUses {
-				if tu.ToolUseID != "" && tu.Name != "" {
-					toolNames[tu.ToolUseID] = tu.Name
-				}
-			}
+		user := history[i].UserInputMessage
+		if i == 0 || user == nil || user.UserInputMessageContext == nil ||
+			len(user.UserInputMessageContext.ToolResults) == 0 {
+			continue
 		}
+		assistant := history[i-1].AssistantResponseMessage
+		if assistant == nil || len(assistant.ToolUses) == 0 {
+			continue
+		}
+		toolUsesByResultIndex[i] = append([]KiroToolUse(nil), assistant.ToolUses...)
 	}
 
 	// Determine whether the last history assistant turn is the "active" tool turn
@@ -2143,6 +2330,11 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 		}
 	}
 
+	// A non-empty key marks a user turn whose complete tool exchange was flattened
+	// successfully. Only two adjacent entries with the exact same key and content
+	// are eligible for retry collapse.
+	toolResultCollapseKeys := make(map[int]string)
+
 	for i := range history {
 		msg := &history[i]
 
@@ -2159,20 +2351,18 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 			if i == activeIdx {
 				continue // keep the active tool turn structured
 			}
-			// Drop the structured tool calls WITHOUT writing any tool-invocation
-			// text into the assistant turn. Narrating the call here (e.g.
-			// "[Called tool X ...]") would give the model dozens of in-context
-			// examples of "invoke a tool by emitting this text", which it then
-			// imitates instead of issuing real structured tool calls. The tool's
-			// identity is preserved on the result side (user turn) via toolNames.
+			// The matching result turn below carries the complete call/result
+			// envelope. Keep any real assistant content unchanged, but do not make
+			// the proxy claim in first person that it inspected or ran anything.
 			msg.AssistantResponseMessage.ToolUses = nil
 		}
 
 		if msg.UserInputMessage != nil && msg.UserInputMessage.UserInputMessageContext != nil {
 			ctx := msg.UserInputMessage.UserInputMessageContext
 			if len(ctx.ToolResults) > 0 {
-				narrated := narrateToolResults(ctx.ToolResults, toolNames)
+				narrated, collapseKey := narrateToolResults(ctx.ToolResults, toolUsesByResultIndex[i])
 				msg.UserInputMessage.Content = joinHistoryText(msg.UserInputMessage.Content, narrated)
+				toolResultCollapseKeys[i] = collapseKey
 				ctx.ToolResults = nil
 			}
 			// History messages must not carry structured tool specs either.
@@ -2201,6 +2391,7 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 	cleaned := history[:0:0]
 	previousUserContent := ""
 	previousUserHadImages := false
+	previousToolResultCollapseKey := ""
 	for i := range history {
 		msg := history[i]
 		if msg.AssistantResponseMessage != nil && len(msg.AssistantResponseMessage.ToolUses) == 0 {
@@ -2212,14 +2403,18 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 		// Removing hollow assistant tool-call turns can leave adjacent user
 		// messages (for example, the original request followed by its tool
 		// result). Kiro history is turn-oriented; keep the role alternation by
-		// merging adjacent user entries after first collapsing exact retries.
+		// merging adjacent user entries. Collapse only a complete flattened tool
+		// retry whose ID, input, status, output, and surrounding user content are
+		// byte-for-byte identical; ordinary repeated user messages are preserved.
 		if msg.UserInputMessage != nil && len(cleaned) > 0 {
 			last := &cleaned[len(cleaned)-1]
 			if last.UserInputMessage != nil {
-				currentContent := strings.TrimSpace(msg.UserInputMessage.Content)
-				if previousUserContent == currentContent && currentContent != "" &&
+				currentContent := msg.UserInputMessage.Content
+				currentCollapseKey := toolResultCollapseKeys[i]
+				if currentCollapseKey != "" && currentCollapseKey == previousToolResultCollapseKey &&
+					previousUserContent == currentContent && strings.TrimSpace(currentContent) != "" &&
 					!previousUserHadImages && len(msg.UserInputMessage.Images) == 0 {
-					continue // collapse an identical retry without duplicating its output
+					continue
 				}
 				last.UserInputMessage.Content = joinHistoryText(
 					last.UserInputMessage.Content,
@@ -2228,18 +2423,21 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 				if len(msg.UserInputMessage.Images) > 0 {
 					last.UserInputMessage.Images = append(last.UserInputMessage.Images, msg.UserInputMessage.Images...)
 				}
-				previousUserContent = currentContent
+				previousUserContent = msg.UserInputMessage.Content
 				previousUserHadImages = len(msg.UserInputMessage.Images) > 0
+				previousToolResultCollapseKey = currentCollapseKey
 				continue
 			}
 		}
 		cleaned = append(cleaned, msg)
 		if msg.UserInputMessage != nil {
-			previousUserContent = strings.TrimSpace(msg.UserInputMessage.Content)
+			previousUserContent = msg.UserInputMessage.Content
 			previousUserHadImages = len(msg.UserInputMessage.Images) > 0
+			previousToolResultCollapseKey = toolResultCollapseKeys[i]
 		} else {
 			previousUserContent = ""
 			previousUserHadImages = false
+			previousToolResultCollapseKey = ""
 		}
 	}
 

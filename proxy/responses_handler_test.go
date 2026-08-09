@@ -90,6 +90,60 @@ func TestResponsesParseArrayInput(t *testing.T) {
 	}
 }
 
+func TestResponsesParseReasoningSummaryAttachesToFunctionCall(t *testing.T) {
+	raw := json.RawMessage(`[
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"inspect it"}]},
+		{"type":"reasoning","summary":[{"type":"summary_text","text":"Find the relevant file."},{"type":"summary_text","text":"Inspect it before editing."}]},
+		{"type":"function_call","call_id":"call_reasoned","name":"read_file","arguments":"{\"path\":\"main.go\"}"},
+		{"type":"function_call_output","call_id":"call_reasoned","output":"package main"}
+	]`)
+
+	msgs, err := parseResponsesInput(raw)
+	if err != nil {
+		t.Fatalf("parse reasoning input: %v", err)
+	}
+	if len(msgs) != 3 {
+		t.Fatalf("expected user, assistant tool call, and tool result; got %d (%+v)", len(msgs), msgs)
+	}
+	if msgs[0].Role != "user" || msgs[0].ReasoningContent != "" {
+		t.Fatalf("reasoning was attached to the user message: %+v", msgs[0])
+	}
+	if msgs[1].Role != "assistant" || msgs[1].ReasoningContent != "Find the relevant file.\nInspect it before editing." {
+		t.Fatalf("assistant reasoning summary mismatch: %+v", msgs[1])
+	}
+	if len(msgs[1].ToolCalls) != 1 || msgs[1].ToolCalls[0].ID != "call_reasoned" {
+		t.Fatalf("reasoning lost its function-call association: %+v", msgs[1])
+	}
+	if msgs[2].Role != "tool" || msgs[2].ToolCallID != "call_reasoned" {
+		t.Fatalf("tool result order/pairing mismatch: %+v", msgs[2])
+	}
+}
+
+func TestResponsesParseReasoningSummaryAttachesToAssistantMessage(t *testing.T) {
+	raw := json.RawMessage(`[
+		{"type":"reasoning","summary":[{"type":"summary_text","text":"The calculation is complete."}]},
+		{"type":"message","role":"assistant","content":[{"type":"output_text","text":"The answer is 42."}]},
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"Thanks"}]}
+	]`)
+
+	msgs, err := parseResponsesInput(raw)
+	if err != nil {
+		t.Fatalf("parse reasoning input: %v", err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("expected assistant then user, got %d (%+v)", len(msgs), msgs)
+	}
+	if msgs[0].Role != "assistant" || msgs[0].ReasoningContent != "The calculation is complete." {
+		t.Fatalf("reasoning was not preserved on assistant message: %+v", msgs[0])
+	}
+	if got, _ := msgs[0].Content.(string); got != "The answer is 42." {
+		t.Fatalf("assistant text mismatch: %q", got)
+	}
+	if msgs[1].Role != "user" || msgs[1].ReasoningContent != "" {
+		t.Fatalf("following user message was polluted: %+v", msgs[1])
+	}
+}
+
 func TestResponsesStoreAndLoad(t *testing.T) {
 	cfgFile := filepath.Join(t.TempDir(), "config.json")
 	if err := config.Init(cfgFile); err != nil {
@@ -174,6 +228,43 @@ func TestResponsesPreviousResponseIDExpands(t *testing.T) {
 	}
 	if expanded[2].ToolCalls[0].ID != "call_prev" {
 		t.Fatalf("expected tool call id call_prev, got %+v", expanded[2].ToolCalls[0])
+	}
+}
+
+func TestResponsesPreviousResponseIDReplaysReasoningWithFunctionCall(t *testing.T) {
+	prev := &ResponsesObject{
+		ID:          "resp_reasoned_tool",
+		StoredInput: json.RawMessage(`"find the file"`),
+		Output: []ResponseOutputItem{
+			{
+				Type: "reasoning",
+				Summary: []ResponseSummaryPart{
+					{Type: "summary_text", Text: "Search the repository."},
+					{Type: "summary_text", Text: "Read the matching file."},
+				},
+			},
+			{
+				Type:      "function_call",
+				CallID:    "call_history",
+				Name:      "read_file",
+				Arguments: `{"path":"proxy/responses_history.go"}`,
+			},
+		},
+	}
+
+	expanded := expandPreviousResponseHistory(prev)
+	if len(expanded) != 2 {
+		t.Fatalf("expected user and assistant tool-call history, got %d (%+v)", len(expanded), expanded)
+	}
+	if expanded[0].Role != "user" || expanded[0].ReasoningContent != "" {
+		t.Fatalf("stored reasoning was attached to user history: %+v", expanded[0])
+	}
+	assistant := expanded[1]
+	if assistant.Role != "assistant" || assistant.ReasoningContent != "Search the repository.\nRead the matching file." {
+		t.Fatalf("stored reasoning summary mismatch: %+v", assistant)
+	}
+	if len(assistant.ToolCalls) != 1 || assistant.ToolCalls[0].ID != "call_history" {
+		t.Fatalf("stored reasoning lost its tool-call association: %+v", assistant)
 	}
 }
 

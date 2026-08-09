@@ -79,13 +79,69 @@ func TestResponsesUsageSeparatesClientCacheFromKiroContext(t *testing.T) {
 	}
 }
 
+func TestAgentUsageBlendsKiroOccupancyAcrossOpenAIProtocols(t *testing.T) {
+	const model = "glm-5"
+	prompt := strings.Repeat("context occupancy evidence ", 12_000)
+	estimatedInput := estimateOpenAIRequestInputTokens(&OpenAIRequest{
+		Model:    model,
+		Messages: []OpenAIMessage{{Role: "user", Content: prompt}},
+	})
+	fixture := &KiroPayload{}
+	observeKiroContextUsage(fixture, model, 90)
+	wantInput := contextUsageBlendedInputTokens(fixture, model, estimatedInput)
+	if wantInput <= estimatedInput {
+		t.Fatalf("fixture did not enter the blend band: estimated=%d blended=%d", estimatedInput, wantInput)
+	}
+
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("chat/stream=%v", stream), func(t *testing.T) {
+			h := newEmptyVisibleOutputTestHandler(t, 1, contextUsageContractCallerAt(90))
+			t.Cleanup(h.stopPromptCachePolicyTrackers)
+			key := addContextUsageCacheBinding(t, fmt.Sprintf("chat-blend-%v", stream), fmt.Sprintf("sk-chat-blend-%v", stream))
+			requireOpenAIAuth(t)
+			body := marshalContextUsageChatRequestForModel(t, model, prompt, stream)
+			response := serveOpenAIChatWithKey(t, h, key.Key, body)
+			usage := contextUsageChatUsage(t, response, stream)
+			if got := int(contextUsageNumber(t, usage, "prompt_tokens")); got != wantInput {
+				t.Fatalf("Chat prompt_tokens=%d, want blended %d from estimate %d", got, wantInput, estimatedInput)
+			}
+			completion := int(contextUsageNumber(t, usage, "completion_tokens"))
+			if got := int(contextUsageNumber(t, usage, "total_tokens")); got != wantInput+completion {
+				t.Fatalf("Chat total_tokens=%d, want %d", got, wantInput+completion)
+			}
+		})
+
+		t.Run(fmt.Sprintf("responses/stream=%v", stream), func(t *testing.T) {
+			h, cleanup := setupResponsesTestHandler(t)
+			defer cleanup()
+			defer h.stopPromptCachePolicyTrackers()
+			h.kiroCaller = contextUsageContractCallerAt(90)
+			key := addContextUsageCacheBinding(t, fmt.Sprintf("responses-blend-%v", stream), fmt.Sprintf("sk-responses-blend-%v", stream))
+			response := runContextUsageResponsesRequestForModel(t, h, key, model, prompt, stream)
+			if response.Usage.InputTokens != wantInput {
+				t.Fatalf("Responses input_tokens=%d, want blended %d from estimate %d", response.Usage.InputTokens, wantInput, estimatedInput)
+			}
+			if response.Usage.TotalTokens != response.Usage.InputTokens+response.Usage.OutputTokens {
+				t.Fatalf("Responses total_tokens=%d, want input(%d)+output(%d)", response.Usage.TotalTokens, response.Usage.InputTokens, response.Usage.OutputTokens)
+			}
+		})
+	}
+}
+
 func contextUsageContractCaller(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
-	callback.OnContextUsage(12.5)
-	callback.OnText("cache contract response", false)
-	// Public usage must remain anchored to the client request, not these
-	// upstream counters or Kiro's hidden context occupancy.
-	callback.OnComplete(987_654, 321)
-	return nil
+	return contextUsageContractCallerAt(12.5)(nil, nil, callback)
+}
+
+func contextUsageContractCallerAt(percentage float64) kiroAPICaller {
+	return func(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
+		callback.OnContextUsage(percentage)
+		callback.OnText("cache contract response", false)
+		// Public usage must remain anchored to the client request rather than
+		// trusting Kiro's unrelated token counters. The context percentage is
+		// blended separately only after it crosses the configured threshold.
+		callback.OnComplete(987_654, 321)
+		return nil
+	}
 }
 
 func addContextUsageCacheBinding(t *testing.T, name, keyValue string) config.ApiKeyEntry {
@@ -121,9 +177,13 @@ func addContextUsageCacheBinding(t *testing.T, name, keyValue string) config.Api
 }
 
 func marshalContextUsageChatRequest(t *testing.T, prompt string, stream bool) []byte {
+	return marshalContextUsageChatRequestForModel(t, contextUsageContractModel, prompt, stream)
+}
+
+func marshalContextUsageChatRequestForModel(t *testing.T, model, prompt string, stream bool) []byte {
 	t.Helper()
 	body := map[string]interface{}{
-		"model":    contextUsageContractModel,
+		"model":    model,
 		"messages": []map[string]interface{}{{"role": "user", "content": prompt}},
 		"stream":   stream,
 	}
@@ -218,9 +278,19 @@ func runContextUsageResponsesRequest(
 	prompt string,
 	stream bool,
 ) ResponsesObject {
+	return runContextUsageResponsesRequestForModel(t, h, key, contextUsageContractModel, prompt, stream)
+}
+
+func runContextUsageResponsesRequestForModel(
+	t *testing.T,
+	h *Handler,
+	key config.ApiKeyEntry,
+	model, prompt string,
+	stream bool,
+) ResponsesObject {
 	t.Helper()
 	body, err := json.Marshal(map[string]interface{}{
-		"model":  contextUsageContractModel,
+		"model":  model,
 		"input":  prompt,
 		"stream": stream,
 		"store":  false,

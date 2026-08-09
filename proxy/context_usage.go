@@ -54,6 +54,26 @@ func contextUsageBlendWeight(percentage float64) float64 {
 	return 0.25 + (linear-0.5)*1.5
 }
 
+// contextUsageComparabilityWeight avoids treating a tiny follow-up estimate as
+// the full conversation while keeping the transition continuous. The previous
+// hard 25% gate changed a one-token difference at the boundary into a jump of
+// hundreds of thousands of reported tokens. The denominator is fixed at the
+// parity point instead of the current occupancy: if it grew with occupancy, a
+// nearly-full conversation could report fewer tokens as Kiro moved from 90% to
+// 100%. Smoothstep is effectively zero for unrelated tiny estimates, reaches
+// full trust at the same 25% parity share, and has zero slope at both ends.
+func contextUsageComparabilityWeight(clientInputTokens, parityOccupancy int) float64 {
+	if clientInputTokens <= 0 || parityOccupancy <= 0 {
+		return 0
+	}
+	share := float64(clientInputTokens) / float64(parityOccupancy)
+	if share >= contextUsageMinComparableShare {
+		return 1
+	}
+	x := share / contextUsageMinComparableShare
+	return x * x * (3 - 2*x)
+}
+
 // contextUsageBlendedInputTokens is the shared blend used by both the public
 // input total and the cache split so the two stay in one token domain.
 //
@@ -79,12 +99,16 @@ func contextUsageBlendedInputTokens(payload *KiroPayload, model string, clientIn
 	if occupied <= clientInputTokens {
 		return clientInputTokens
 	}
-	// The gap is only meaningful when both numbers describe the same
-	// conversation. A client estimate far below the reported occupancy means they
-	// are not comparable -- a peak carried over from an earlier turn, or a tiny
-	// follow-up on a reused payload -- and blending would inflate by orders of
-	// magnitude. Pass the client number through instead.
-	if float64(clientInputTokens) < float64(occupied)*contextUsageMinComparableShare {
+	// A peak carried over from an earlier recovery attempt can dwarf the current
+	// bounded prompt. Ease the blend toward zero for such incomparable values
+	// instead of using a discontinuous pass/fail threshold. Anchor comparison to
+	// the fixed parity occupancy so increasing Kiro usage cannot lower the result.
+	parityOccupancy := contextUsageTokens(model, contextUsageBlendParityPercent)
+	if parityOccupancy <= 0 {
+		parityOccupancy = occupied
+	}
+	weight *= contextUsageComparabilityWeight(clientInputTokens, parityOccupancy)
+	if weight <= 0 {
 		return clientInputTokens
 	}
 	// Cap the target below the window before weighting. Upstream occupancy counts
@@ -121,6 +145,13 @@ func claudePublicInputTokens(payload *KiroPayload, model string, fallback int) i
 // read/creation shares rather than being appended as uncached tokens. Without
 // this, a blend-lifted request would look like a sudden cache miss.
 func claudeTerminalCacheUsage(profile *promptCacheProfile, payload *KiroPayload, model string, fallback int, usage promptCacheUsage) promptCacheUsage {
+	return contextUsageBlendedCacheUsage(payload, model, fallback, usage)
+}
+
+// contextUsageBlendedCacheUsage scales the cache detail into the same public
+// token domain as contextUsageBlendedInputTokens. Internal billing and cache
+// tracker state continue to use the unblended request estimate.
+func contextUsageBlendedCacheUsage(payload *KiroPayload, model string, fallback int, usage promptCacheUsage) promptCacheUsage {
 	if fallback <= 0 {
 		return usage
 	}

@@ -1811,6 +1811,10 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 			if _, exists := toolBlockIndexes[toolUseID]; exists || ignoredToolUses[toolUseID] {
 				return
 			}
+			if forcedToolChoiceMode(payload) && !kiroPayloadAllowsToolName(payload, name) {
+				ignoredToolUses[toolUseID] = true
+				return
+			}
 			// Anthropic content blocks are strictly serial. Keep streaming the
 			// active tool's arguments, but wait to open another block until this
 			// tool has received its validated completion event.
@@ -2049,7 +2053,7 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 				suppressedReasoningObserved || hiddenThinkingObserved || rawThinkingBuilder.Len() > 0 || pendingThinkingSignature != "" || len(redactedThinking) > 0,
 				completionGate.VisibleText(),
 				completionGate.Marked(),
-				len(toolUses),
+				completedKiroToolNames(toolUses),
 				upstreamStopReason,
 			); completionErr != nil {
 				err = completionErr
@@ -2691,7 +2695,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 				suppressedReasoningObserved || thinkingContent != "" || thinkingSignature != "" || len(redactedThinking) > 0,
 				visibleContent,
 				markerSeen,
-				len(toolUses),
+				completedKiroToolNames(toolUses),
 				upstreamStopReason,
 			); completionErr != nil {
 				err = completionErr
@@ -3233,6 +3237,7 @@ func (h *Handler) handleOpenAIStreamWithCache(w http.ResponseWriter, payload *Ki
 		bypassStopFilter := false
 		toolCallIndexes := make(map[string]int)
 		toolCallNames := make(map[string]string)
+		ignoredToolUses := make(map[string]bool)
 
 		writeChunk := func(choices []map[string]interface{}, usage map[string]interface{}) {
 			chunk := map[string]interface{}{
@@ -3500,7 +3505,11 @@ func (h *Handler) handleOpenAIStreamWithCache(w http.ResponseWriter, payload *Ki
 		}
 
 		beginToolCall := func(toolUseID, name string) {
-			if _, exists := toolCallIndexes[toolUseID]; exists {
+			if _, exists := toolCallIndexes[toolUseID]; exists || ignoredToolUses[toolUseID] {
+				return
+			}
+			if forcedToolChoiceMode(payload) && !kiroPayloadAllowsToolName(payload, name) {
+				ignoredToolUses[toolUseID] = true
 				return
 			}
 			processText("", false, true)
@@ -3540,7 +3549,7 @@ func (h *Handler) handleOpenAIStreamWithCache(w http.ResponseWriter, payload *Ki
 			}}, nil)
 		}
 		emitToolCallDelta := func(toolUseID, delta string) {
-			if delta == "" {
+			if delta == "" || ignoredToolUses[toolUseID] {
 				return
 			}
 			index, exists := toolCallIndexes[toolUseID]
@@ -3619,6 +3628,11 @@ func (h *Handler) handleOpenAIStreamWithCache(w http.ResponseWriter, payload *Ki
 			},
 			OnToolUse: func(tu KiroToolUse) {
 				upstreamOutputStarted = true
+				if ignoredToolUses[tu.ToolUseID] ||
+					(forcedToolChoiceMode(payload) && !kiroPayloadAllowsToolName(payload, tu.Name)) {
+					ignoredToolUses[tu.ToolUseID] = true
+					return
+				}
 				_, streamed := toolCallIndexes[tu.ToolUseID]
 				if !streamed {
 					beginToolCall(tu.ToolUseID, tu.Name)
@@ -3664,7 +3678,7 @@ func (h *Handler) handleOpenAIStreamWithCache(w http.ResponseWriter, payload *Ki
 				suppressedReasoningObserved || rawReasoningBuilder.Len() > 0,
 				completionGate.VisibleText(),
 				completionGate.Marked(),
-				len(toolCalls),
+				completedOpenAIToolNames(toolCalls),
 				upstreamStopReason,
 			); completionErr != nil {
 				err = completionErr
@@ -3846,7 +3860,9 @@ func (h *Handler) handleOpenAIStreamWithCache(w http.ResponseWriter, payload *Ki
 			"finish_reason": finishReason,
 		}}, nil)
 		if includeUsage {
-			terminalUsage := buildOpenAIUsageMap(inputTokens, outputTokens, cacheUsage)
+			publicInputTokens := contextUsageBlendedInputTokens(payload, model, inputTokens)
+			publicCacheUsage := contextUsageBlendedCacheUsage(payload, model, inputTokens, cacheUsage)
+			terminalUsage := buildOpenAIUsageMap(publicInputTokens, outputTokens, publicCacheUsage)
 			addKiroContextUsage(terminalUsage, payload, model)
 			writeChunk([]map[string]interface{}{}, terminalUsage)
 		}
@@ -4000,7 +4016,7 @@ func (h *Handler) handleOpenAINonStreamWithCache(w http.ResponseWriter, payload 
 				suppressedReasoningObserved || reasoningContent != "",
 				visibleContent,
 				markerSeen,
-				len(toolUses),
+				completedKiroToolNames(toolUses),
 				upstreamStopReason,
 			); completionErr != nil {
 				err = completionErr
@@ -4108,8 +4124,10 @@ func (h *Handler) handleOpenAINonStreamWithCache(w http.ResponseWriter, payload 
 		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
-		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, responseModel, thinkingFormat)
-		usage := buildOpenAIUsageMap(inputTokens, outputTokens, cacheUsage)
+		publicInputTokens := contextUsageBlendedInputTokens(payload, model, inputTokens)
+		publicCacheUsage := contextUsageBlendedCacheUsage(payload, model, inputTokens, cacheUsage)
+		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, publicInputTokens, outputTokens, responseModel, thinkingFormat)
+		usage := buildOpenAIUsageMap(publicInputTokens, outputTokens, publicCacheUsage)
 		addKiroContextUsage(usage, payload, model)
 		resp["usage"] = usage
 		if matchedStopSequence != "" {

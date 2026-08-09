@@ -75,7 +75,11 @@ func TestCallKiroAPIInputTooLongWithoutTextPreservesPreviousActionHint(t *testin
 	payload := completionProtocolTestPayload()
 	payload.ProfileArn = "arn:aws:codewhisperer:us-east-1:000000000000:profile/test"
 	const previousHint = "PREVIOUS_ACTION_HINT: inspect config before retrying the write"
+	const previousReasoning = "PREVIOUS_REASONING_CAUSE: the write failed because the file was stale"
+	const previousVisible = "PREVIOUS_VISIBLE_ACTION: inspect config before retrying the write"
 	payload.agentRecoveryActionHint = previousHint
+	payload.agentRecoveryAttemptReasoning = previousReasoning
+	payload.agentRecoveryAttemptVisibleText = previousVisible
 	if !captureAgentRecoveryOriginalPayload(payload) {
 		t.Fatal("failed to capture original recovery payload")
 	}
@@ -107,11 +111,17 @@ func TestCallKiroAPIInputTooLongWithoutTextPreservesPreviousActionHint(t *testin
 	if payload.agentRecoveryActionHint != previousHint {
 		t.Fatalf("zero-text HTTP 400 replaced previous action hint: got %q want %q", payload.agentRecoveryActionHint, previousHint)
 	}
+	if payload.agentRecoveryAttemptReasoning != previousReasoning ||
+		payload.agentRecoveryAttemptVisibleText != previousVisible {
+		t.Fatalf("zero-text HTTP 400 replaced split attempt buffers: reasoning=%q visible=%q",
+			payload.agentRecoveryAttemptReasoning, payload.agentRecoveryAttemptVisibleText)
+	}
 	if !prepareAgentInputTooLongRecovery(payload) {
 		t.Fatal("preserved action hint was not available to bounded input-too-long recovery")
 	}
 	content := payload.ConversationState.CurrentMessage.UserInputMessage.Content
-	if !strings.Contains(content, previousHint) || !strings.Contains(content, "<agent_bounded_context_recovery>") {
+	if !strings.Contains(content, previousHint) || !strings.Contains(content, previousReasoning) ||
+		!strings.Contains(content, previousVisible) || !strings.Contains(content, "<agent_bounded_context_recovery>") {
 		t.Fatalf("bounded recovery did not receive previous action hint: %q", content)
 	}
 }

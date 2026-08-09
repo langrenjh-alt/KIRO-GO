@@ -45,6 +45,7 @@ func parseResponsesInput(raw json.RawMessage) ([]OpenAIMessage, error) {
 func convertResponsesInputItems(items []json.RawMessage) ([]OpenAIMessage, error) {
 	messages := make([]OpenAIMessage, 0, len(items))
 	pendingUserParts := []interface{}{}
+	pendingReasoning := ""
 
 	flushPendingUser := func() {
 		if len(pendingUserParts) == 0 {
@@ -55,6 +56,21 @@ func convertResponsesInputItems(items []json.RawMessage) ([]OpenAIMessage, error
 			Content: pendingUserParts,
 		})
 		pendingUserParts = nil
+	}
+	attachPendingReasoning := func(msg *OpenAIMessage) {
+		if msg == nil || strings.TrimSpace(pendingReasoning) == "" {
+			return
+		}
+		msg.ReasoningContent = appendResponsesReasoning(msg.ReasoningContent, pendingReasoning)
+		pendingReasoning = ""
+	}
+	flushPendingReasoning := func() {
+		if strings.TrimSpace(pendingReasoning) == "" {
+			return
+		}
+		msg := OpenAIMessage{Role: "assistant", Content: ""}
+		attachPendingReasoning(&msg)
+		messages = append(messages, msg)
 	}
 
 	for _, item := range items {
@@ -68,14 +84,32 @@ func convertResponsesInputItems(items []json.RawMessage) ([]OpenAIMessage, error
 
 		switch {
 		case typ == "message" || (typ == "" && role != ""):
-			flushPendingUser()
-			msg := buildMessageFromInputItem(obj, role)
+			messageRole := role
+			if messageRole == "" {
+				messageRole = "user"
+			}
+			if messageRole == "assistant" {
+				flushPendingUser()
+			} else {
+				flushPendingReasoning()
+				flushPendingUser()
+			}
+			msg := buildMessageFromInputItem(obj, messageRole)
+			if msg == nil && messageRole == "assistant" && strings.TrimSpace(pendingReasoning) != "" {
+				msg = &OpenAIMessage{Role: "assistant", Content: ""}
+			}
 			if msg != nil {
+				attachPendingReasoning(msg)
 				messages = append(messages, *msg)
 			}
 
+		case typ == "reasoning":
+			flushPendingUser()
+			pendingReasoning = appendResponsesReasoning(pendingReasoning, reasoningSummaryFromInputItem(obj))
+
 		case typ == "function_call_output" || typ == "tool_result":
 			flushPendingUser()
+			flushPendingReasoning()
 			callID, _ := obj["call_id"].(string)
 			if callID == "" {
 				callID, _ = obj["tool_call_id"].(string)
@@ -111,16 +145,20 @@ func convertResponsesInputItems(items []json.RawMessage) ([]OpenAIMessage, error
 				messages[n-1].Role == "assistant" &&
 				len(messages[n-1].ToolCalls) > 0 &&
 				strings.TrimSpace(extractOpenAIMessageText(messages[n-1].Content)) == "" {
+				attachPendingReasoning(&messages[n-1])
 				messages[n-1].ToolCalls = append(messages[n-1].ToolCalls, tc)
 			} else {
-				messages = append(messages, OpenAIMessage{
+				msg := OpenAIMessage{
 					Role:      "assistant",
 					Content:   "",
 					ToolCalls: []ToolCall{tc},
-				})
+				}
+				attachPendingReasoning(&msg)
+				messages = append(messages, msg)
 			}
 
 		case typ == "input_text" || typ == "text":
+			flushPendingReasoning()
 			text, _ := obj["text"].(string)
 			if text != "" {
 				pendingUserParts = append(pendingUserParts, map[string]interface{}{
@@ -130,20 +168,32 @@ func convertResponsesInputItems(items []json.RawMessage) ([]OpenAIMessage, error
 			}
 
 		case typ == "input_image", typ == "image", typ == "image_url":
+			flushPendingReasoning()
 			pendingUserParts = append(pendingUserParts, map[string]interface{}(obj))
 
 		case typ == "output_text":
 			flushPendingUser()
 			text, _ := obj["text"].(string)
-			if text != "" {
-				messages = append(messages, OpenAIMessage{Role: "assistant", Content: text})
+			if text != "" || strings.TrimSpace(pendingReasoning) != "" {
+				msg := OpenAIMessage{Role: "assistant", Content: text}
+				attachPendingReasoning(&msg)
+				messages = append(messages, msg)
 			}
 
 		default:
 			if role != "" {
-				flushPendingUser()
+				if role == "assistant" {
+					flushPendingUser()
+				} else {
+					flushPendingReasoning()
+					flushPendingUser()
+				}
 				msg := buildMessageFromInputItem(obj, role)
+				if msg == nil && role == "assistant" && strings.TrimSpace(pendingReasoning) != "" {
+					msg = &OpenAIMessage{Role: "assistant", Content: ""}
+				}
 				if msg != nil {
+					attachPendingReasoning(msg)
 					messages = append(messages, *msg)
 				}
 			}
@@ -151,7 +201,48 @@ func convertResponsesInputItems(items []json.RawMessage) ([]OpenAIMessage, error
 	}
 
 	flushPendingUser()
+	flushPendingReasoning()
 	return messages, nil
+}
+
+func reasoningSummaryFromInputItem(obj map[string]interface{}) string {
+	summary, ok := obj["summary"]
+	if !ok {
+		return ""
+	}
+	if text, ok := summary.(string); ok {
+		return text
+	}
+
+	raw, err := json.Marshal(summary)
+	if err != nil {
+		return ""
+	}
+	var parts []ResponseSummaryPart
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return ""
+	}
+	return joinResponseSummaryParts(parts)
+}
+
+func joinResponseSummaryParts(parts []ResponseSummaryPart) string {
+	texts := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if (part.Type == "" || part.Type == "summary_text" || part.Type == "text") && strings.TrimSpace(part.Text) != "" {
+			texts = append(texts, part.Text)
+		}
+	}
+	return strings.Join(texts, "\n")
+}
+
+func appendResponsesReasoning(existing, additional string) string {
+	if strings.TrimSpace(additional) == "" {
+		return existing
+	}
+	if strings.TrimSpace(existing) == "" {
+		return additional
+	}
+	return existing + "\n" + additional
 }
 
 func buildMessageFromInputItem(obj map[string]interface{}, role string) *OpenAIMessage {

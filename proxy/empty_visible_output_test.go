@@ -346,6 +346,7 @@ func TestClaudeStreamMarkerRecoveryRetainsTerminalUsage(t *testing.T) {
 			return nil
 		}
 		callback.OnText(payload.AgentCompletionMarker+"recovered", false)
+		callback.OnStopReason("END_TURN")
 		return nil
 	})
 	rec := httptest.NewRecorder()

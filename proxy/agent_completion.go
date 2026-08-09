@@ -19,6 +19,7 @@ const (
 	agentRecoveryCurrentMaxBytes    = 24 << 10
 	agentRecoveryAggressiveMaxBytes = 8 << 10
 	agentRecoveryActionHintMaxBytes = 1 << 10
+	agentRecoveryAttemptMaxBytes    = 4 << 10
 	agentCompletionProbeSpaceBytes  = 64
 	agentRecoveryBytesPerToken      = 3
 	agentRecoveryTokenReserve       = 8 << 10
@@ -78,6 +79,38 @@ The previous response ended without either the completion marker or a structured
 </agent_retry>`, marker)
 }
 
+func forcedToolChoiceRetryInstruction(mode, selected string) string {
+	return forcedToolChoiceRetryInstructionWithName(mode, shortenToolName(sanitizeToolName(selected)))
+}
+
+func forcedToolChoiceRetryInstructionWithName(mode, selected string) string {
+	if mode != "required" && mode != "specific" {
+		return ""
+	}
+	instruction := `<forced_tool_choice_retry>
+The previous response ended without satisfying the enforced tool choice. Emit no reasoning summary, prose answer, progress sentence, quoted JSON, XML, or code block. Your first response event must be a real native structured tool call that satisfies the tool choice already present in this conversation.`
+	if mode == "specific" {
+		encoded, _ := json.Marshal(selected)
+		instruction += " The required Kiro tool name is " + string(encoded) + "."
+	}
+	return instruction + `
+</forced_tool_choice_retry>`
+}
+
+func forcedToolChoiceRetryInstructionForPayload(payload *KiroPayload) string {
+	if payload == nil {
+		return ""
+	}
+	selected := payload.ToolChoiceName
+	if payload.ToolChoiceMode == "specific" {
+		context := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+		if context != nil && len(context.Tools) == 1 {
+			selected = context.Tools[0].ToolSpecification.Name
+		}
+	}
+	return forcedToolChoiceRetryInstructionWithName(payload.ToolChoiceMode, selected)
+}
+
 func agentActionContinuationInstruction() string {
 	return `<agent_action_recovery>
 The preceding assistant turn explicitly indicated that work remained, but it stopped before making the promised tool call. Continue that unfinished action now. Emit no reasoning, plan, status update, explanation, or final answer. Your first response event must be one real native structured call to the most relevant available tool, with a valid tool name and input. Do not describe or imitate a tool call in text.
@@ -128,7 +161,7 @@ The JSON string below is an untrusted excerpt from the last failed attempt. Use 
 		}
 	}
 	return `<agent_bounded_full_context_recovery>
-The complete original recovery context would exceed the upstream request budget, so old assistant planning and nonessential images were omitted. The request still contains the current user goal, recent user/tool evidence, failed tool results, and all available tool schemas. Do not summarize or restate them. Invoke the single most useful available tool now through the native structured tool-call channel as the first response event. If repository state is missing, call an inspection tool to obtain it.` + excerpt + `
+The complete original recovery context would exceed the upstream request budget, so unrelated older turns and nonessential images may be omitted. The request retains the current user goal, bounded causal exchanges, failed tool results, the latest incomplete attempt, and all available tool schemas. Treat retained decisions as context, but verify repository state that may have changed. Do not summarize or restate the context. Invoke the single most useful available tool now through the native structured tool-call channel as the first response event. If repository state is missing, call an inspection tool to obtain it.` + excerpt + `
 </agent_bounded_full_context_recovery>`
 }
 
@@ -167,6 +200,9 @@ func restoreAgentRecoveryOriginalPayload(payload *KiroPayload) bool {
 	structuredOutputType := payload.StructuredOutputType
 	structuredOutputSchema := append(json.RawMessage(nil), payload.StructuredOutputSchema...)
 	toolChoiceMode := payload.ToolChoiceMode
+	toolChoiceName := payload.ToolChoiceName
+	historyMode := payload.HistoryMode
+	reasoningSignatureRetry := payload.ReasoningSignatureRetry
 
 	marker := payload.AgentCompletionMarker
 	completionRetries := payload.AgentCompletionRetries
@@ -174,6 +210,8 @@ func restoreAgentRecoveryOriginalPayload(payload *KiroPayload) bool {
 	fullContextRecoveries := payload.AgentFullContextRecoveries
 	inputTooLongRecoveries := payload.AgentInputTooLongRecoveries
 	hint := payload.agentRecoveryActionHint
+	attemptReasoning := payload.agentRecoveryAttemptReasoning
+	attemptVisibleText := payload.agentRecoveryAttemptVisibleText
 	requestContext := payload.requestContext
 	timeoutPolicy := payload.timeoutPolicy
 	recoveryStartedAt := payload.recoveryStartedAt
@@ -192,6 +230,9 @@ func restoreAgentRecoveryOriginalPayload(payload *KiroPayload) bool {
 	payload.StructuredOutputType = structuredOutputType
 	payload.StructuredOutputSchema = structuredOutputSchema
 	payload.ToolChoiceMode = toolChoiceMode
+	payload.ToolChoiceName = toolChoiceName
+	payload.HistoryMode = historyMode
+	payload.ReasoningSignatureRetry = reasoningSignatureRetry
 	payload.AgentCompletionMarker = marker
 	payload.AgentCompletionRetries = completionRetries
 	payload.AgentActionContinuations = actionContinuations
@@ -200,6 +241,8 @@ func restoreAgentRecoveryOriginalPayload(payload *KiroPayload) bool {
 	payload.AgentRecoveryCompacted = false
 	payload.AgentRecoveryAggressive = false
 	payload.agentRecoveryActionHint = hint
+	payload.agentRecoveryAttemptReasoning = attemptReasoning
+	payload.agentRecoveryAttemptVisibleText = attemptVisibleText
 	payload.agentRecoveryOriginalPayload = snapshot
 	payload.requestContext = requestContext
 	payload.timeoutPolicy = timeoutPolicy
@@ -290,6 +333,51 @@ func appendAgentRecoveryActionHint(payload *KiroPayload, text string) {
 	)
 }
 
+func agentRecoveryVisibleAttempt(payload *KiroPayload) string {
+	if payload == nil {
+		return ""
+	}
+	visible := payload.agentRecoveryAttemptVisibleText
+	if payload.AgentCompletionMarker != "" {
+		filtered, _ := stripAgentCompletionMarker(visible, payload.AgentCompletionMarker)
+		visible = filtered
+		candidate := strings.TrimLeftFunc(visible, unicode.IsSpace)
+		if candidate != "" && strings.HasPrefix(payload.AgentCompletionMarker, candidate) {
+			visible = ""
+		}
+	}
+	return strings.TrimSpace(stripAgentToolTranscriptPollution(visible))
+}
+
+func refreshAgentRecoveryActionHint(payload *KiroPayload) {
+	if payload == nil {
+		return
+	}
+	hint := agentRecoveryVisibleAttempt(payload)
+	if hint == "" {
+		hint = strings.TrimSpace(payload.agentRecoveryAttemptReasoning)
+	}
+	payload.agentRecoveryActionHint = utf8Tail(hint, agentRecoveryActionHintMaxBytes)
+}
+
+func appendAgentRecoveryAttempt(payload *KiroPayload, text string, reasoning bool) {
+	if payload == nil || text == "" {
+		return
+	}
+	if reasoning {
+		payload.agentRecoveryAttemptReasoning = utf8Tail(
+			payload.agentRecoveryAttemptReasoning+text,
+			agentRecoveryAttemptMaxBytes,
+		)
+	} else {
+		payload.agentRecoveryAttemptVisibleText = utf8Tail(
+			payload.agentRecoveryAttemptVisibleText+text,
+			agentRecoveryAttemptMaxBytes,
+		)
+	}
+	refreshAgentRecoveryActionHint(payload)
+}
+
 func captureAgentRecoveryActionHint(payload *KiroPayload, callback *KiroStreamCallback) *KiroStreamCallback {
 	if payload == nil || payload.AgentCompletionMarker == "" {
 		return callback
@@ -301,7 +389,7 @@ func captureAgentRecoveryActionHint(payload *KiroPayload, callback *KiroStreamCa
 	originalOnText := callback.OnText
 	originalOnReasoning := callback.OnReasoning
 	attemptOutputStarted := false
-	appendAttemptHint := func(text string) {
+	appendAttempt := func(text string, reasoning bool) {
 		if text == "" {
 			return
 		}
@@ -310,13 +398,15 @@ func captureAgentRecoveryActionHint(payload *KiroPayload, callback *KiroStreamCa
 		// only after this attempt actually emits text or reasoning.
 		if !attemptOutputStarted {
 			payload.agentRecoveryActionHint = ""
+			payload.agentRecoveryAttemptReasoning = ""
+			payload.agentRecoveryAttemptVisibleText = ""
 			attemptOutputStarted = true
 		}
-		appendAgentRecoveryActionHint(payload, text)
+		appendAgentRecoveryAttempt(payload, text, reasoning)
 	}
 	wrapped := *callback
 	wrapped.OnText = func(text string, isThinking bool) {
-		appendAttemptHint(text)
+		appendAttempt(text, isThinking)
 		if originalOnText != nil {
 			originalOnText(text, isThinking)
 		}
@@ -325,11 +415,43 @@ func captureAgentRecoveryActionHint(payload *KiroPayload, callback *KiroStreamCa
 	// then preserves its legacy fallback to OnText(text, true).
 	if originalOnReasoning != nil {
 		wrapped.OnReasoning = func(event KiroReasoningContentEvent) {
-			appendAttemptHint(event.Text)
+			appendAttempt(event.Text, true)
 			originalOnReasoning(event)
 		}
 	}
 	return &wrapped
+}
+
+type agentRecoveryAttemptEvidence struct {
+	State            string `json:"state"`
+	ReasoningExcerpt string `json:"reasoning_excerpt,omitempty"`
+	VisibleExcerpt   string `json:"visible_text_excerpt,omitempty"`
+}
+
+func agentRecoveryAttemptEvidenceJSON(payload *KiroPayload) string {
+	if payload == nil {
+		return ""
+	}
+	reasoning := strings.TrimSpace(payload.agentRecoveryAttemptReasoning)
+	visible := agentRecoveryVisibleAttempt(payload)
+	if reasoning == "" && visible == "" && strings.TrimSpace(payload.agentRecoveryActionHint) != "" {
+		// Preserve manually seeded and pre-upgrade recovery state as visible
+		// diagnostic text; live stream capture always populates split buffers.
+		visible = strings.TrimSpace(stripAgentToolTranscriptPollution(payload.agentRecoveryActionHint))
+	}
+	if reasoning == "" && visible == "" {
+		return ""
+	}
+	evidence := agentRecoveryAttemptEvidence{
+		State:            "incomplete",
+		ReasoningExcerpt: utf8Tail(reasoning, agentRecoveryAttemptMaxBytes),
+		VisibleExcerpt:   utf8Tail(visible, agentRecoveryAttemptMaxBytes),
+	}
+	wire, err := json.Marshal(evidence)
+	if err != nil {
+		return ""
+	}
+	return string(wire)
 }
 
 func agentRecoveryActionHintInstruction(hint string) string {
@@ -374,6 +496,16 @@ func advanceAgentRecoveryTurn(payload *KiroPayload) {
 	}
 
 	current := &payload.ConversationState.CurrentMessage.UserInputMessage
+	attemptEvidence := agentRecoveryAttemptEvidenceJSON(payload)
+	visibleAttempt := agentRecoveryVisibleAttempt(payload)
+	if visibleAttempt == "" && (payload.agentRecoveryAttemptReasoning != "" || attemptEvidence == "") {
+		// A hidden reasoning-only attempt produced no assistant turn. Keep the
+		// original user/tool-result turn current so its causal adjacency remains
+		// intact, and attach the retry instruction to that same turn below.
+		payload.ConversationState.AgentContinuationId = uuid.NewString()
+		payload.agentRecoveryInjectedActionHint = ""
+		return
+	}
 	priorUser := *current
 	var tools []KiroToolWrapper
 	if current.UserInputMessageContext != nil {
@@ -394,12 +526,11 @@ func advanceAgentRecoveryTurn(payload *KiroPayload) {
 		UserInputMessage: &priorUser,
 	})
 
-	attemptExcerpt := strings.TrimSpace(stripAgentToolTranscriptPollution(payload.agentRecoveryActionHint))
-	if attemptExcerpt == "" {
-		attemptExcerpt = "The previous attempt ended before producing a final answer or a structured tool call."
+	if attemptEvidence == "" {
+		attemptEvidence = `{"state":"incomplete"}`
 	}
 	payload.ConversationState.History = append(payload.ConversationState.History, KiroHistoryMessage{
-		AssistantResponseMessage: &KiroAssistantResponseMessage{Content: attemptExcerpt},
+		AssistantResponseMessage: &KiroAssistantResponseMessage{Content: `<incomplete_assistant_attempt encoding="json">` + attemptEvidence + `</incomplete_assistant_attempt>`},
 	})
 
 	current.Content = ""
@@ -442,29 +573,49 @@ func compactAgentRecoveryPayload(payload *KiroPayload, force, aggressive bool) b
 
 	current := &payload.ConversationState.CurrentMessage.UserInputMessage
 	sourceCurrent := &source.ConversationState.CurrentMessage.UserInputMessage
-	recentEvidence := collectAgentRecoveryEvidence(source.ConversationState.History, limit)
+	evidenceHistory := append([]KiroHistoryMessage(nil), source.ConversationState.History...)
+	if sourceCurrent.UserInputMessageContext != nil && len(sourceCurrent.UserInputMessageContext.ToolResults) > 0 {
+		currentEvidence := *sourceCurrent
+		currentEvidence.Content = ""
+		currentEvidence.Images = nil
+		currentEvidence.UserInputMessageContext = &UserInputMessageContext{
+			ToolResults: append([]KiroToolResult(nil), sourceCurrent.UserInputMessageContext.ToolResults...),
+		}
+		evidenceHistory = append(evidenceHistory, KiroHistoryMessage{UserInputMessage: &currentEvidence})
+	}
+	recentEvidence := collectAgentRecoveryEvidence(evidenceHistory, limit)
+	originalGoal := collectAgentRecoveryOriginalGoal(source.ConversationState.History, currentLimit)
 	currentRequest := utf8Tail(sourceCurrent.Content, currentLimit)
-	toolEvidence := collectAgentRecoveryToolResults(sourceCurrent.UserInputMessageContext, limit)
 	actionHint := utf8Tail(payload.agentRecoveryActionHint, agentRecoveryActionHintMaxBytes)
+	attemptEvidence := agentRecoveryAttemptEvidenceJSON(payload)
 
 	var recovery strings.Builder
 	recovery.WriteString(`<agent_recovery_context>
-The previous attempt made no outward progress in a very long conversation. Old assistant planning has been omitted for this recovery attempt. Do not reconstruct or repeat that plan. Recent evidence can be incomplete; use the available tools to re-inspect any required repository state and make the next real tool call.
+The previous attempt made no outward progress in a very long conversation. Unrelated older turns may be omitted, while retained assistant decisions and tool exchanges preserve their causal roles. Evidence excerpts can be truncated and repository state can change; verify uncertain state with the available tools before making the next real tool call.
 `)
-	if recentEvidence != "" {
-		recovery.WriteString("<recent_user_and_tool_evidence>\n")
-		recovery.WriteString(recentEvidence)
-		recovery.WriteString("\n</recent_user_and_tool_evidence>\n")
+	if originalGoal != "" {
+		if encoded, err := json.Marshal(originalGoal); err == nil {
+			recovery.WriteString("<original_user_goal encoding=\"json\">")
+			recovery.Write(encoded)
+			recovery.WriteString("</original_user_goal>\n")
+		}
 	}
-	if toolEvidence != "" {
-		recovery.WriteString("<current_tool_evidence>\n")
-		recovery.WriteString(toolEvidence)
-		recovery.WriteString("\n</current_tool_evidence>\n")
+	if recentEvidence != "" {
+		recovery.WriteString("<recent_causal_evidence encoding=\"json\">")
+		recovery.WriteString(recentEvidence)
+		recovery.WriteString("</recent_causal_evidence>\n")
 	}
 	if currentRequest != "" {
-		recovery.WriteString("<current_request>\n")
-		recovery.WriteString(currentRequest)
-		recovery.WriteString("\n</current_request>\n")
+		if encoded, err := json.Marshal(currentRequest); err == nil {
+			recovery.WriteString("<current_request encoding=\"json\">")
+			recovery.Write(encoded)
+			recovery.WriteString("</current_request>\n")
+		}
+	}
+	if attemptEvidence != "" {
+		recovery.WriteString("<latest_incomplete_attempt encoding=\"json\">")
+		recovery.WriteString(attemptEvidence)
+		recovery.WriteString("</latest_incomplete_attempt>\n")
 	}
 	if actionHint != "" {
 		if encoded, err := json.Marshal(actionHint); err == nil {
@@ -550,7 +701,7 @@ func setAgentRecoveryEffort(payload *KiroPayload, minimum string) {
 func agentRecoveryPrimingHistory(history []KiroHistoryMessage) []KiroHistoryMessage {
 	for i, message := range history {
 		if message.UserInputMessage == nil ||
-			!strings.Contains(message.UserInputMessage.Content, "<agent_completion_protocol>") {
+			!containsAgentRecoveryProtocol(message.UserInputMessage.Content) {
 			continue
 		}
 		end := i + 1
@@ -562,40 +713,241 @@ func agentRecoveryPrimingHistory(history []KiroHistoryMessage) []KiroHistoryMess
 	return nil
 }
 
-func collectAgentRecoveryEvidence(history []KiroHistoryMessage, limit int) string {
-	if limit <= 0 {
-		return ""
+type agentRecoveryCausalToolUse struct {
+	ToolUseID        string `json:"tool_use_id"`
+	Name             string `json:"name"`
+	InputJSONExcerpt string `json:"input_json_excerpt,omitempty"`
+}
+
+type agentRecoveryCausalToolResult struct {
+	ToolUseID     string `json:"tool_use_id"`
+	Status        string `json:"status,omitempty"`
+	OutputExcerpt string `json:"output_excerpt,omitempty"`
+}
+
+type agentRecoveryCausalMessage struct {
+	Role        string                          `json:"role"`
+	Content     string                          `json:"content_excerpt,omitempty"`
+	ToolUses    []agentRecoveryCausalToolUse    `json:"tool_uses,omitempty"`
+	ToolResults []agentRecoveryCausalToolResult `json:"tool_results,omitempty"`
+}
+
+type agentRecoveryCausalUnit struct {
+	Pairing  string                       `json:"pairing"`
+	Messages []agentRecoveryCausalMessage `json:"messages"`
+}
+
+func agentRecoveryAssistantEvidence(message *KiroAssistantResponseMessage) agentRecoveryCausalMessage {
+	evidence := agentRecoveryCausalMessage{Role: "assistant"}
+	if message == nil {
+		return evidence
 	}
-	parts := make([]string, 0, 4)
-	remaining := limit
-	for i := len(history) - 1; i >= 0 && remaining > 0; i-- {
-		message := history[i].UserInputMessage
-		if message == nil || strings.Contains(message.Content, "<agent_completion_protocol>") {
-			continue
+	evidence.Content = strings.TrimSpace(message.Content)
+	for _, use := range message.ToolUses {
+		input, err := json.Marshal(use.Input)
+		if err != nil {
+			input = []byte("(unserializable input)")
 		}
-		text := strings.TrimSpace(message.Content)
-		if message.UserInputMessageContext != nil {
-			toolText := collectAgentRecoveryToolResults(message.UserInputMessageContext, remaining)
-			if toolText != "" {
-				textBudget := remaining - len(toolText)
-				if text != "" && textBudget > 2 {
-					text = joinHistoryText(utf8Tail(text, textBudget-2), toolText)
-				} else {
-					text = toolText
-				}
+		evidence.ToolUses = append(evidence.ToolUses, agentRecoveryCausalToolUse{
+			ToolUseID:        use.ToolUseID,
+			Name:             use.Name,
+			InputJSONExcerpt: string(input),
+		})
+	}
+	return evidence
+}
+
+func agentRecoveryUserEvidence(message *KiroUserInputMessage) agentRecoveryCausalMessage {
+	evidence := agentRecoveryCausalMessage{Role: "user"}
+	if message == nil {
+		return evidence
+	}
+	evidence.Content = strings.TrimSpace(message.Content)
+	if message.UserInputMessageContext == nil {
+		return evidence
+	}
+	for _, result := range message.UserInputMessageContext.ToolResults {
+		texts := make([]string, 0, len(result.Content))
+		for _, content := range result.Content {
+			if text := strings.TrimSpace(content.Text); text != "" {
+				texts = append(texts, text)
 			}
 		}
-		if text == "" {
+		evidence.ToolResults = append(evidence.ToolResults, agentRecoveryCausalToolResult{
+			ToolUseID:     result.ToolUseID,
+			Status:        result.Status,
+			OutputExcerpt: strings.Join(texts, "\n"),
+		})
+	}
+	return evidence
+}
+
+func agentRecoveryToolPairing(uses []agentRecoveryCausalToolUse, results []agentRecoveryCausalToolResult) string {
+	if len(uses) == 0 && len(results) == 0 {
+		return "message"
+	}
+	if len(uses) == 0 {
+		return "orphan_tool_result"
+	}
+	if len(results) == 0 {
+		return "unanswered_tool_use"
+	}
+	if len(uses) != len(results) {
+		return "partial_tool_exchange"
+	}
+	ids := make(map[string]bool, len(uses))
+	for _, use := range uses {
+		if use.ToolUseID == "" || ids[use.ToolUseID] {
+			return "ambiguous_tool_exchange"
+		}
+		ids[use.ToolUseID] = true
+	}
+	seen := make(map[string]bool, len(results))
+	for _, result := range results {
+		if result.ToolUseID == "" || seen[result.ToolUseID] || !ids[result.ToolUseID] {
+			return "partial_tool_exchange"
+		}
+		seen[result.ToolUseID] = true
+	}
+	return "complete_tool_exchange"
+}
+
+func buildAgentRecoveryCausalUnits(history []KiroHistoryMessage) []agentRecoveryCausalUnit {
+	units := make([]agentRecoveryCausalUnit, 0, len(history))
+	for i := 0; i < len(history); i++ {
+		message := history[i]
+		if message.UserInputMessage != nil && containsAgentRecoveryProtocol(message.UserInputMessage.Content) {
+			if i+1 < len(history) && history[i+1].AssistantResponseMessage != nil {
+				i++
+			}
 			continue
 		}
-		part := utf8Tail(text, remaining)
-		parts = append(parts, part)
-		remaining -= len(part)
+		if assistant := message.AssistantResponseMessage; assistant != nil {
+			assistantEvidence := agentRecoveryAssistantEvidence(assistant)
+			unit := agentRecoveryCausalUnit{Messages: []agentRecoveryCausalMessage{assistantEvidence}}
+			if len(assistantEvidence.ToolUses) > 0 && i+1 < len(history) {
+				next := history[i+1].UserInputMessage
+				if next != nil && next.UserInputMessageContext != nil && len(next.UserInputMessageContext.ToolResults) > 0 {
+					userEvidence := agentRecoveryUserEvidence(next)
+					unit.Messages = append(unit.Messages, userEvidence)
+					unit.Pairing = agentRecoveryToolPairing(assistantEvidence.ToolUses, userEvidence.ToolResults)
+					i++
+				}
+			}
+			if unit.Pairing == "" {
+				unit.Pairing = agentRecoveryToolPairing(assistantEvidence.ToolUses, nil)
+			}
+			units = append(units, unit)
+			continue
+		}
+		if user := message.UserInputMessage; user != nil {
+			userEvidence := agentRecoveryUserEvidence(user)
+			units = append(units, agentRecoveryCausalUnit{
+				Pairing:  agentRecoveryToolPairing(nil, userEvidence.ToolResults),
+				Messages: []agentRecoveryCausalMessage{userEvidence},
+			})
+		}
+	}
+	return units
+}
+
+func boundAgentRecoveryCausalUnit(unit agentRecoveryCausalUnit, fieldLimit int) agentRecoveryCausalUnit {
+	bounded := unit
+	bounded.Messages = make([]agentRecoveryCausalMessage, len(unit.Messages))
+	for i, message := range unit.Messages {
+		bounded.Messages[i] = message
+		bounded.Messages[i].Content = utf8Tail(message.Content, fieldLimit)
+		bounded.Messages[i].ToolUses = append([]agentRecoveryCausalToolUse(nil), message.ToolUses...)
+		for j := range bounded.Messages[i].ToolUses {
+			bounded.Messages[i].ToolUses[j].InputJSONExcerpt = utf8Tail(
+				bounded.Messages[i].ToolUses[j].InputJSONExcerpt,
+				fieldLimit,
+			)
+		}
+		bounded.Messages[i].ToolResults = append([]agentRecoveryCausalToolResult(nil), message.ToolResults...)
+		for j := range bounded.Messages[i].ToolResults {
+			bounded.Messages[i].ToolResults[j].OutputExcerpt = utf8Tail(
+				bounded.Messages[i].ToolResults[j].OutputExcerpt,
+				fieldLimit,
+			)
+		}
+	}
+	return bounded
+}
+
+func marshalAgentRecoveryCausalUnit(unit agentRecoveryCausalUnit, budget int) []byte {
+	if budget <= 0 {
+		return nil
+	}
+	fieldLimit := agentRecoveryAttemptMaxBytes
+	if fieldLimit > budget/2 {
+		fieldLimit = budget / 2
+	}
+	for fieldLimit >= 64 {
+		wire, err := json.Marshal(boundAgentRecoveryCausalUnit(unit, fieldLimit))
+		if err == nil && len(wire) <= budget {
+			return wire
+		}
+		fieldLimit /= 2
+	}
+	minimal := boundAgentRecoveryCausalUnit(unit, 0)
+	wire, err := json.Marshal(minimal)
+	if err != nil || len(wire) > budget {
+		return nil
+	}
+	return wire
+}
+
+func collectAgentRecoveryEvidence(history []KiroHistoryMessage, limit int) string {
+	if limit < 2 {
+		return ""
+	}
+	units := buildAgentRecoveryCausalUnits(history)
+	parts := make([]string, 0, len(units))
+	remaining := limit - 2 // JSON array brackets.
+	for i := len(units) - 1; i >= 0 && remaining > 0; i-- {
+		separator := 0
+		if len(parts) > 0 {
+			separator = 1
+		}
+		wire := marshalAgentRecoveryCausalUnit(units[i], remaining-separator)
+		if len(wire) == 0 {
+			break
+		}
+		parts = append(parts, string(wire))
+		remaining -= separator + len(wire)
 	}
 	for left, right := 0, len(parts)-1; left < right; left, right = left+1, right-1 {
 		parts[left], parts[right] = parts[right], parts[left]
 	}
-	return strings.Join(parts, "\n\n")
+	if len(parts) == 0 {
+		return ""
+	}
+	return "[" + strings.Join(parts, ",") + "]"
+}
+
+func collectAgentRecoveryOriginalGoal(history []KiroHistoryMessage, limit int) string {
+	for _, message := range history {
+		if message.UserInputMessage == nil || containsAgentRecoveryProtocol(message.UserInputMessage.Content) {
+			continue
+		}
+		if content := strings.TrimSpace(message.UserInputMessage.Content); content != "" {
+			if len(content) <= limit {
+				return content
+			}
+			end := limit
+			for end > 0 && !utf8.ValidString(content[:end]) {
+				end--
+			}
+			return content[:end]
+		}
+	}
+	return ""
+}
+
+func containsAgentRecoveryProtocol(content string) bool {
+	return strings.Contains(content, "<agent_completion_protocol>") ||
+		strings.Contains(content, "<forced_tool_choice_completion_protocol>")
 }
 
 func collectAgentRecoveryToolResults(context *UserInputMessageContext, limit int) string {
@@ -692,15 +1044,20 @@ func stripAgentToolTranscriptPollution(content string) string {
 }
 
 // agentCompletionGate buffers only enough leading text to recognize and strip
-// a split completion marker. Once the prefix cannot be a marker, ordinary
-// assistant text streams immediately and retains the upstream
-// reasoning -> text -> tool order.
+// a split completion marker. Forced tool choices hold all assistant prose until
+// a completed tool call either validates the turn or causes the prose to be
+// discarded; auto-mode text streams once it cannot be a marker.
 type agentCompletionGate struct {
-	marker     string
-	pending    strings.Builder
-	visible    strings.Builder
-	marked     bool
-	mismatched bool
+	marker           string
+	forcedToolChoice bool
+	pending          strings.Builder
+	visible          strings.Builder
+	marked           bool
+	mismatched       bool
+	serializedTools  map[string]bool
+	serializedProbe  strings.Builder
+	serializedCall   bool
+	serializedDone   bool
 }
 
 func newAgentCompletionGate(marker string) *agentCompletionGate {
@@ -712,23 +1069,154 @@ func newAgentCompletionGateForPayload(payload *KiroPayload) *agentCompletionGate
 	if payload != nil {
 		marker = payload.AgentCompletionMarker
 	}
-	return newAgentCompletionGate(marker)
+	gate := newAgentCompletionGate(marker)
+	gate.forcedToolChoice = forcedToolChoiceMode(payload)
+	if marker != "" {
+		gate.serializedTools = kiroPayloadAllowedToolNames(payload)
+	}
+	return gate
+}
+
+const serializedToolCallProbeMaxBytes = 512
+
+var (
+	serializedInvokeTagPattern    = regexp.MustCompile(`(?is)^<invoke[\t\r\n ]+[^>]*\bname[\t\r\n ]*=[\t\r\n ]*["']([^"']+)["'][^>]*>`)
+	serializedParameterTagPattern = regexp.MustCompile(`(?is)^<parameter[\t\r\n ]+[^>]*\bname[\t\r\n ]*=[\t\r\n ]*["'][^"']+["'][^>]*>`)
+)
+
+func allowedSerializedToolName(allowed map[string]bool, name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" || len(allowed) == 0 {
+		return false
+	}
+	for candidate := range allowed {
+		if strings.EqualFold(strings.TrimSpace(candidate), name) {
+			return true
+		}
+	}
+	return false
+}
+
+// classifySerializedToolCallPrefix recognizes only a top-level legacy Kiro
+// tool carrier for one of the request's declared tools. It deliberately does
+// not scan prose or fenced examples for generic XML-looking text.
+func classifySerializedToolCallPrefix(content string, allowed map[string]bool) agentCompletionPrefixState {
+	if len(allowed) == 0 {
+		return agentCompletionPrefixMismatch
+	}
+	trimmed := strings.TrimLeftFunc(content, unicode.IsSpace)
+	if trimmed == "" {
+		return agentCompletionPrefixPending
+	}
+
+	const invokePrefix = "<invoke"
+	lower := strings.ToLower(trimmed)
+	if len(lower) < len(invokePrefix) {
+		if strings.HasPrefix(invokePrefix, lower) {
+			return agentCompletionPrefixPending
+		}
+		return agentCompletionPrefixMismatch
+	}
+	if !strings.HasPrefix(lower, invokePrefix) {
+		return agentCompletionPrefixMismatch
+	}
+	if len(trimmed) > serializedToolCallProbeMaxBytes && !strings.Contains(trimmed[:serializedToolCallProbeMaxBytes], ">") {
+		return agentCompletionPrefixMismatch
+	}
+
+	invokeTag := serializedInvokeTagPattern.FindStringSubmatch(trimmed)
+	if len(invokeTag) == 0 {
+		if !strings.Contains(trimmed, ">") && len(trimmed) <= serializedToolCallProbeMaxBytes {
+			return agentCompletionPrefixPending
+		}
+		return agentCompletionPrefixMismatch
+	}
+	if !allowedSerializedToolName(allowed, invokeTag[1]) {
+		return agentCompletionPrefixMismatch
+	}
+
+	rest := strings.TrimLeftFunc(trimmed[len(invokeTag[0]):], unicode.IsSpace)
+	if rest == "" {
+		return agentCompletionPrefixPending
+	}
+	lowerRest := strings.ToLower(rest)
+	const parameterPrefix = "<parameter"
+	if strings.HasPrefix(lowerRest, "</invoke>") {
+		return agentCompletionPrefixComplete
+	}
+	if len(lowerRest) < len(parameterPrefix) {
+		if strings.HasPrefix(parameterPrefix, lowerRest) {
+			return agentCompletionPrefixPending
+		}
+		return agentCompletionPrefixMismatch
+	}
+	if !strings.HasPrefix(lowerRest, parameterPrefix) {
+		return agentCompletionPrefixMismatch
+	}
+	if serializedParameterTagPattern.MatchString(rest) {
+		return agentCompletionPrefixComplete
+	}
+	if !strings.Contains(rest, ">") && len(trimmed) <= serializedToolCallProbeMaxBytes {
+		return agentCompletionPrefixPending
+	}
+	return agentCompletionPrefixMismatch
+}
+
+func looksLikeSerializedAgentToolCall(payload *KiroPayload, content string) bool {
+	return classifySerializedToolCallPrefix(content, kiroPayloadAllowedToolNames(payload)) == agentCompletionPrefixComplete
+}
+
+func (g *agentCompletionGate) pushVisible(text string) string {
+	if text == "" {
+		return ""
+	}
+	if len(g.serializedTools) == 0 || g.serializedDone {
+		g.visible.WriteString(text)
+		return text
+	}
+	if g.serializedCall {
+		g.visible.WriteString(text)
+		return ""
+	}
+
+	g.serializedProbe.WriteString(text)
+	probe := g.serializedProbe.String()
+	switch classifySerializedToolCallPrefix(probe, g.serializedTools) {
+	case agentCompletionPrefixPending:
+		return ""
+	case agentCompletionPrefixComplete:
+		g.serializedCall = true
+		g.visible.WriteString(probe)
+		g.serializedProbe.Reset()
+		return ""
+	default:
+		g.serializedDone = true
+		g.serializedProbe.Reset()
+		g.visible.WriteString(probe)
+		return probe
+	}
 }
 
 func (g *agentCompletionGate) Push(text string) string {
 	if text == "" {
 		return ""
 	}
-	if g == nil || g.marker == "" {
+	if g == nil {
+		return text
+	}
+	if g.forcedToolChoice {
+		g.pending.WriteString(text)
+		g.visible.WriteString(text)
+		return ""
+	}
+	if g.marker == "" {
 		return text
 	}
 	if g.marked {
-		g.visible.WriteString(text)
-		return text
+		return g.pushVisible(text)
 	}
 	if g.mismatched {
-		g.visible.WriteString(text)
-		return text
+		return g.pushVisible(text)
 	}
 
 	g.pending.WriteString(text)
@@ -738,8 +1226,7 @@ func (g *agentCompletionGate) Push(text string) string {
 	case agentCompletionPrefixMismatch:
 		g.mismatched = true
 		g.pending.Reset()
-		g.visible.WriteString(pending)
-		return stripPollutedToolCallText(pending)
+		return stripPollutedToolCallText(g.pushVisible(pending))
 	case agentCompletionPrefixPending:
 		// A real marker needs at most marker bytes plus this small allowance for
 		// leading formatting whitespace. A larger probe is ordinary unmarked
@@ -747,8 +1234,7 @@ func (g *agentCompletionGate) Push(text string) string {
 		if len(pending) > len(g.marker)+agentCompletionProbeSpaceBytes {
 			g.mismatched = true
 			g.pending.Reset()
-			g.visible.WriteString(pending)
-			return pending
+			return g.pushVisible(pending)
 		}
 		return ""
 	}
@@ -756,8 +1242,7 @@ func (g *agentCompletionGate) Push(text string) string {
 	g.marked = true
 	released := strings.TrimLeftFunc(candidate[len(g.marker):], unicode.IsSpace)
 	g.pending.Reset()
-	g.visible.WriteString(released)
-	return released
+	return g.pushVisible(released)
 }
 
 func (g *agentCompletionGate) Marked() bool {
@@ -779,6 +1264,17 @@ func (g *agentCompletionGate) VisibleText() string {
 // already streamed as soon as it diverged from the marker, so this method never
 // replays a buffered narration block ahead of the tool event.
 func (g *agentCompletionGate) CommitPendingForTool() string {
+	if g != nil && (g.serializedCall || g.serializedProbe.Len() > 0) {
+		g.serializedProbe.Reset()
+		g.visible.Reset()
+		g.serializedCall = false
+		g.serializedDone = true
+	}
+	if g != nil && g.forcedToolChoice {
+		g.pending.Reset()
+		g.visible.Reset()
+		return ""
+	}
 	if g != nil && !g.marked {
 		g.pending.Reset()
 	}
@@ -788,6 +1284,18 @@ func (g *agentCompletionGate) CommitPendingForTool() string {
 // CommitPendingForTerminal discards unvalidated narration and unfinished
 // marker prefixes. A marked final answer was already released by Push.
 func (g *agentCompletionGate) CommitPendingForTerminal() string {
+	if g != nil && (g.serializedCall || g.serializedProbe.Len() > 0) {
+		g.serializedProbe.Reset()
+		g.visible.Reset()
+		g.serializedCall = false
+		g.serializedDone = true
+		return ""
+	}
+	if g != nil && g.forcedToolChoice {
+		g.pending.Reset()
+		g.visible.Reset()
+		return ""
+	}
 	if g != nil && !g.marked {
 		g.pending.Reset()
 	}
@@ -795,6 +1303,17 @@ func (g *agentCompletionGate) CommitPendingForTerminal() string {
 }
 
 func (g *agentCompletionGate) DiscardPending() {
+	if g != nil && (g.serializedCall || g.serializedProbe.Len() > 0) {
+		g.serializedProbe.Reset()
+		g.visible.Reset()
+		g.serializedCall = false
+		g.serializedDone = true
+	}
+	if g != nil && g.forcedToolChoice {
+		g.pending.Reset()
+		g.visible.Reset()
+		return
+	}
 	if g != nil && !g.marked {
 		g.pending.Reset()
 	}
@@ -813,33 +1332,138 @@ func stripAgentCompletionMarker(content, marker string) (string, bool) {
 }
 
 func filterAgentCompletionContent(payload *KiroPayload, content string, toolCount int) (string, bool) {
-	if payload == nil || payload.AgentCompletionMarker == "" {
+	if payload == nil {
+		return content, false
+	}
+	if payload.AgentCompletionMarker == "" {
+		if toolCount > 0 && forcedToolChoiceMode(payload) {
+			return "", false
+		}
 		return content, false
 	}
 	filtered, marked := stripAgentCompletionMarker(content, payload.AgentCompletionMarker)
 	if toolCount > 0 {
+		if forcedToolChoiceMode(payload) {
+			return "", marked
+		}
 		filtered = stripPollutedToolCallText(filtered)
 	}
 	return filtered, marked
 }
 
-func agentCompletionResponseError(payload *KiroPayload, reasoningObserved bool, visibleContent string, markerSeen bool, toolCount int, stopReason string) error {
+func agentCompletionResponseError(payload *KiroPayload, reasoningObserved bool, visibleContent string, markerSeen bool, completedToolNames []string, stopReason string) error {
 	_ = reasoningObserved
-	if payload == nil || payload.AgentCompletionMarker == "" || toolCount > 0 || markerSeen {
+	_ = markerSeen
+	if payload == nil {
 		return nil
 	}
-	if normalizeKiroStopReason(stopReason) == "end_turn" && strings.TrimSpace(visibleContent) != "" {
-		// Tool calls and final answers both have fixed protocol signals. Treat an
-		// END_TURN carrying neither signal as ambiguous regardless of prose, then
-		// use the bounded continuation attempts to resolve it. Continuations use
-		// the normal generation and recovery-chain time budgets by default.
-		return newUpstreamAgentActionOnlyError()
+
+	stopReason = normalizeKiroStopReason(stopReason)
+	if stopReason == "max_tokens" {
+		if payload.AgentCompletionMarker == "" && !forcedToolChoiceMode(payload) {
+			return nil
+		}
+		return newUpstreamAgentMarkerMismatchError()
+	}
+	if forcedToolChoiceMode(payload) {
+		if len(completedToolNames) == 0 {
+			return newUpstreamAgentToolChoiceMismatchError(payload.ToolChoiceMode, payload.ToolChoiceName, nil)
+		}
+		for _, name := range completedToolNames {
+			if !kiroPayloadAllowsToolName(payload, name) ||
+				(payload.ToolChoiceMode == "specific" &&
+					!kiroPayloadToolNameMatchesOriginal(payload, name, payload.ToolChoiceName)) {
+				return newUpstreamAgentToolChoiceMismatchError(payload.ToolChoiceMode, payload.ToolChoiceName, completedToolNames)
+			}
+		}
+		return nil
+	}
+	if payload.AgentCompletionMarker == "" {
+		return nil
+	}
+	// A completed structured tool event is its own native terminal signal. A
+	// visible END_TURN is likewise authoritative even when the model omitted the
+	// optional completion marker. The marker is retained only for stripping and
+	// telemetry; it must not override Kiro's native terminal state.
+	if len(completedToolNames) > 0 {
+		return nil
+	}
+	if stopReason == "end_turn" && strings.TrimSpace(visibleContent) != "" {
+		if looksLikeSerializedAgentToolCall(payload, visibleContent) {
+			return newUpstreamAgentActionOnlyError()
+		}
+		return nil
 	}
 	return newUpstreamAgentMarkerMismatchError()
 }
 
-func incompleteAgentResponse(payload *KiroPayload, reasoningObserved bool, visibleContent string, markerSeen bool, toolCount int, stopReason string) bool {
-	return agentCompletionResponseError(payload, reasoningObserved, visibleContent, markerSeen, toolCount, stopReason) != nil
+func incompleteAgentResponse(payload *KiroPayload, reasoningObserved bool, visibleContent string, markerSeen bool, completedToolNames []string, stopReason string) bool {
+	return agentCompletionResponseError(payload, reasoningObserved, visibleContent, markerSeen, completedToolNames, stopReason) != nil
+}
+
+func forcedToolChoiceMode(payload *KiroPayload) bool {
+	if payload == nil {
+		return false
+	}
+	return payload.ToolChoiceMode == "required" || payload.ToolChoiceMode == "specific"
+}
+
+func kiroPayloadToolNameMatchesOriginal(payload *KiroPayload, observed, original string) bool {
+	if observed == original {
+		return true
+	}
+	if payload == nil {
+		return false
+	}
+	return payload.ToolNameMap[observed] == original
+}
+
+func kiroPayloadAllowedToolNames(payload *KiroPayload) map[string]bool {
+	if payload == nil {
+		return nil
+	}
+	context := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+	if context == nil || len(context.Tools) == 0 {
+		return nil
+	}
+	allowed := make(map[string]bool, len(context.Tools)*2)
+	for _, tool := range context.Tools {
+		name := strings.TrimSpace(tool.ToolSpecification.Name)
+		if name == "" {
+			continue
+		}
+		allowed[name] = true
+		if original := strings.TrimSpace(payload.ToolNameMap[name]); original != "" {
+			allowed[original] = true
+		}
+	}
+	return allowed
+}
+
+func kiroPayloadAllowsToolName(payload *KiroPayload, name string) bool {
+	allowed := kiroPayloadAllowedToolNames(payload)
+	if len(allowed) == 0 {
+		// Synthetic helper tests may omit tool schemas. Real forced requests have
+		// schemas in the current message and therefore take the strict branch.
+		return strings.TrimSpace(name) != ""
+	}
+	return allowed[name]
+}
+
+func completedKiroToolNames(toolUses []KiroToolUse) []string {
+	names := make([]string, 0, len(toolUses))
+	for _, toolUse := range toolUses {
+		names = append(names, toolUse.Name)
+	}
+	return names
+}
+
+func completedOpenAIToolNames(toolCalls []ToolCall) []string {
+	names := make([]string, 0, len(toolCalls))
+	for _, toolCall := range toolCalls {
+		names = append(names, toolCall.Function.Name)
+	}
+	return names
 }
 
 func shouldFinishStreamAfterAgentContinuation(payload *KiroPayload, err error, toolCount int) bool {
@@ -879,6 +1503,9 @@ func cloneKiroPayload(payload *KiroPayload) *KiroPayload {
 	clone.StructuredOutputType = payload.StructuredOutputType
 	clone.StructuredOutputSchema = append(json.RawMessage(nil), payload.StructuredOutputSchema...)
 	clone.ToolChoiceMode = payload.ToolChoiceMode
+	clone.ToolChoiceName = payload.ToolChoiceName
+	clone.HistoryMode = payload.HistoryMode
+	clone.ReasoningSignatureRetry = payload.ReasoningSignatureRetry
 	clone.AgentCompletionMarker = payload.AgentCompletionMarker
 	clone.AgentCompletionRetries = payload.AgentCompletionRetries
 	clone.AgentActionContinuations = payload.AgentActionContinuations
@@ -887,6 +1514,8 @@ func cloneKiroPayload(payload *KiroPayload) *KiroPayload {
 	clone.AgentRecoveryAggressive = payload.AgentRecoveryAggressive
 	clone.AgentInputTooLongRecoveries = payload.AgentInputTooLongRecoveries
 	clone.agentRecoveryActionHint = payload.agentRecoveryActionHint
+	clone.agentRecoveryAttemptReasoning = payload.agentRecoveryAttemptReasoning
+	clone.agentRecoveryAttemptVisibleText = payload.agentRecoveryAttemptVisibleText
 	clone.agentRecoveryInjectedActionHint = payload.agentRecoveryInjectedActionHint
 	if len(payload.agentRecoveryOriginalPayload) > 0 {
 		clone.agentRecoveryOriginalPayload = append([]byte(nil), payload.agentRecoveryOriginalPayload...)

@@ -700,6 +700,7 @@ func TestAgentMarkerPrefixCanSpanFrames(t *testing.T) {
 	stream := bytes.NewReader(bytes.Join([][]byte{
 		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": " \n" + marker[:13]}),
 		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": marker[13:] + "done"}),
+		awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{"stopReason": "END_TURN"}),
 	}, nil))
 
 	err := parseEventStreamWithKeepAlive(stream, &KiroStreamCallback{
@@ -707,6 +708,20 @@ func TestAgentMarkerPrefixCanSpanFrames(t *testing.T) {
 	}, 0)
 	if err != nil {
 		t.Fatalf("split completion marker was rejected: %v", err)
+	}
+}
+
+func TestAgentMarkerDoesNotCompleteWithoutNativeTerminal(t *testing.T) {
+	const marker = "<agent_final_0123456789abcdef>"
+	stream := bytes.NewReader(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+		"content": marker + "done",
+	}))
+
+	err := parseEventStreamWithKeepAlive(stream, &KiroStreamCallback{
+		AgentCompletionMarker: marker,
+	}, 0)
+	if !isUpstreamIncompleteResponseError(err) || !isUpstreamAgentMarkerMismatchError(err) {
+		t.Fatalf("marker without native terminal was accepted: %v", err)
 	}
 }
 
@@ -842,6 +857,49 @@ func TestParseEventStreamNativeEndTurnAcceptsVisibleAssistantText(t *testing.T) 
 	}
 }
 
+func TestParseEventStreamRejectsEmptyAgentEndTurn(t *testing.T) {
+	const marker = "<agent_final_0123456789abcdef>"
+	tests := []struct {
+		name   string
+		frames [][]byte
+	}{
+		{
+			name: "empty",
+		},
+		{
+			name: "reasoning only",
+			frames: [][]byte{
+				awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{"text": "thinking"}),
+			},
+		},
+		{
+			name: "marker only",
+			frames: [][]byte{
+				awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": marker}),
+			},
+		},
+		{
+			name: "whitespace only",
+			frames: [][]byte{
+				awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": " \r\n\t"}),
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			frames := append([][]byte(nil), test.frames...)
+			frames = append(frames, awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{"stopReason": "END_TURN"}))
+			err := parseEventStream(bytes.NewReader(bytes.Join(frames, nil)), &KiroStreamCallback{
+				AgentCompletionMarker: marker,
+			})
+			if !isUpstreamIncompleteResponseError(err) || !isUpstreamAgentMarkerMismatchError(err) {
+				t.Fatalf("empty agent END_TURN was accepted: %v", err)
+			}
+		})
+	}
+}
+
 func TestParseEventStreamDoesNotTreatContextUsageAsTerminal(t *testing.T) {
 	stream := bytes.NewReader(bytes.Join([][]byte{
 		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "partial answer"}),
@@ -857,14 +915,15 @@ func TestParseEventStreamDoesNotTreatContextUsageAsTerminal(t *testing.T) {
 }
 
 func TestParseEventStreamMaxTokensStillRequiresAgentRecovery(t *testing.T) {
+	const marker = "<agent_final_0123456789abcdef>"
 	stream := bytes.NewReader(bytes.Join([][]byte{
-		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "partial answer"}),
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": marker + "partial answer"}),
 		awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{"stopReason": "MAX_TOKENS"}),
 	}, nil))
 
 	var stopReason string
 	err := parseEventStream(stream, &KiroStreamCallback{
-		AgentCompletionMarker: "<agent_final_0123456789abcdef>",
+		AgentCompletionMarker: marker,
 		OnStopReason:          func(reason string) { stopReason = reason },
 	})
 	if stopReason != "max_tokens" || !isUpstreamIncompleteResponseError(err) || !isUpstreamAgentMarkerMismatchError(err) {

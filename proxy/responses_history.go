@@ -79,18 +79,41 @@ func outputToMessages(items []ResponseOutputItem) []OpenAIMessage {
 		return nil
 	}
 	out := make([]OpenAIMessage, 0, len(items))
+	pendingReasoning := ""
+	attachPendingReasoning := func(msg *OpenAIMessage) {
+		if msg == nil || pendingReasoning == "" {
+			return
+		}
+		msg.ReasoningContent = appendResponsesReasoning(msg.ReasoningContent, pendingReasoning)
+		pendingReasoning = ""
+	}
+	flushPendingReasoning := func() {
+		if pendingReasoning == "" {
+			return
+		}
+		msg := OpenAIMessage{Role: "assistant", Content: ""}
+		attachPendingReasoning(&msg)
+		out = append(out, msg)
+	}
 	for _, item := range items {
 		switch item.Type {
+		case "reasoning":
+			pendingReasoning = appendResponsesReasoning(pendingReasoning, joinResponseSummaryParts(item.Summary))
 		case "message":
 			text := joinTextParts(item.Content)
 			role := item.Role
 			if role == "" {
 				role = "assistant"
 			}
-			if text == "" && role == "assistant" {
+			if role != "assistant" {
+				flushPendingReasoning()
+			}
+			if text == "" && role == "assistant" && pendingReasoning == "" {
 				continue
 			}
-			out = append(out, OpenAIMessage{Role: role, Content: text})
+			msg := OpenAIMessage{Role: role, Content: text}
+			attachPendingReasoning(&msg)
+			out = append(out, msg)
 		case "function_call":
 			tc := ToolCall{ID: item.CallID, Type: "function"}
 			if tc.ID == "" {
@@ -98,13 +121,16 @@ func outputToMessages(items []ResponseOutputItem) []OpenAIMessage {
 			}
 			tc.Function.Name = item.Name
 			tc.Function.Arguments = item.Arguments
-			out = append(out, OpenAIMessage{
+			msg := OpenAIMessage{
 				Role:      "assistant",
 				Content:   "",
 				ToolCalls: []ToolCall{tc},
-			})
+			}
+			attachPendingReasoning(&msg)
+			out = append(out, msg)
 		}
 	}
+	flushPendingReasoning()
 	return out
 }
 

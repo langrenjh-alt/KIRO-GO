@@ -256,6 +256,22 @@ func closeHTTPClientIdleConnections(client *http.Client) {
 
 // ==================== Request Structs ====================
 
+type kiroHistoryMode string
+
+const (
+	kiroHistoryModeLegacy       kiroHistoryMode = "legacy"
+	kiroHistoryModeNativeActive kiroHistoryMode = "native_active"
+)
+
+func configuredKiroHistoryMode() kiroHistoryMode {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("KIRO_NATIVE_STRUCTURED_HISTORY"))) {
+	case "0", "false", "no", "off", "disable", "disabled", string(kiroHistoryModeLegacy):
+		return kiroHistoryModeLegacy
+	default:
+		return kiroHistoryModeNativeActive
+	}
+}
+
 // KiroPayload is the top-level request body sent to the Kiro API.
 type KiroPayload struct {
 	ConversationState struct {
@@ -296,6 +312,18 @@ type KiroPayload struct {
 	// normalization. In particular, Anthropic's any/required mode expects one
 	// selected call even when Kiro proposes more than one.
 	ToolChoiceMode string `json:"-"`
+	// ToolChoiceName preserves the original client-facing name for a specific
+	// tool choice. Kiro receives a sanitized name, but terminal validation runs
+	// after callbacks restore the original name through ToolNameMap.
+	ToolChoiceName string `json:"-"`
+
+	// HistoryMode is bound once while translating the downstream request. It is
+	// not re-read during retries, so one logical request cannot switch protocol
+	// shapes because the process environment changed mid-flight.
+	HistoryMode kiroHistoryMode `json:"-"`
+	// ReasoningSignatureRetry records the one same-account retry allowed after
+	// Kiro rejects a replayed native reasoning signature.
+	ReasoningSignatureRetry bool `json:"-"`
 
 	// AgentCompletionMarker enables the internal completion protocol for a
 	// recognized tool-enabled coding harness. It is stripped from final output
@@ -323,6 +351,10 @@ type KiroPayload struct {
 	// failed attempt. It is injected as untrusted diagnostic context only when
 	// constructing a semantic recovery request and is never serialized directly.
 	agentRecoveryActionHint string
+	// Recovery attempt output is split by semantic channel. Hidden reasoning is
+	// never replayed as if it were visible assistant text.
+	agentRecoveryAttemptReasoning   string
+	agentRecoveryAttemptVisibleText string
 	// agentRecoveryInjectedActionHint records the exact generated suffix so a
 	// later semantic retry can replace it without scanning or altering user text.
 	agentRecoveryInjectedActionHint string
@@ -498,8 +530,43 @@ type KiroHistoryMessage struct {
 }
 
 type KiroAssistantResponseMessage struct {
-	Content  string        `json:"content"`
-	ToolUses []KiroToolUse `json:"toolUses,omitempty"`
+	MessageID        string                `json:"messageId,omitempty"`
+	Content          string                `json:"content"`
+	ToolUses         []KiroToolUse         `json:"toolUses,omitempty"`
+	ReasoningContent *KiroReasoningContent `json:"reasoningContent,omitempty"`
+}
+
+// KiroReasoningContent mirrors the upstream union. Exactly one branch is
+// valid: signed plaintext reasoning, or an already-base64-encoded redacted
+// blob. MarshalJSON rejects malformed internal values before they reach Kiro.
+type KiroReasoningContent struct {
+	ReasoningText   *KiroReasoningText `json:"reasoningText,omitempty"`
+	RedactedContent string             `json:"redactedContent,omitempty"`
+}
+
+type KiroReasoningText struct {
+	Text      string `json:"text"`
+	Signature string `json:"signature"`
+}
+
+func (content KiroReasoningContent) MarshalJSON() ([]byte, error) {
+	hasText := content.ReasoningText != nil
+	hasRedacted := content.RedactedContent != ""
+	if hasText == hasRedacted {
+		return nil, errors.New("Kiro reasoningContent must contain exactly one union branch")
+	}
+	if hasText {
+		if strings.TrimSpace(content.ReasoningText.Text) == "" ||
+			strings.TrimSpace(content.ReasoningText.Signature) == "" {
+			return nil, errors.New("Kiro reasoningText requires non-empty text and signature")
+		}
+		return json.Marshal(struct {
+			ReasoningText *KiroReasoningText `json:"reasoningText"`
+		}{ReasoningText: content.ReasoningText})
+	}
+	return json.Marshal(struct {
+		RedactedContent string `json:"redactedContent"`
+	}{RedactedContent: content.RedactedContent})
 }
 
 type KiroToolUse struct {
@@ -588,6 +655,7 @@ const (
 var errUpstreamIncompleteResponse = errors.New("upstream did not complete the agent turn")
 var errUpstreamAgentMarkerMismatch = errors.New("upstream did not complete the agent turn: completion marker prefix mismatch")
 var errUpstreamAgentActionOnly = errors.New("upstream END_TURN had neither a completion marker nor a structured tool call")
+var errUpstreamAgentToolChoiceMismatch = errors.New("upstream did not satisfy the required tool choice")
 
 type KiroHTTPError struct {
 	StatusCode int
@@ -642,6 +710,25 @@ func newUpstreamAgentActionOnlyError() error {
 	return &KiroStreamProtocolError{
 		Code: upstreamIncompleteResponseCode,
 		Err:  fmt.Errorf("%w: %w", errUpstreamAgentMarkerMismatch, errUpstreamAgentActionOnly),
+	}
+}
+
+func newUpstreamAgentToolChoiceMismatchError(mode, selected string, observed []string) error {
+	detail := "required tool choice ended without a completed structured tool call"
+	if mode == "specific" {
+		detail = fmt.Sprintf("specific tool choice %q was not satisfied", selected)
+		if len(observed) > 0 {
+			detail = fmt.Sprintf("%s; completed tools: %s", detail, strings.Join(observed, ", "))
+		}
+	}
+	return &KiroStreamProtocolError{
+		Code: upstreamIncompleteResponseCode,
+		Err: fmt.Errorf(
+			"%w: %w: %s",
+			errUpstreamAgentMarkerMismatch,
+			errUpstreamAgentToolChoiceMismatch,
+			detail,
+		),
 	}
 }
 
@@ -743,6 +830,10 @@ func isUpstreamAgentActionOnlyError(err error) bool {
 	return errors.Is(err, errUpstreamAgentActionOnly)
 }
 
+func isUpstreamAgentToolChoiceMismatchError(err error) bool {
+	return errors.Is(err, errUpstreamAgentToolChoiceMismatch)
+}
+
 func isUpstreamIncompleteResponseError(err error) bool {
 	if errors.Is(err, errUpstreamIncompleteResponse) {
 		return true
@@ -801,13 +892,12 @@ func prepareReasoningOnlyRetry(payload *KiroPayload, causes ...error) {
 		prepareFullContextAgentRecovery(payload)
 		return
 	}
-	// The first short continuation should act on the existing plan cheaply. A
-	// repeated narration receives a fresh bounded conversation and at least
-	// medium effort instead of replaying the same prompt a second time.
+	// Never make a recovery less capable than the original request. The first
+	// short continuation preserves the requested effort; later continuations
+	// raise low-effort requests to at least medium without reducing high, xhigh,
+	// or max.
 	if payload.AdditionalModelRequestFields != nil && payload.AdditionalModelRequestFields.OutputConfig != nil {
-		if payload.AgentCompletionRetries == 1 {
-			payload.AdditionalModelRequestFields.OutputConfig.Effort = "low"
-		} else {
+		if payload.AgentCompletionRetries > 1 {
 			setAgentRecoveryEffort(payload, "medium")
 		}
 	}
@@ -821,6 +911,9 @@ func prepareReasoningOnlyRetry(payload *KiroPayload, causes ...error) {
 		*message = appendSystemInstruction(*message, agentEscalatedActionContinuationInstruction())
 	} else {
 		instruction := agentCompletionRetryInstruction(payload.AgentCompletionMarker)
+		if forcedToolChoiceMode(payload) {
+			instruction = forcedToolChoiceRetryInstructionForPayload(payload)
+		}
 		if !strings.Contains(*message, instruction) {
 			*message = appendSystemInstruction(*message, instruction)
 		}
@@ -941,6 +1034,74 @@ func isKiroInputTooLongError(err error) bool {
 		return false
 	}
 	return isKiroInputTooLongBody([]byte(err.Error()))
+}
+
+func isKiroThinkingSignatureInvalidError(err error) bool {
+	var httpErr *KiroHTTPError
+	if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusBadRequest {
+		return false
+	}
+	body := strings.ToLower(httpErr.Body)
+	return strings.Contains(body, "thinking_signature_invalid") ||
+		(strings.Contains(body, "thinking.signature") &&
+			(strings.Contains(body, "field required") || strings.Contains(body, "invalid")))
+}
+
+func isKiroNativeHistoryValidationError(err error) bool {
+	var httpErr *KiroHTTPError
+	if !errors.As(err, &httpErr) ||
+		(httpErr.StatusCode != http.StatusBadRequest && httpErr.StatusCode != http.StatusUnprocessableEntity) {
+		return false
+	}
+	body := strings.ToLower(httpErr.Body)
+	if isKiroInputTooLongBody([]byte(body)) {
+		return false
+	}
+	// Kiro commonly collapses invalid tool-use/tool-result history into this
+	// message without identifying the failing field.
+	if strings.Contains(body, "improperly formed request") {
+		return true
+	}
+	historyField := containsAnySubstring(body,
+		"conversationstate.history", "conversation state history",
+		"assistantresponsemessage", "assistant response message",
+		"userinputmessagecontext", "user input message context",
+		"toolresults", "tool results", "tool_result", "tool result",
+		"tooluses", "tool uses", "tool_use", "tool use",
+		"messageid", "message id", "reasoningcontent", "redactedcontent",
+	)
+	if !historyField {
+		return false
+	}
+	return containsAnySubstring(body,
+		"request_body_invalid", "invalid", "malformed", "validation",
+		"field required", "missing", "not supported", "unexpected", "unknown field",
+	)
+}
+
+func containsAnySubstring(value string, candidates ...string) bool {
+	for _, candidate := range candidates {
+		if strings.Contains(value, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+func stripKiroHistoryReasoning(payload *KiroPayload) bool {
+	if payload == nil {
+		return false
+	}
+	stripped := false
+	for i := range payload.ConversationState.History {
+		assistant := payload.ConversationState.History[i].AssistantResponseMessage
+		if assistant == nil || assistant.ReasoningContent == nil {
+			continue
+		}
+		assistant.ReasoningContent = nil
+		stripped = true
+	}
+	return stripped
 }
 
 // ==================== API Call ====================
@@ -1170,6 +1331,26 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 	}
 	err := kiroEndpointError(ep, resp.StatusCode, errBody, resp.Header.Get("Retry-After"))
 	logger.Warnf("[KiroAPI] Endpoint %s error: %v", ep.Name, err)
+	if payload.HistoryMode == kiroHistoryModeNativeActive &&
+		!payload.ReasoningSignatureRetry && isKiroThinkingSignatureInvalidError(err) &&
+		stripKiroHistoryReasoning(payload) {
+		payload.ReasoningSignatureRetry = true
+		logger.Warnf(
+			"[KiroAPI] retrying once without replayed reasoning after signature rejection request_id=%s account=%s",
+			kiroPayloadRequestID(payload), accountEmailForLog(account),
+		)
+		return CallKiroAPI(account, payload, callback)
+	}
+	if payload.HistoryMode == kiroHistoryModeNativeActive && isKiroNativeHistoryValidationError(err) {
+		fallbackKiroHistoryToLegacy(payload)
+		logger.Warnf(
+			"[KiroAPI] retrying once with legacy history after native history validation rejection request_id=%s account=%s",
+			kiroPayloadRequestID(payload), accountEmailForLog(account),
+		)
+		// fallbackKiroHistoryToLegacy changes HistoryMode to legacy before the
+		// recursive call, which makes this retry intrinsically single-shot.
+		return CallKiroAPI(account, payload, callback)
+	}
 	return err
 }
 
@@ -1371,6 +1552,7 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 	var completedToolUses int
 	var agentOutputObserved bool
 	var assistantTextObserved bool
+	var agentVisibleTextObserved bool
 	// Accounted only while no tool call and no visible text have appeared, so a
 	// multi-round agent task resets it at every outward action and never
 	// accumulates across the whole task.
@@ -1521,14 +1703,24 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 			if content, ok := event["content"].(string); ok && content != "" {
 				agentOutputObserved = true
 				assistantTextObserved = true
-				if callback.AgentCompletionMarker != "" && markerState == agentCompletionPrefixPending {
-					markerProbe.WriteString(content)
-					markerState = classifyAgentCompletionPrefix(markerProbe.String(), callback.AgentCompletionMarker)
-					if markerState != agentCompletionPrefixPending {
-						markerProbe.Reset()
-					}
-					if markerState == agentCompletionPrefixComplete {
-						stopThinkingTimer()
+				if callback.AgentCompletionMarker != "" {
+					if markerState == agentCompletionPrefixPending {
+						markerProbe.WriteString(content)
+						probe := markerProbe.String()
+						markerState = classifyAgentCompletionPrefix(probe, callback.AgentCompletionMarker)
+						if markerState != agentCompletionPrefixPending {
+							markerProbe.Reset()
+							switch markerState {
+							case agentCompletionPrefixComplete:
+								visible, _ := stripAgentCompletionMarker(probe, callback.AgentCompletionMarker)
+								agentVisibleTextObserved = strings.TrimSpace(visible) != ""
+								stopThinkingTimer()
+							case agentCompletionPrefixMismatch:
+								agentVisibleTextObserved = strings.TrimSpace(probe) != ""
+							}
+						}
+					} else if strings.TrimSpace(content) != "" {
+						agentVisibleTextObserved = true
 					}
 				}
 				if callback.OnText != nil {
@@ -1621,9 +1813,11 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 			callback.OnStopReason(upstreamStopReason)
 		}
 	}
-	if callback.AgentCompletionMarker != "" && markerState != agentCompletionPrefixComplete &&
-		!toolObserved && !(upstreamStopReason == "end_turn" && assistantTextObserved) {
-		return reportKiroStreamError(callback, newUpstreamAgentMarkerMismatchError())
+	if callback.AgentCompletionMarker != "" {
+		if upstreamStopReason == "max_tokens" ||
+			(!toolObserved && (upstreamStopReason != "end_turn" || !agentVisibleTextObserved)) {
+			return reportKiroStreamError(callback, newUpstreamAgentMarkerMismatchError())
+		}
 	}
 
 	if callback.OnCredits != nil && totalCredits > 0 {

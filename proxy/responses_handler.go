@@ -273,7 +273,7 @@ func (h *Handler) handleResponsesNonStream(
 				suppressedReasoningObserved || reasoningContent != "",
 				visibleContent,
 				markerSeen,
-				len(toolUses),
+				completedKiroToolNames(toolUses),
 				upstreamStopReason,
 			); completionErr != nil {
 				err = completionErr
@@ -371,8 +371,10 @@ func (h *Handler) handleResponsesNonStream(
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
-		respObj := buildResponsesObjectWithReasoning(respID, responseModel, finalContent, reasoningContent, toolUses, inputTokens, outputTokens, req)
-		applyResponsesPromptCacheUsage(respObj, cacheUsage)
+		publicInputTokens := contextUsageBlendedInputTokens(payload, model, inputTokens)
+		publicCacheUsage := contextUsageBlendedCacheUsage(payload, model, inputTokens, cacheUsage)
+		respObj := buildResponsesObjectWithReasoning(respID, responseModel, finalContent, reasoningContent, toolUses, publicInputTokens, outputTokens, req)
+		applyResponsesPromptCacheUsage(respObj, publicCacheUsage)
 		respObj.Usage.KiroContextUsage = kiroContextUsage(payload, model)
 		applyResponsesTerminalStatus(respObj, upstreamStopReason, contextWindowExceeded)
 		respObj.StoredInput = storedInput
@@ -652,6 +654,7 @@ func (h *Handler) handleResponsesStream(
 			outputIndex int
 		}
 		toolStreams := make(map[string]*responseToolStream)
+		ignoredToolUses := make(map[string]bool)
 
 		closeMessage := func() {
 			if !messageStarted {
@@ -897,7 +900,11 @@ func (h *Handler) handleResponsesStream(
 		}
 
 		beginToolUse := func(toolUseID, name string) {
-			if _, exists := toolStreams[toolUseID]; exists {
+			if _, exists := toolStreams[toolUseID]; exists || ignoredToolUses[toolUseID] {
+				return
+			}
+			if forcedToolChoiceMode(payload) && !kiroPayloadAllowsToolName(payload, name) {
+				ignoredToolUses[toolUseID] = true
 				return
 			}
 			processAssistantText("", true)
@@ -929,7 +936,7 @@ func (h *Handler) handleResponsesStream(
 			responseStarted = true
 		}
 		emitToolUseInputDelta := func(toolUseID, delta string) {
-			if delta == "" {
+			if delta == "" || ignoredToolUses[toolUseID] {
 				return
 			}
 			stream := toolStreams[toolUseID]
@@ -972,6 +979,11 @@ func (h *Handler) handleResponsesStream(
 			OnToolUseStart:      beginToolUse,
 			OnToolUseInputDelta: emitToolUseInputDelta,
 			OnToolUse: func(tu KiroToolUse) {
+				if ignoredToolUses[tu.ToolUseID] ||
+					(forcedToolChoiceMode(payload) && !kiroPayloadAllowsToolName(payload, tu.Name)) {
+					ignoredToolUses[tu.ToolUseID] = true
+					return
+				}
 				stream := toolStreams[tu.ToolUseID]
 				if stream == nil {
 					beginToolUse(tu.ToolUseID, tu.Name)
@@ -1028,7 +1040,7 @@ func (h *Handler) handleResponsesStream(
 				suppressedReasoningObserved || fullReasoningText.Len() > 0,
 				completionGate.VisibleText(),
 				completionGate.Marked(),
-				len(toolUses),
+				completedKiroToolNames(toolUses),
 				upstreamStopReason,
 			); completionErr != nil {
 				err = completionErr
@@ -1212,8 +1224,10 @@ func (h *Handler) handleResponsesStream(
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
-		respObj := buildResponsesObjectWithReasoning(respID, responseModel, finalContent, reasoning, toolUses, inputTokens, outputTokens, req)
-		applyResponsesPromptCacheUsage(respObj, cacheUsage)
+		publicInputTokens := contextUsageBlendedInputTokens(payload, model, inputTokens)
+		publicCacheUsage := contextUsageBlendedCacheUsage(payload, model, inputTokens, cacheUsage)
+		respObj := buildResponsesObjectWithReasoning(respID, responseModel, finalContent, reasoning, toolUses, publicInputTokens, outputTokens, req)
+		applyResponsesPromptCacheUsage(respObj, publicCacheUsage)
 		respObj.Usage.KiroContextUsage = kiroContextUsage(payload, model)
 		respObj.Output = streamOutput
 		incomplete := applyResponsesTerminalStatus(respObj, upstreamStopReason, contextWindowExceeded)

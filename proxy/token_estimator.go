@@ -172,7 +172,7 @@ func estimateOpenAIRequestInputTokens(req *OpenAIRequest) int {
 	total := 0
 	total += estimateApproxTokens(openAIStructuredOutputInstruction(req.ResponseFormat))
 	if choice, err := resolveToolChoice(req.ToolChoice); err == nil {
-		total += estimateApproxTokens(toolChoiceInstruction(choice))
+		total += estimateApproxTokens(openAIToolChoiceInstruction(choice))
 	}
 	if stopSequences, err := resolveOpenAIStopSequences(req.Stop); err == nil {
 		total += estimateApproxTokens(stopSequencesInstruction(stopSequences))

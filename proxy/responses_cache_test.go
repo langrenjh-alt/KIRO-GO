@@ -170,6 +170,7 @@ func TestResponsesPromptCacheComputesOnceAcrossRetry(t *testing.T) {
 			return nil
 		}
 		callback.OnText(payload.AgentCompletionMarker+"\nfinal answer", false)
+		callback.OnStopReason("END_TURN")
 		callback.OnComplete(400, 4)
 		return nil
 	}

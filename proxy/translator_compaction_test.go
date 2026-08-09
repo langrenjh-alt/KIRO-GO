@@ -140,6 +140,7 @@ func TestClaudeToKiroKeepsActiveToolTurnStructured(t *testing.T) {
 // structured toolResult without the matching toolConfig, so the result must
 // become ordinary user text while preserving its output.
 func TestClaudeToKiroFlattensActiveToolResultWithoutToolConfig(t *testing.T) {
+	t.Setenv("KIRO_NATIVE_STRUCTURED_HISTORY", "off")
 	req := &ClaudeRequest{
 		Model: "claude-opus-4.8",
 		Messages: []ClaudeMessage{
@@ -169,6 +170,7 @@ func TestClaudeToKiroFlattensActiveToolResultWithoutToolConfig(t *testing.T) {
 }
 
 func TestOpenAIToKiroFlattensActiveToolResultWithoutToolConfig(t *testing.T) {
+	t.Setenv("KIRO_NATIVE_STRUCTURED_HISTORY", "off")
 	req := &OpenAIRequest{
 		Model: "claude-opus-4.8",
 		Messages: []OpenAIMessage{

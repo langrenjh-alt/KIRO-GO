@@ -110,6 +110,30 @@ func toolChoiceInstruction(choice resolvedToolChoice) string {
 	}
 }
 
+func openAIToolChoiceInstruction(choice resolvedToolChoice) string {
+	switch choice.Mode {
+	case "required":
+		return "<tool_choice>Call at least one available tool before answering.</tool_choice>"
+	case "specific":
+		// OpenAI-compatible tool specifications preserve underscores and dashes;
+		// only the 64-byte upstream limit is applied by the converter.
+		name := shortenToolName(choice.Name)
+		encoded, _ := json.Marshal(name)
+		return "<tool_choice>You must call the tool named " + string(encoded) + " before answering.</tool_choice>"
+	default:
+		return ""
+	}
+}
+
+func forcedToolChoiceCompletionInstruction(choice resolvedToolChoice) string {
+	if choice.Mode != "required" && choice.Mode != "specific" {
+		return ""
+	}
+	return `<forced_tool_choice_completion_protocol>
+This turn completes only with a real native structured tool call that satisfies the tool choice. Do not answer with prose, imitate a tool call in text, or print a textual turn-ending token. The proxy validates the completed structured call before accepting the turn.
+</forced_tool_choice_completion_protocol>`
+}
+
 func claudeAgentToolProtocolInstruction(req *ClaudeRequest, choice resolvedToolChoice) string {
 	if req == nil {
 		return ""
@@ -182,6 +206,11 @@ func codingAgentCompletionProtocolEnabled(choice resolvedToolChoice, recognizedH
 		}
 	}
 	return false
+}
+
+func codingAgentForcedToolChoiceGuardEnabled(choice resolvedToolChoice, recognizedHarness bool, toolNames []string) bool {
+	return recognizedHarness && len(toolNames) > 0 &&
+		(choice.Mode == "required" || choice.Mode == "specific")
 }
 
 const (

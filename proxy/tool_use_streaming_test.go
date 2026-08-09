@@ -168,7 +168,6 @@ func TestClaudeContinuationSerializesInterleavedToolAndReasoningBlocks(t *testin
 		if calls == 1 {
 			callback.OnReasoning(KiroReasoningContentEvent{Text: "first-pass reasoning"})
 			callback.OnText("I'll inspect the implementation now.", false)
-			callback.OnStopReason("END_TURN")
 			callback.OnComplete(10, 4)
 			return nil
 		}

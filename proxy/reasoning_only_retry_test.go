@@ -8,12 +8,11 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"kiro-go/config"
 )
 
-func TestAgentActionNarrationRetriesWithCorrection(t *testing.T) {
+func TestInterruptedAgentNarrationRetriesWithCorrection(t *testing.T) {
 	calls := 0
 	h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
 		calls++
@@ -34,7 +33,6 @@ func TestAgentActionNarrationRetriesWithCorrection(t *testing.T) {
 		switch calls {
 		case 1:
 			callback.OnText("我先检查新代码里哪些方法可被测试访问。", false)
-			callback.OnStopReason("END_TURN")
 		default:
 			callback.OnToolUse(KiroToolUse{
 				ToolUseID: "call_search",
@@ -121,17 +119,27 @@ func TestClaudeFailedToolResultRecoversWithStructuredToolCall(t *testing.T) {
 				t.Fatalf("initial failed tool result was not structured: %#v", current.UserInputMessageContext)
 			}
 			callback.OnText("I will retry the write now.", false)
-			callback.OnStopReason("END_TURN")
 		case 2:
 			var historyText strings.Builder
+			structuredErrorPreserved := false
+			if context := current.UserInputMessageContext; context != nil && len(context.ToolResults) == 1 &&
+				context.ToolResults[0].ToolUseID == "tool_write_previous" && context.ToolResults[0].Status == "error" &&
+				len(context.ToolResults[0].Content) == 1 && context.ToolResults[0].Content[0].Text == "Write failed" {
+				structuredErrorPreserved = true
+			}
 			for _, message := range attempt.ConversationState.History {
 				if message.UserInputMessage != nil {
 					historyText.WriteString(message.UserInputMessage.Content)
+					if context := message.UserInputMessage.UserInputMessageContext; context != nil && len(context.ToolResults) == 1 &&
+						context.ToolResults[0].ToolUseID == "tool_write_previous" && context.ToolResults[0].Status == "error" &&
+						len(context.ToolResults[0].Content) == 1 && context.ToolResults[0].Content[0].Text == "Write failed" {
+						structuredErrorPreserved = true
+					}
 				}
 			}
-			if evidence := historyText.String(); !strings.Contains(evidence, `<tool_result status="error">`) ||
-				!strings.Contains(evidence, "Write failed") {
-				t.Fatalf("recovery request lost failed tool evidence: %q", evidence)
+			if !structuredErrorPreserved ||
+				(!strings.Contains(historyText.String(), "Create a.js") && !strings.Contains(current.Content, "Create a.js")) {
+				t.Fatalf("recovery request lost structured failed tool evidence: history=%#v", attempt.ConversationState.History)
 			}
 			callback.OnToolUse(KiroToolUse{
 				ToolUseID: "tool_write_retry",
@@ -196,7 +204,6 @@ func TestClaudeFailedToolResultSurvivesRecoveryInputTooLong(t *testing.T) {
 		switch calls {
 		case 1:
 			callback.OnText("I will correct the failed Write now.", false)
-			callback.OnStopReason("END_TURN")
 			callback.OnComplete(10, 4)
 			return nil
 		case 2:
@@ -209,7 +216,10 @@ func TestClaudeFailedToolResultSurvivesRecoveryInputTooLong(t *testing.T) {
 			current := attempt.ConversationState.CurrentMessage.UserInputMessage
 			if attempt.AgentInputTooLongRecoveries != 1 || !attempt.agentInputTooLongRecoveryPending ||
 				!attempt.AgentRecoveryAggressive || !strings.Contains(current.Content, "Write failed") ||
-				!strings.Contains(current.Content, `<tool_result status="error">`) {
+				!strings.Contains(current.Content, "tool_write_previous") ||
+				!strings.Contains(current.Content, "Write") ||
+				!strings.Contains(current.Content, "config.js") ||
+				!strings.Contains(current.Content, "complete_tool_exchange") {
 				t.Fatalf("bounded retry lost failed Write evidence: state=%#v content=%q", attempt, current.Content)
 			}
 			callback.OnToolUse(KiroToolUse{
@@ -239,7 +249,7 @@ func TestClaudeFailedToolResultSurvivesRecoveryInputTooLong(t *testing.T) {
 	}
 }
 
-func TestStreamingAgentContinuationTimeoutFinishesOriginalResponse(t *testing.T) {
+func TestStreamingNativeEndTurnDoesNotStartAgentContinuation(t *testing.T) {
 	tests := []struct {
 		name      string
 		invoke    func(*Handler, *httptest.ResponseRecorder)
@@ -291,33 +301,33 @@ func TestStreamingAgentContinuationTimeoutFinishesOriginalResponse(t *testing.T)
 			calls := 0
 			h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
 				calls++
-				if calls == 1 {
-					if callback.OnReasoning != nil {
-						callback.OnReasoning(KiroReasoningContentEvent{Text: "I still need to write and run the verification suite."})
-					}
-					callback.OnText("All core modules confirmed. Now the test suite -- this is the gate for everything downstream.", false)
-					callback.OnStopReason("END_TURN")
-					callback.OnComplete(10, 4)
-					return nil
+				if calls > 1 {
+					t.Fatalf("native END_TURN unexpectedly started continuation call %d", calls)
 				}
-				return newUpstreamAgentContinuationTimeoutError(30 * time.Second)
+				if callback.OnReasoning != nil {
+					callback.OnReasoning(KiroReasoningContentEvent{Text: "The answer is ready."})
+				}
+				callback.OnText("All core modules confirmed.", false)
+				callback.OnStopReason("END_TURN")
+				callback.OnComplete(10, 4)
+				return nil
 			})
 			rec := httptest.NewRecorder()
 
 			test.invoke(h, rec)
 
 			body := rec.Body.String()
-			if calls != 2 || !strings.Contains(body, "All core modules confirmed.") || !strings.Contains(body, test.terminal) {
-				t.Fatalf("bounded continuation did not finish the original response: calls=%d body=%s", calls, body)
+			if calls != 1 || !strings.Contains(body, "All core modules confirmed.") || !strings.Contains(body, test.terminal) {
+				t.Fatalf("native END_TURN did not finish directly: calls=%d body=%s", calls, body)
 			}
 			if strings.Contains(body, test.forbidden) || strings.Contains(body, upstreamAgentContinuationTimeoutCode) {
-				t.Fatalf("bounded continuation timeout leaked as a client error: %s", body)
+				t.Fatalf("native END_TURN produced a continuation error: %s", body)
 			}
 		})
 	}
 }
 
-func TestStreamingActionContinuationUsesFullContextFallbackAcrossProtocols(t *testing.T) {
+func TestStreamingMissingTerminalUsesFullContextFallbackAcrossProtocols(t *testing.T) {
 	tests := []struct {
 		name      string
 		invoke    func(*Handler, *httptest.ResponseRecorder)
@@ -371,7 +381,6 @@ func TestStreamingActionContinuationUsesFullContextFallbackAcrossProtocols(t *te
 				calls++
 				if calls <= maxKiroAgentActionContinuations+1 {
 					callback.OnText(fmt.Sprintf("action narration %d", calls), false)
-					callback.OnStopReason("END_TURN")
 					callback.OnComplete(10, 4)
 					return nil
 				}
@@ -508,7 +517,6 @@ func TestMixedActionAndReasoningOnlyUsesFullContextFallbackAcrossPublicFormats(t
 			emitStall: func(call int, callback *KiroStreamCallback) {
 				if call == 1 {
 					callback.OnText("I will inspect the implementation now.", false)
-					callback.OnStopReason("END_TURN")
 					return
 				}
 				reasoning := fmt.Sprintf("reasoning-only continuation %d", call)
@@ -600,7 +608,6 @@ func TestFullContextRecoveryFailureIsBoundedAcrossPublicFormats(t *testing.T) {
 			name: "pure_action_only",
 			emitStall: func(call int, callback *KiroStreamCallback) {
 				callback.OnText(fmt.Sprintf("I still need to invoke the tool now, attempt %d.", call), false)
-				callback.OnStopReason("END_TURN")
 			},
 		},
 		{
@@ -608,7 +615,6 @@ func TestFullContextRecoveryFailureIsBoundedAcrossPublicFormats(t *testing.T) {
 			emitStall: func(call int, callback *KiroStreamCallback) {
 				if call%2 == 1 {
 					callback.OnText(fmt.Sprintf("I will invoke the tool now, attempt %d.", call), false)
-					callback.OnStopReason("END_TURN")
 					return
 				}
 				if callback.OnReasoning != nil {
@@ -676,7 +682,6 @@ func TestStreamingAgentContinuationRetriesTransientUpstreamFailure(t *testing.T)
 		switch calls {
 		case 1:
 			callback.OnText("I will inspect the test file now.", false)
-			callback.OnStopReason("END_TURN")
 			callback.OnComplete(10, 4)
 			return nil
 		case 2:
@@ -758,8 +763,10 @@ func TestClaudeLongContextRecoveryCompactsBeforeRetry(t *testing.T) {
 			if err != nil {
 				t.Fatalf("marshal compacted retry: %v", err)
 			}
-			if bytes.Contains(wire, []byte("assistant-planning-inertia")) {
-				t.Fatal("old assistant planning remained in bounded recovery request")
+			if bytes.Contains(wire, []byte("UNRELATED_PLANNING_HEAD_SENTINEL")) ||
+				!bytes.Contains(wire, []byte("DECISION_CAUSE_SENTINEL")) ||
+				!bytes.Contains(wire, []byte("recent_causal_evidence")) {
+				t.Fatal("bounded recovery did not retain the causal tail while dropping unrelated planning")
 			}
 			callback.OnReasoning(KiroReasoningContentEvent{Text: "act"})
 			callback.OnToolUse(KiroToolUse{
@@ -777,7 +784,7 @@ func TestClaudeLongContextRecoveryCompactsBeforeRetry(t *testing.T) {
 		{UserInputMessage: &KiroUserInputMessage{Content: agentCompletionProtocolInstruction(payload.AgentCompletionMarker)}},
 		{AssistantResponseMessage: &KiroAssistantResponseMessage{Content: "I will follow these instructions."}},
 		{UserInputMessage: &KiroUserInputMessage{Content: strings.Repeat("repository evidence ", 10000)}},
-		{AssistantResponseMessage: &KiroAssistantResponseMessage{Content: strings.Repeat("assistant-planning-inertia ", 20000)}},
+		{AssistantResponseMessage: &KiroAssistantResponseMessage{Content: "UNRELATED_PLANNING_HEAD_SENTINEL " + strings.Repeat("assistant-planning-inertia ", 20000) + " DECISION_CAUSE_SENTINEL: inspect the implementation before editing."}},
 	}
 	payload.ConversationState.CurrentMessage.UserInputMessage.Content = "continue implementation"
 	rec := httptest.NewRecorder()
@@ -802,7 +809,7 @@ func TestClaudeLongContextRecoveryCompactsBeforeRetry(t *testing.T) {
 		t.Fatalf("compacted recovery did not emit tool call: %s", body)
 	}
 	if strings.Contains(body, upstreamIncompleteResponseCode) ||
-		strings.Contains(body, "assistant-planning-inertia") ||
+		strings.Contains(body, "UNRELATED_PLANNING_HEAD_SENTINEL") ||
 		strings.Contains(body, "repeated recovery reasoning") {
 		t.Fatalf("recovery leaked failure or old planning: %s", body)
 	}
@@ -904,6 +911,7 @@ func TestCompletionMarkerRecoveryAcrossPublicResponseFormats(t *testing.T) {
 				} else {
 					callback.OnText(payload.AgentCompletionMarker[:12], false)
 					callback.OnText(payload.AgentCompletionMarker[12:]+"\nfinal answer", false)
+					callback.OnStopReason("END_TURN")
 				}
 				callback.OnComplete(10, 4)
 				return nil
@@ -1217,6 +1225,7 @@ func TestAgentMaxTokenMissingMarkerRetriesWithCorrection(t *testing.T) {
 			callback.OnStopReason("max_tokens")
 		} else {
 			callback.OnText(payload.AgentCompletionMarker+"final answer", false)
+			callback.OnStopReason("END_TURN")
 		}
 		callback.OnComplete(10, 4)
 		return nil
@@ -1242,7 +1251,7 @@ func TestAgentMaxTokenMissingMarkerRetriesWithCorrection(t *testing.T) {
 	}
 }
 
-func TestMarkedEndTurnWithVisibleTextSkipsRecoveryAcrossProtocols(t *testing.T) {
+func TestUnmarkedEndTurnWithVisibleTextSkipsRecoveryAcrossProtocols(t *testing.T) {
 	tests := []struct {
 		name      string
 		invoke    func(*Handler, *httptest.ResponseRecorder)
@@ -1328,9 +1337,9 @@ func TestMarkedEndTurnWithVisibleTextSkipsRecoveryAcrossProtocols(t *testing.T) 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			calls := 0
-			h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
+			h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
 				calls++
-				callback.OnText(payload.AgentCompletionMarker+"final answer", false)
+				callback.OnText("final answer", false)
 				callback.OnStopReason("END_TURN")
 				callback.OnComplete(10, 4)
 				return nil
@@ -1350,6 +1359,114 @@ func TestMarkedEndTurnWithVisibleTextSkipsRecoveryAcrossProtocols(t *testing.T) 
 	}
 }
 
+func TestSerializedToolCarrierRecoversToStructuredCallAcrossProtocols(t *testing.T) {
+	tests := []struct {
+		name   string
+		invoke func(*Handler, *httptest.ResponseRecorder)
+	}{
+		{
+			name: "Claude stream",
+			invoke: func(h *Handler, rec *httptest.ResponseRecorder) {
+				h.handleClaudeStream(rec, completionProtocolTestPayload(), "claude-opus-5", "claude-opus-5", false, claudeThinkingResponseOptions{}, 5, nil, "")
+			},
+		},
+		{
+			name: "Claude non-stream",
+			invoke: func(h *Handler, rec *httptest.ResponseRecorder) {
+				h.handleClaudeNonStream(rec, completionProtocolTestPayload(), "claude-opus-5", "claude-opus-5", false, claudeThinkingResponseOptions{}, 5, nil, "")
+			},
+		},
+		{
+			name: "Chat Completions stream",
+			invoke: func(h *Handler, rec *httptest.ResponseRecorder) {
+				req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+					"model":"claude-opus-5",
+					"messages":[{"role":"system","content":"You are Codex, a coding agent."},{"role":"user","content":"edit the file"}],
+					"tools":[{"type":"function","function":{"name":"shell_command","parameters":{"type":"object"}}}],
+					"stream":true
+				}`))
+				h.handleOpenAIChat(rec, req)
+			},
+		},
+		{
+			name: "Chat Completions non-stream",
+			invoke: func(h *Handler, rec *httptest.ResponseRecorder) {
+				req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+					"model":"claude-opus-5",
+					"messages":[{"role":"system","content":"You are Codex, a coding agent."},{"role":"user","content":"edit the file"}],
+					"tools":[{"type":"function","function":{"name":"shell_command","parameters":{"type":"object"}}}]
+				}`))
+				h.handleOpenAIChat(rec, req)
+			},
+		},
+		{
+			name: "Responses stream",
+			invoke: func(h *Handler, rec *httptest.ResponseRecorder) {
+				req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+					"model":"claude-opus-5",
+					"instructions":"You are Codex, a coding agent.",
+					"input":"edit the file",
+					"tools":[{"type":"function","name":"shell_command","parameters":{"type":"object"}}],
+					"stream":true,
+					"store":false
+				}`))
+				h.handleOpenAIResponses(rec, req)
+			},
+		},
+		{
+			name: "Responses non-stream",
+			invoke: func(h *Handler, rec *httptest.ResponseRecorder) {
+				req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+					"model":"claude-opus-5",
+					"instructions":"You are Codex, a coding agent.",
+					"input":"edit the file",
+					"tools":[{"type":"function","name":"shell_command","parameters":{"type":"object"}}],
+					"store":false
+				}`))
+				h.handleOpenAIResponses(rec, req)
+			},
+		},
+	}
+
+	const carrier = `<invoke name="shell_command"><parameter name="command">printf RECOVERY_SENTINEL</parameter></invoke>`
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
+				calls++
+				if calls == 1 {
+					callback.OnText(carrier[:12], false)
+					callback.OnText(carrier[12:], false)
+					callback.OnStopReason("END_TURN")
+				} else {
+					if payload.AgentActionContinuations == 0 {
+						t.Fatal("serialized tool carrier did not enter action continuation")
+					}
+					callback.OnToolUse(KiroToolUse{
+						ToolUseID: "toolu_recovered",
+						Name:      "shell_command",
+						Input:     map[string]interface{}{"command": "printf RECOVERY_SENTINEL"},
+					})
+					callback.OnStopReason("TOOL_USE")
+				}
+				callback.OnComplete(10, 4)
+				return nil
+			})
+			rec := httptest.NewRecorder()
+
+			test.invoke(h, rec)
+
+			body := rec.Body.String()
+			if calls != 2 || rec.Code != http.StatusOK || !strings.Contains(body, "shell_command") || !strings.Contains(body, "RECOVERY_SENTINEL") {
+				t.Fatalf("serialized carrier did not recover to a structured call: calls=%d status=%d body=%s", calls, rec.Code, body)
+			}
+			if strings.Contains(body, carrier) || strings.Contains(body, upstreamIncompleteResponseCode) {
+				t.Fatalf("serialized carrier leaked or recovery failed: %s", body)
+			}
+		})
+	}
+}
+
 func TestEventStreamAllowsReasoningBeyondOldEightKiBLimit(t *testing.T) {
 	const marker = "<agent_final_0123456789abcdef>"
 	reasoning := strings.Repeat("plan the implementation carefully; ", 1000)
@@ -1359,6 +1476,7 @@ func TestEventStreamAllowsReasoningBeyondOldEightKiBLimit(t *testing.T) {
 	stream := bytes.NewReader(bytes.Join([][]byte{
 		awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{"text": reasoning}),
 		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": marker + "done"}),
+		awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{"stopReason": "END_TURN"}),
 	}, nil))
 
 	err := parseEventStream(stream, &KiroStreamCallback{AgentCompletionMarker: marker})

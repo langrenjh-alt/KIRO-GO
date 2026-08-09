@@ -274,7 +274,6 @@ func TestClaudeRecoveryUsageKeepsClientInputAndPeakKiroOccupancy(t *testing.T) {
 				}
 				if calls == 1 {
 					callback.OnText("I will inspect the repository now.", false)
-					callback.OnStopReason("END_TURN")
 					callback.OnComplete(10, 4)
 					return nil
 				}

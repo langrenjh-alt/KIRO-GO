@@ -200,17 +200,22 @@ func TestIncompleteAgentResponseTerminalDecisionMatrix(t *testing.T) {
 		name           string
 		visibleContent string
 		markerSeen     bool
-		toolCount      int
+		toolNames      []string
 		stopReason     string
 		wantIncomplete bool
 	}{
-		{name: "unmarked visible native end turn", visibleContent: "final answer", stopReason: "END_TURN", wantIncomplete: true},
-		{name: "action-only native end turn", visibleContent: "I will inspect the file now.", stopReason: "END_TURN", wantIncomplete: true},
+		{name: "unmarked visible native end turn", visibleContent: "final answer", stopReason: "END_TURN"},
+		{name: "action-looking native end turn", visibleContent: "I will inspect the file now.", stopReason: "END_TURN"},
+		{name: "serialized tool call native end turn", visibleContent: `<invoke name="shell_command"><parameter name="command">pwd</parameter></invoke>`, stopReason: "END_TURN", wantIncomplete: true},
 		{name: "empty native end turn", stopReason: "END_TURN", wantIncomplete: true},
 		{name: "visible max tokens", visibleContent: "partial answer", stopReason: "MAX_TOKENS", wantIncomplete: true},
+		{name: "marked visible max tokens", visibleContent: "partial answer", markerSeen: true, stopReason: "MAX_TOKENS", wantIncomplete: true},
 		{name: "visible without terminal", visibleContent: "partial answer", wantIncomplete: true},
-		{name: "completion marker", markerSeen: true, stopReason: "END_TURN"},
-		{name: "tool call", toolCount: 1, stopReason: "TOOL_USE"},
+		{name: "completion marker with visible answer", visibleContent: "final answer", markerSeen: true, stopReason: "END_TURN"},
+		{name: "completion marker without visible answer", markerSeen: true, stopReason: "END_TURN", wantIncomplete: true},
+		{name: "tool call", toolNames: []string{"shell_command"}, stopReason: "TOOL_USE"},
+		{name: "tool call without metadata terminal", toolNames: []string{"shell_command"}},
+		{name: "tool call followed by max tokens", toolNames: []string{"shell_command"}, stopReason: "MAX_TOKENS", wantIncomplete: true},
 	}
 
 	for _, test := range tests {
@@ -220,7 +225,7 @@ func TestIncompleteAgentResponseTerminalDecisionMatrix(t *testing.T) {
 				test.visibleContent == "",
 				test.visibleContent,
 				test.markerSeen,
-				test.toolCount,
+				test.toolNames,
 				test.stopReason,
 			)
 			if got != test.wantIncomplete {
@@ -230,41 +235,66 @@ func TestIncompleteAgentResponseTerminalDecisionMatrix(t *testing.T) {
 	}
 }
 
-func TestUnmarkedEndTurnUsesTwoShortContinuationsThenFullContextRecovery(t *testing.T) {
+func TestSerializedAgentToolCallTerminalClassifier(t *testing.T) {
 	payload := completionProtocolTestPayload()
-	err := agentCompletionResponseError(payload, true, "All core modules confirmed. Now the test suite -- this is the gate for everything downstream.", false, 0, "END_TURN")
-	if !isUpstreamAgentActionOnlyError(err) {
-		t.Fatalf("unmarked END_TURN was not classified for continuation: %v", err)
-	}
-	prepareReasoningOnlyRetry(payload, err)
-	if payload.AgentActionContinuations != 1 || !agentCompletionRetryAllowed(payload, err) {
-		t.Fatalf("first action continuation was rejected: completions=%d actions=%d", payload.AgentCompletionRetries, payload.AgentActionContinuations)
+	payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.Tools[0].ToolSpecification.Name = "edit"
+	carrier := `<invoke name="edit"> <parameter name="file_path">/e/test/core.js</parameter> <parameter name="old_string">function unequip(s) { return s; }</parameter> <parameter name="new_string">function unequip(s) { if (!s) return false; return s; }</parameter> </invoke>`
+
+	err := agentCompletionResponseError(payload, true, carrier, false, nil, "END_TURN")
+	if err == nil || !isUpstreamAgentActionOnlyError(err) {
+		t.Fatalf("serialized edit carrier was accepted as a final answer: %v", err)
 	}
 
-	err = agentCompletionResponseError(payload, false, "This could also be a normal-looking final answer.", false, 0, "END_TURN")
-	prepareReasoningOnlyRetry(payload, err)
-	if payload.AgentActionContinuations != 2 || !agentCompletionRetryAllowed(payload, err) {
-		t.Fatalf("second action continuation was rejected: completions=%d actions=%d", payload.AgentCompletionRetries, payload.AgentActionContinuations)
+	for _, content := range []string{
+		"Final answer with an embedded <invoke name=\"edit\"> example.",
+		"```xml\n<invoke name=\"edit\"><parameter name=\"file_path\">main.go</parameter></invoke>\n```",
+		`<invoke name="unknown"><parameter name="file_path">main.go</parameter></invoke>`,
+	} {
+		if err := agentCompletionResponseError(payload, false, content, false, nil, "END_TURN"); err != nil {
+			t.Fatalf("ordinary terminal content was rejected: content=%q err=%v", content, err)
+		}
+	}
+}
+
+func TestAgentCompletionGateBuffersSerializedToolCarrier(t *testing.T) {
+	payload := completionProtocolTestPayload()
+	payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.Tools[0].ToolSpecification.Name = "edit"
+	gate := newAgentCompletionGateForPayload(payload)
+	parts := []string{
+		"  <inv",
+		`oke name="edit">`,
+		` <parameter name="file_path">/e/test/core.js</parameter>`,
+		` </invoke>`,
+	}
+	for _, part := range parts {
+		if got := gate.Push(part); got != "" {
+			t.Fatalf("serialized tool carrier leaked before validation: %q", got)
+		}
+	}
+	if got := gate.VisibleText(); got != strings.Join(parts, "") {
+		t.Fatalf("serialized carrier evidence was not retained: %q", got)
+	}
+	if got := gate.CommitPendingForTool(); got != "" || gate.VisibleText() != "" {
+		t.Fatalf("serialized carrier was not discarded for a real tool call: released=%q visible=%q", got, gate.VisibleText())
 	}
 
-	prepareReasoningOnlyRetry(payload, err)
-	if payload.AgentActionContinuations != 3 || payload.AgentFullContextRecoveries != 1 ||
-		!payload.agentFullContextRecoveryPending || !agentCompletionRetryAllowed(payload, err) {
-		t.Fatalf("full-context recovery was not prepared: completions=%d actions=%d full=%d pending=%v",
-			payload.AgentCompletionRetries, payload.AgentActionContinuations,
-			payload.AgentFullContextRecoveries, payload.agentFullContextRecoveryPending)
+	ordinary := newAgentCompletionGateForPayload(payload)
+	content := `<invoke name="unknown"><parameter name="file_path">main.go</parameter></invoke>`
+	if got := ordinary.Push(content); got != content {
+		t.Fatalf("unknown-tool XML was buffered as a tool carrier: %q", got)
 	}
-	if content := payload.ConversationState.CurrentMessage.UserInputMessage.Content; !strings.Contains(content, "<agent_full_context_recovery>") ||
-		!strings.Contains(content, "native structured tool-call channel") {
-		t.Fatalf("full-context recovery instruction missing: %q", content)
-	}
+}
 
-	prepareReasoningOnlyRetry(payload, err)
-	if payload.AgentActionContinuations != 4 || payload.AgentFullContextRecoveries != 1 ||
-		payload.agentFullContextRecoveryPending || agentCompletionRetryAllowed(payload, err) {
-		t.Fatalf("full-context recovery was not bounded: completions=%d actions=%d full=%d pending=%v",
-			payload.AgentCompletionRetries, payload.AgentActionContinuations,
-			payload.AgentFullContextRecoveries, payload.agentFullContextRecoveryPending)
+func TestUnmarkedVisibleEndTurnSkipsSemanticRecovery(t *testing.T) {
+	payload := completionProtocolTestPayload()
+	err := agentCompletionResponseError(payload, true, "All core modules confirmed. Now the test suite -- this is the gate for everything downstream.", false, nil, "END_TURN")
+	if err != nil {
+		t.Fatalf("unmarked visible END_TURN entered semantic recovery: %v", err)
+	}
+	if payload.AgentCompletionRetries != 0 || payload.AgentActionContinuations != 0 ||
+		payload.AgentFullContextRecoveries != 0 {
+		t.Fatalf("successful END_TURN mutated recovery state: completions=%d actions=%d full=%d",
+			payload.AgentCompletionRetries, payload.AgentActionContinuations, payload.AgentFullContextRecoveries)
 	}
 }
 
@@ -373,14 +403,48 @@ func TestAgentCompletionRetriesOnlyMissingMarkerTwice(t *testing.T) {
 	}
 }
 
-func TestAgentRecoveryUsesLowEffortAndRequiresImmediateStructuredAction(t *testing.T) {
-	payload := completionProtocolTestPayload()
-	payload.AdditionalModelRequestFields = newReasoningFields("claude-opus-5", "high")
-
-	prepareReasoningOnlyRetry(payload, newUpstreamAgentMarkerMismatchError())
-	if got := payload.AdditionalModelRequestFields.OutputConfig.Effort; got != "low" {
-		t.Fatalf("recovery effort=%q, want low", got)
+func TestAgentRecoveryNeverLowersEffort(t *testing.T) {
+	tests := []struct {
+		initial    string
+		wantFirst  string
+		wantSecond string
+	}{
+		{initial: "low", wantFirst: "low", wantSecond: "medium"},
+		{initial: "medium", wantFirst: "medium", wantSecond: "medium"},
+		{initial: "high", wantFirst: "high", wantSecond: "high"},
+		{initial: "xhigh", wantFirst: "xhigh", wantSecond: "xhigh"},
+		{initial: "max", wantFirst: "max", wantSecond: "max"},
 	}
+	for _, test := range tests {
+		t.Run(test.initial, func(t *testing.T) {
+			payload := completionProtocolTestPayload()
+			payload.AdditionalModelRequestFields = newReasoningFields("claude-opus-5", test.initial)
+
+			prepareReasoningOnlyRetry(payload, newUpstreamAgentMarkerMismatchError())
+			if got := payload.AdditionalModelRequestFields.OutputConfig.Effort; got != test.wantFirst {
+				t.Fatalf("first recovery effort=%q, want %q", got, test.wantFirst)
+			}
+			prepareReasoningOnlyRetry(payload, newUpstreamAgentMarkerMismatchError())
+			if got := payload.AdditionalModelRequestFields.OutputConfig.Effort; got != test.wantSecond {
+				t.Fatalf("second recovery effort=%q, want %q", got, test.wantSecond)
+			}
+			prepareReasoningOnlyRetry(payload, newUpstreamAgentMarkerMismatchError())
+			if !payload.agentFullContextRecoveryPending {
+				t.Fatal("third failure did not prepare full-context recovery")
+			}
+			if got := payload.AdditionalModelRequestFields.OutputConfig.Effort; got != test.wantSecond {
+				t.Fatalf("full-context recovery effort=%q, want %q", got, test.wantSecond)
+			}
+			if !prepareAgentInputTooLongRecovery(payload) {
+				t.Fatal("input-too-long recovery was not prepared")
+			}
+			if got := payload.AdditionalModelRequestFields.OutputConfig.Effort; got != test.wantSecond {
+				t.Fatalf("input-too-long recovery effort=%q, want %q", got, test.wantSecond)
+			}
+		})
+	}
+
+	payload := completionProtocolTestPayload()
 	if instruction := agentCompletionRetryInstruction(payload.AgentCompletionMarker); !strings.Contains(instruction, "first response event") {
 		t.Fatalf("recovery instruction does not require an immediate structured action: %q", instruction)
 	}
@@ -455,6 +519,65 @@ func TestAgentRecoveryActionHintPreservesReasoningFallback(t *testing.T) {
 	callback.OnText("next tool action", true)
 	if observed != "next tool action" || payload.agentRecoveryActionHint != "next tool action" {
 		t.Fatalf("reasoning fallback was not preserved: observed=%q hint=%q", observed, payload.agentRecoveryActionHint)
+	}
+}
+
+func TestAgentRecoveryCaptureSeparatesReasoningAndVisibleText(t *testing.T) {
+	payload := completionProtocolTestPayload()
+	var observedReasoning, observedVisible string
+	callback := captureAgentRecoveryActionHint(payload, &KiroStreamCallback{
+		OnReasoning: func(event KiroReasoningContentEvent) {
+			observedReasoning += event.Text
+		},
+		OnText: func(text string, isThinking bool) {
+			if !isThinking {
+				observedVisible += text
+			}
+		},
+	})
+
+	callback.OnReasoning(KiroReasoningContentEvent{Text: "DECISION_CAUSE_SENTINEL: inspect before editing."})
+	callback.OnText(payload.AgentCompletionMarker+"I will inspect proxy/translator.go now.", false)
+
+	if observedReasoning == "" || observedVisible == "" {
+		t.Fatalf("capture changed original callbacks: reasoning=%q visible=%q", observedReasoning, observedVisible)
+	}
+	if !strings.Contains(payload.agentRecoveryAttemptReasoning, "DECISION_CAUSE_SENTINEL") ||
+		!strings.Contains(payload.agentRecoveryAttemptVisibleText, "I will inspect") {
+		t.Fatalf("attempt channels were merged or dropped: reasoning=%q visible=%q",
+			payload.agentRecoveryAttemptReasoning, payload.agentRecoveryAttemptVisibleText)
+	}
+	if strings.Contains(payload.agentRecoveryActionHint, payload.AgentCompletionMarker) ||
+		!strings.Contains(payload.agentRecoveryActionHint, "I will inspect") ||
+		strings.Contains(payload.agentRecoveryActionHint, "DECISION_CAUSE_SENTINEL") {
+		t.Fatalf("visible text did not take precedence for the action hint: %q", payload.agentRecoveryActionHint)
+	}
+	if len(payload.agentRecoveryAttemptReasoning) > agentRecoveryAttemptMaxBytes ||
+		len(payload.agentRecoveryAttemptVisibleText) > agentRecoveryAttemptMaxBytes ||
+		!utf8.ValidString(payload.agentRecoveryAttemptReasoning) ||
+		!utf8.ValidString(payload.agentRecoveryAttemptVisibleText) {
+		t.Fatal("attempt buffers are not bounded UTF-8")
+	}
+}
+
+func TestAgentRecoveryReasoningOnlyKeepsOriginalUserTurnCurrent(t *testing.T) {
+	payload := completionProtocolTestPayload()
+	originalHistoryLen := len(payload.ConversationState.History)
+	originalCurrent := payload.ConversationState.CurrentMessage.UserInputMessage.Content
+	callback := captureAgentRecoveryActionHint(payload, &KiroStreamCallback{
+		OnReasoning: func(KiroReasoningContentEvent) {},
+	})
+	callback.OnReasoning(KiroReasoningContentEvent{Text: "reasoning-only-cause-sentinel"})
+
+	prepareReasoningOnlyRetry(payload, newUpstreamAgentMarkerMismatchError())
+
+	if len(payload.ConversationState.History) != originalHistoryLen {
+		t.Fatalf("reasoning-only attempt fabricated history: before=%d after=%d", originalHistoryLen, len(payload.ConversationState.History))
+	}
+	current := payload.ConversationState.CurrentMessage.UserInputMessage
+	if !strings.Contains(current.Content, originalCurrent) || !strings.Contains(current.Content, "reasoning-only-cause-sentinel") ||
+		!strings.Contains(current.Content, agentCompletionRetryInstruction(payload.AgentCompletionMarker)) {
+		t.Fatalf("reasoning-only recovery lost the original user turn or cause: %q", current.Content)
 	}
 }
 
@@ -550,6 +673,72 @@ func TestAgentGuardKeepsTwoSemanticRetriesAndBoundedActionHint(t *testing.T) {
 	}
 }
 
+func TestCollectAgentRecoveryEvidenceKeepsToolCauseAndResultAtomic(t *testing.T) {
+	history := []KiroHistoryMessage{
+		{UserInputMessage: &KiroUserInputMessage{Content: "causal-user-goal"}},
+		{AssistantResponseMessage: &KiroAssistantResponseMessage{
+			Content: "DECISION_CAUSE_SENTINEL: inspect both files before editing.",
+			ToolUses: []KiroToolUse{
+				{ToolUseID: "toolu_a", Name: "read_file", Input: map[string]interface{}{"path": "a.go"}},
+				{ToolUseID: "toolu_b", Name: "read_file", Input: map[string]interface{}{"path": "b.go"}},
+			},
+		}},
+		{UserInputMessage: &KiroUserInputMessage{
+			Content: "inspection finished",
+			UserInputMessageContext: &UserInputMessageContext{ToolResults: []KiroToolResult{
+				{ToolUseID: "toolu_a", Status: "success", Content: []KiroResultContent{{Text: "A_RESULT"}}},
+				{ToolUseID: "toolu_b", Status: "error", Content: []KiroResultContent{{Text: "B_RESULT"}}},
+			}},
+		}},
+	}
+
+	evidence := collectAgentRecoveryEvidence(history, 16<<10)
+	if !json.Valid([]byte(evidence)) {
+		t.Fatalf("causal evidence is not valid JSON: %q", evidence)
+	}
+	var units []agentRecoveryCausalUnit
+	if err := json.Unmarshal([]byte(evidence), &units); err != nil {
+		t.Fatal(err)
+	}
+	if len(units) != 2 || units[1].Pairing != "complete_tool_exchange" || len(units[1].Messages) != 2 {
+		t.Fatalf("tool exchange was split: %#v", units)
+	}
+	for _, sentinel := range []string{
+		"DECISION_CAUSE_SENTINEL", "toolu_a", "toolu_b", "read_file", "a.go", "b.go", "A_RESULT", "B_RESULT",
+	} {
+		if !strings.Contains(evidence, sentinel) {
+			t.Fatalf("causal exchange lost %q: %s", sentinel, evidence)
+		}
+	}
+
+	tight := collectAgentRecoveryEvidence(history[1:], 320)
+	if tight == "" {
+		return // Omitting an exchange is preferable to emitting half of one.
+	}
+	var tightUnits []agentRecoveryCausalUnit
+	if err := json.Unmarshal([]byte(tight), &tightUnits); err != nil {
+		t.Fatalf("tight evidence is truncated JSON: %q (%v)", tight, err)
+	}
+	if len(tightUnits) != 1 || len(tightUnits[0].Messages) != 2 {
+		t.Fatalf("tight budget emitted half an exchange: %#v", tightUnits)
+	}
+}
+
+func TestCollectAgentRecoveryEvidenceMarksOrphanResults(t *testing.T) {
+	history := []KiroHistoryMessage{
+		{UserInputMessage: &KiroUserInputMessage{
+			UserInputMessageContext: &UserInputMessageContext{ToolResults: []KiroToolResult{{
+				ToolUseID: "orphan_call", Status: "error", Content: []KiroResultContent{{Text: "orphan-output"}},
+			}}},
+		}},
+	}
+	evidence := collectAgentRecoveryEvidence(history, 2048)
+	if !strings.Contains(evidence, `"pairing":"orphan_tool_result"`) ||
+		!strings.Contains(evidence, "orphan_call") || !strings.Contains(evidence, "orphan-output") {
+		t.Fatalf("orphan result was disguised or lost: %s", evidence)
+	}
+}
+
 func TestLongAgentRecoveryCompactsPlanningHistoryOnlyAfterFailure(t *testing.T) {
 	payload := completionProtocolTestPayload()
 	payload.ConversationState.ConversationID = "original-conversation"
@@ -559,7 +748,7 @@ func TestLongAgentRecoveryCompactsPlanningHistoryOnlyAfterFailure(t *testing.T) 
 		{AssistantResponseMessage: &KiroAssistantResponseMessage{Content: "I will follow these instructions."}},
 		{UserInputMessage: &KiroUserInputMessage{Content: strings.Repeat("repository evidence ", 8000) + "recent-user-sentinel"}},
 		{AssistantResponseMessage: &KiroAssistantResponseMessage{
-			Content: strings.Repeat("Let me keep planning without acting. ", 12000),
+			Content: strings.Repeat("Let me keep planning without acting. ", 12000) + " DECISION_CAUSE_SENTINEL: tests must verify the edit.",
 			ToolUses: []KiroToolUse{{
 				ToolUseID: previousToolUseID,
 				Name:      "shell_command",
@@ -617,11 +806,13 @@ func TestLongAgentRecoveryCompactsPlanningHistoryOnlyAfterFailure(t *testing.T) 
 	if recoveryUser == nil || !strings.Contains(recoveryUser.Content, "recent-user-sentinel") ||
 		!strings.Contains(recoveryUser.Content, "current-request-sentinel") ||
 		!strings.Contains(recoveryUser.Content, "tool-result-sentinel") ||
-		!strings.Contains(recoveryUser.Content, `<tool_result status="error">`) {
+		!strings.Contains(recoveryUser.Content, previousToolUseID) ||
+		!strings.Contains(recoveryUser.Content, "shell_command") ||
+		!strings.Contains(recoveryUser.Content, "go test ./proxy") ||
+		!strings.Contains(recoveryUser.Content, "complete_tool_exchange") ||
+		!strings.Contains(recoveryUser.Content, "DECISION_CAUSE_SENTINEL") ||
+		!strings.Contains(recoveryUser.Content, `<recent_causal_evidence encoding="json">`) {
 		t.Fatalf("recovery evidence was not preserved: %#v", recoveryUser)
-	}
-	if strings.Contains(recoveryUser.Content, "Let me keep planning") {
-		t.Fatal("assistant planning leaked into compacted recovery context")
 	}
 	if current.UserInputMessageContext == nil || len(current.UserInputMessageContext.Tools) != 1 ||
 		len(current.UserInputMessageContext.ToolResults) != 0 {
@@ -647,7 +838,7 @@ func TestFullContextRecoveryRestoresOriginalEvidenceWithinBudget(t *testing.T) {
 		{UserInputMessage: &KiroUserInputMessage{Content: agentCompletionProtocolInstruction(payload.AgentCompletionMarker)}},
 		{AssistantResponseMessage: &KiroAssistantResponseMessage{Content: "primed"}},
 		{UserInputMessage: &KiroUserInputMessage{Content: "ORIGINAL_HISTORY_SENTINEL"}},
-		{AssistantResponseMessage: &KiroAssistantResponseMessage{Content: strings.Repeat("ORIGINAL_PLANNING_SENTINEL ", 24000)}},
+		{AssistantResponseMessage: &KiroAssistantResponseMessage{Content: "UNRELATED_PLANNING_HEAD_SENTINEL " + strings.Repeat("planning filler ", 40000) + " DECISION_CAUSE_SENTINEL: inspect the generated file before editing."}},
 	}
 	current := &payload.ConversationState.CurrentMessage.UserInputMessage
 	current.ModelID = "claude-sonnet-4.5"
@@ -699,9 +890,11 @@ func TestFullContextRecoveryRestoresOriginalEvidenceWithinBudget(t *testing.T) {
 	if !strings.Contains(current.Content, "ORIGINAL_CURRENT_SENTINEL") ||
 		!strings.Contains(current.Content, "ORIGINAL_HISTORY_SENTINEL") ||
 		!strings.Contains(current.Content, "ORIGINAL_TOOL_RESULT_SENTINEL") ||
-		!strings.Contains(current.Content, `<tool_result status="error">`) ||
+		!strings.Contains(current.Content, "toolu_original") ||
+		!strings.Contains(current.Content, "orphan_tool_result") ||
+		!strings.Contains(current.Content, "DECISION_CAUSE_SENTINEL") ||
 		!strings.Contains(current.Content, "<agent_bounded_full_context_recovery>") ||
-		strings.Contains(current.Content, "ORIGINAL_PLANNING_SENTINEL") ||
+		strings.Contains(current.Content, "UNRELATED_PLANNING_HEAD_SENTINEL") ||
 		!strings.Contains(current.Content, "FINAL_ACTION_HINT_SENTINEL") {
 		t.Fatalf("full recovery current content=%q", current.Content)
 	}
@@ -726,7 +919,7 @@ func TestAgentInputTooLongRecoveryCompactsOriginalEvidenceWithinBudget(t *testin
 		{UserInputMessage: &KiroUserInputMessage{Content: agentCompletionProtocolInstruction(payload.AgentCompletionMarker)}},
 		{AssistantResponseMessage: &KiroAssistantResponseMessage{Content: "primed"}},
 		{UserInputMessage: &KiroUserInputMessage{Content: "ORIGINAL_USER_GOAL_SENTINEL: fix both generated files"}},
-		{AssistantResponseMessage: &KiroAssistantResponseMessage{Content: strings.Repeat("old planning must be omitted ", 24000)}},
+		{AssistantResponseMessage: &KiroAssistantResponseMessage{Content: "UNRELATED_PLANNING_HEAD_SENTINEL " + strings.Repeat("old planning filler ", 24000) + " DECISION_CAUSE_SENTINEL: read the file before retrying the write."}},
 	}
 	current := &payload.ConversationState.CurrentMessage.UserInputMessage
 	current.Content = "retry the failed write"
@@ -761,9 +954,11 @@ func TestAgentInputTooLongRecoveryCompactsOriginalEvidenceWithinBudget(t *testin
 	}
 	if !strings.Contains(current.Content, "ORIGINAL_USER_GOAL_SENTINEL") ||
 		!strings.Contains(current.Content, "WRITE_FAILURE_SENTINEL") ||
-		!strings.Contains(current.Content, `<tool_result status="error">`) ||
+		!strings.Contains(current.Content, "tool_write_failed") ||
+		!strings.Contains(current.Content, "orphan_tool_result") ||
+		!strings.Contains(current.Content, "DECISION_CAUSE_SENTINEL") ||
 		!strings.Contains(current.Content, "<agent_bounded_context_recovery>") ||
-		strings.Contains(current.Content, "old planning must be omitted") {
+		strings.Contains(current.Content, "UNRELATED_PLANNING_HEAD_SENTINEL") {
 		t.Fatalf("bounded recovery lost required evidence or retained planning: %q", current.Content)
 	}
 	if agentRecoveryExceedsBudget(payload, "") {
@@ -825,7 +1020,8 @@ func TestShortAgentRecoveryDoesNotCompactConversation(t *testing.T) {
 	prepareReasoningOnlyRetry(payload, newUpstreamAgentMarkerMismatchError())
 
 	if payload.AgentRecoveryCompacted || payload.ConversationState.ConversationID != "short-conversation" ||
-		len(payload.ConversationState.History) != 3 {
+		len(payload.ConversationState.History) != 1 ||
+		!strings.Contains(payload.ConversationState.CurrentMessage.UserInputMessage.Content, agentCompletionRetryInstruction(payload.AgentCompletionMarker)) {
 		t.Fatalf("short recovery was compacted: compacted=%v id=%q history=%d",
 			payload.AgentRecoveryCompacted, payload.ConversationState.ConversationID, len(payload.ConversationState.History))
 	}

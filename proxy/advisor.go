@@ -421,15 +421,15 @@ func (h *Handler) callClaudeBuffered(
 		if err == nil {
 			visibleContent, _ := extractThinkingFromContent(content.String())
 			visibleContent, markerSeen := filterAgentCompletionContent(payload, visibleContent, len(result.ToolUses))
-			if incompleteAgentResponse(
+			if completionErr := agentCompletionResponseError(
 				payload,
 				suppressedReasoningObserved || reasoning.Len() > 0 || result.Reasoning.Signature != "" || len(result.Reasoning.Redacted) > 0,
 				visibleContent,
 				markerSeen,
-				len(result.ToolUses),
+				completedKiroToolNames(result.ToolUses),
 				result.UpstreamStopReason,
-			) {
-				err = newUpstreamAgentMarkerMismatchError()
+			); completionErr != nil {
+				err = completionErr
 				prepareReasoningOnlyRetry(payload, err)
 			}
 		}

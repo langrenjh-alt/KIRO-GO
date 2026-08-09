@@ -55,6 +55,45 @@ func TestContextUsageBlendEasesInGently(t *testing.T) {
 	}
 }
 
+func TestContextUsageBlendHasNoComparabilityCliff(t *testing.T) {
+	const model = "glm-5"
+	payload := &KiroPayload{}
+	observeKiroContextUsage(payload, model, 90)
+	parityOccupancy := contextUsageTokens(model, contextUsageBlendParityPercent)
+	boundary := int(float64(parityOccupancy) * contextUsageMinComparableShare)
+	below := contextUsageBlendedInputTokens(payload, model, boundary-1)
+	at := contextUsageBlendedInputTokens(payload, model, boundary)
+	if jump := at - below; jump < 0 || jump > 16 {
+		t.Fatalf("one-token comparability crossing jumped by %d tokens: below=%d at=%d", jump, below, at)
+	}
+}
+
+func TestContextUsageBlendDoesNotDropNearFullWindow(t *testing.T) {
+	const model = "glm-5"
+	// This estimate is below the old moving 25% boundary at full occupancy.
+	// With an occupancy-relative denominator, 90% -> 100% made public usage
+	// decrease even though the upstream context had only become fuller.
+	const client = 20_000
+	previous := 0
+	for percentage := 85.0; percentage <= 100; percentage++ {
+		payload := &KiroPayload{}
+		observeKiroContextUsage(payload, model, percentage)
+		got := contextUsageBlendedInputTokens(payload, model, client)
+		if got < previous {
+			t.Fatalf("percentage=%v public input tokens=%d dropped below %d", percentage, got, previous)
+		}
+		previous = got
+	}
+}
+
+func TestContextUsageBlendKeepsTinyUnrelatedEstimateStable(t *testing.T) {
+	payload := &KiroPayload{}
+	observeKiroContextUsage(payload, "claude-opus-5", 80)
+	if got := contextUsageBlendedInputTokens(payload, "claude-opus-5", 80); got != 80 {
+		t.Fatalf("tiny unrelated estimate=%d, want unchanged 80", got)
+	}
+}
+
 // The whole point of the feature: once upstream is nearly full, the reported
 // share must be close enough to the real share that the client compacts in time.
 func TestContextUsageBlendTracksRealOccupancyShare(t *testing.T) {
