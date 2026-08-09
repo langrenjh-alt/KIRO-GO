@@ -160,7 +160,7 @@
   "settings.reasoningCapRatioMedium": "Ratio: medium effort",
   "settings.reasoningCapRatioHigh": "Ratio: high effort",
   "settings.reasoningCapRatioXHigh": "Ratio: xhigh/max effort",
-  "settings.reasoningCapRatioHint": "Each ratio is a fraction of the model context window; the token ceiling caps the result. Leave a field at 0 to keep its built-in default (4% / 8% / 15% / 25%, ceiling 53248).",
+  "settings.reasoningCapRatioHint": "Each ratio is a fraction of the model context window and remains subject to a token ceiling. Zero keeps the built-in 4% / 8% / 15% / 25% ratios and low / medium / high / xhigh(max) ceilings of 4096 / 6144 / 8192 / 12288. A configured token ceiling overrides these effort defaults.",
   "settings.saveReasoningCap": "Save Reasoning Budget",
   "settings.reasoningCapSaved": "Reasoning budget saved",
   "settings.policyValueInvalid": "A policy value is outside its allowed range",

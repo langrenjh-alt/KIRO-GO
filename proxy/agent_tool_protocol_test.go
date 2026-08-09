@@ -176,6 +176,9 @@ func TestAgentCompletionMarkerCanBeHotReloadedWithoutWeakeningForcedToolChoice(t
 		if payload.AgentCompletionMarker != "" || strings.Contains(priming, "<agent_completion_protocol>") || strings.Contains(priming, "<agent_final_") {
 			t.Fatalf("%s marker protocol remained active: marker=%q priming=%q", name, payload.AgentCompletionMarker, priming)
 		}
+		if payload.AgentCompletionProtocolEnabled || !payload.AgentReasoningCapEnabled {
+			t.Fatalf("%s marker/cap were not decoupled: completion=%v cap=%v", name, payload.AgentCompletionProtocolEnabled, payload.AgentReasoningCapEnabled)
+		}
 		if !strings.Contains(priming, agentToolProtocol) {
 			t.Fatalf("%s tool protocol was disabled with the marker: %q", name, priming)
 		}
@@ -188,7 +191,7 @@ func TestAgentCompletionMarkerCanBeHotReloadedWithoutWeakeningForcedToolChoice(t
 	forcedReq.ToolChoice = "required"
 	forced := OpenAIToKiro(&forcedReq, false)
 	forcedPriming := structuredOutputPriming(t, forced)
-	if forced.AgentCompletionMarker != "" || !forced.AgentCompletionProtocolEnabled || !strings.Contains(forcedPriming, "<forced_tool_choice_completion_protocol>") {
+	if forced.AgentCompletionMarker != "" || !forced.AgentCompletionProtocolEnabled || !forced.AgentReasoningCapEnabled || !strings.Contains(forcedPriming, "<forced_tool_choice_completion_protocol>") {
 		t.Fatalf("forced tool guard was disabled with the automatic marker: marker=%q priming=%q", forced.AgentCompletionMarker, forcedPriming)
 	}
 	if strings.Contains(forcedPriming, "<agent_completion_protocol>") || strings.Contains(forcedPriming, "<agent_final_") {

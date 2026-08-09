@@ -334,6 +334,10 @@ type KiroPayload struct {
 	// AgentCompletionProtocolEnabled binds completion lifecycle handling to this
 	// request and keeps forced tool-choice validation independent of the marker.
 	AgentCompletionProtocolEnabled bool `json:"-"`
+	// AgentReasoningCapEnabled independently marks recognized coding-agent tool
+	// turns whose pre-action reasoning should be bounded. This deliberately does
+	// not depend on AgentCompletionMarker or the completion lifecycle protocol.
+	AgentReasoningCapEnabled bool `json:"-"`
 	// AgentCompletionRetries counts semantic repair attempts independently from
 	// transport/account retries. It is private to the handler's cloned payload.
 	AgentCompletionRetries int `json:"-"`
@@ -1271,15 +1275,12 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		}
 		callback.AgentCompletionRequired = true
 		callback.AgentThinkingTimeout = initialAgentThinkingTimeout(payload)
-		// The cap applies to any client that reaches the marker protocol, so it
-		// does not depend on harness recognition or tool-name matching.
-		// Resolved per request so an admin change applies to the next generation
-		// without restarting the process.
-		if settings := resolveReasoningCapSettings(); settings.Mode != reasoningCapOff {
-			callback.ReasoningCapMode = settings.Mode
-			callback.ReasoningCapBytes = reasoningCapBytes(payload, settings)
-		}
 	}
+	// The reasoning budget is an independent resource guard. It must remain
+	// active for recognized coding-agent turns even when the optional marker
+	// completion protocol is disabled in the WebUI. Resolve the settings for
+	// every request so a successful admin update takes effect without restart.
+	applyReasoningCapSettings(payload, callback, resolveReasoningCapSettings())
 	callback = instrumentKiroCallbackTiming(timing, callback)
 
 	if payload != nil && strings.TrimSpace(payload.ProfileArn) == "" {

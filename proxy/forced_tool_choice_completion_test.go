@@ -86,8 +86,10 @@ func TestForcedToolChoiceProtocolAndRecoveryPreservePrivateState(t *testing.T) {
 	}
 	payload := OpenAIToKiro(req, false)
 	priming := structuredOutputPriming(t, payload)
-	if payload.ToolChoiceMode != "specific" || payload.ToolChoiceName != "shell_command" || !payload.AgentCompletionProtocolEnabled {
-		t.Fatalf("forced private state missing: mode=%q name=%q protocol=%v", payload.ToolChoiceMode, payload.ToolChoiceName, payload.AgentCompletionProtocolEnabled)
+	if payload.ToolChoiceMode != "specific" || payload.ToolChoiceName != "shell_command" ||
+		!payload.AgentCompletionProtocolEnabled || !payload.AgentReasoningCapEnabled {
+		t.Fatalf("forced private state missing: mode=%q name=%q protocol=%v cap=%v",
+			payload.ToolChoiceMode, payload.ToolChoiceName, payload.AgentCompletionProtocolEnabled, payload.AgentReasoningCapEnabled)
 	}
 	if !strings.Contains(priming, "<forced_tool_choice_completion_protocol>") {
 		t.Fatalf("forced completion protocol missing: %q", priming)
@@ -100,15 +102,18 @@ func TestForcedToolChoiceProtocolAndRecoveryPreservePrivateState(t *testing.T) {
 	}
 
 	clone := cloneKiroPayload(payload)
-	if clone.ToolChoiceMode != payload.ToolChoiceMode || clone.ToolChoiceName != payload.ToolChoiceName || clone.AgentCompletionProtocolEnabled != payload.AgentCompletionProtocolEnabled {
+	if clone.ToolChoiceMode != payload.ToolChoiceMode || clone.ToolChoiceName != payload.ToolChoiceName ||
+		clone.AgentCompletionProtocolEnabled != payload.AgentCompletionProtocolEnabled ||
+		clone.AgentReasoningCapEnabled != payload.AgentReasoningCapEnabled {
 		t.Fatalf("clone lost forced state: %#v", clone)
 	}
 	if !captureAgentRecoveryOriginalPayload(clone) {
 		t.Fatal("failed to capture recovery payload")
 	}
 	clone.ConversationState.CurrentMessage.UserInputMessage.Content = "mutated"
-	if !restoreAgentRecoveryOriginalPayload(clone) || clone.ToolChoiceName != "shell_command" {
-		t.Fatalf("restore lost specific tool choice: mode=%q name=%q", clone.ToolChoiceMode, clone.ToolChoiceName)
+	if !restoreAgentRecoveryOriginalPayload(clone) || clone.ToolChoiceName != "shell_command" || !clone.AgentReasoningCapEnabled {
+		t.Fatalf("restore lost forced state: mode=%q name=%q cap=%v",
+			clone.ToolChoiceMode, clone.ToolChoiceName, clone.AgentReasoningCapEnabled)
 	}
 
 	prepareReasoningOnlyRetry(clone, newUpstreamAgentToolChoiceMismatchError("specific", "shell_command", nil))

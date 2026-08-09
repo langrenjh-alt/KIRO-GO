@@ -146,11 +146,79 @@ func TestReasoningCapConfiguredRatiosOverrideDefaults(t *testing.T) {
 	if got := s.ratioForEffort("high"); got != reasoningCapRatioHigh {
 		t.Fatalf("unset high ratio = %v, want the built-in %v", got, reasoningCapRatioHigh)
 	}
-	if got := (reasoningCapSettings{}).maxTokens(); got != reasoningCapMaxTokens {
-		t.Fatalf("unset maxTokens = %d, want the built-in %d", got, reasoningCapMaxTokens)
-	}
-	if got := (reasoningCapSettings{MaxTokens: 4096}).maxTokens(); got != 4096 {
+	if got := (reasoningCapSettings{MaxTokens: 4096}).maxTokensForEffort("xhigh"); got != 4096 {
 		t.Fatalf("configured maxTokens = %d, want 4096", got)
+	}
+}
+
+func TestReasoningCapDefaultEffortCeilingsPreserveLargeWindowLadder(t *testing.T) {
+	want := map[string]int{
+		"low":    4 << 10,
+		"medium": 6 << 10,
+		"high":   8 << 10,
+		"xhigh":  12 << 10,
+		"max":    12 << 10,
+	}
+	for effort, wantTokens := range want {
+		gotBytes := reasoningCapBytes(newReasoningCapPayload("claude-opus-5", effort), reasoningCapSettings{})
+		if gotTokens := gotBytes / reasoningCapBytesPerToken; gotTokens != wantTokens {
+			t.Fatalf("%s cap = %d tokens, want %d", effort, gotTokens, wantTokens)
+		}
+	}
+}
+
+func TestReasoningCapRatioCanStayBelowEffortCeiling(t *testing.T) {
+	const ratio = 0.001
+	settings := reasoningCapSettings{
+		RatioLow: ratio, RatioMedium: ratio, RatioHigh: ratio, RatioXHigh: ratio,
+	}
+	payload := newReasoningCapPayload("claude-opus-5", "xhigh")
+	window := getContextWindowSize(payload.ConversationState.CurrentMessage.UserInputMessage.ModelID)
+	usable := window - agentRecoveryTokenReserve
+	if usable < 1 {
+		usable = window
+	}
+	wantTokens := int(float64(usable) * ratio)
+	if gotTokens := reasoningCapBytes(payload, settings) / reasoningCapBytesPerToken; gotTokens != wantTokens {
+		t.Fatalf("ratio-limited cap = %d tokens, want %d", gotTokens, wantTokens)
+	}
+}
+
+func TestReasoningCapConfiguredMaxOverridesEffortCeilings(t *testing.T) {
+	const configured = 4096
+	settings := reasoningCapSettings{MaxTokens: configured}
+	for _, effort := range []string{"low", "medium", "high", "xhigh", "max"} {
+		gotBytes := reasoningCapBytes(newReasoningCapPayload("claude-opus-5", effort), settings)
+		if gotTokens := gotBytes / reasoningCapBytesPerToken; gotTokens != configured {
+			t.Fatalf("%s configured cap = %d tokens, want %d", effort, gotTokens, configured)
+		}
+	}
+}
+
+func TestReasoningCapAppliesWithoutCompletionProtocol(t *testing.T) {
+	payload := newReasoningCapPayload("claude-opus-5", "medium")
+	payload.AgentReasoningCapEnabled = true
+	if agentCompletionProtocolEnabled(payload) {
+		t.Fatal("fixture unexpectedly enabled the completion protocol")
+	}
+	callback := &KiroStreamCallback{}
+	settings := reasoningCapSettings{Mode: reasoningCapEnforce}
+	applyReasoningCapSettings(payload, callback, settings)
+	if callback.ReasoningCapMode != reasoningCapEnforce {
+		t.Fatalf("mode = %d, want enforce", callback.ReasoningCapMode)
+	}
+	wantBytes := reasoningCapDefaultTokensMedium * reasoningCapBytesPerToken
+	if callback.ReasoningCapBytes != wantBytes {
+		t.Fatalf("cap = %d bytes, want %d", callback.ReasoningCapBytes, wantBytes)
+	}
+}
+
+func TestReasoningCapIgnoresIneligibleRequests(t *testing.T) {
+	payload := newReasoningCapPayload("claude-opus-5", "medium")
+	callback := &KiroStreamCallback{}
+	applyReasoningCapSettings(payload, callback, reasoningCapSettings{Mode: reasoningCapEnforce})
+	if callback.ReasoningCapMode != reasoningCapOff || callback.ReasoningCapBytes != 0 {
+		t.Fatalf("ineligible request received cap: mode=%d bytes=%d", callback.ReasoningCapMode, callback.ReasoningCapBytes)
 	}
 }
 
@@ -185,18 +253,6 @@ func TestReasoningCapNeverExceedsWindow(t *testing.T) {
 	}
 }
 
-// A 1M-token window would otherwise scale to a limit so large that a looping
-// turn holds the account slot for hours before hitting it.
-func TestReasoningCapHonoursAbsoluteCeiling(t *testing.T) {
-	capBytes := reasoningCapBytes(newReasoningCapPayload("claude-opus-5", "max"), reasoningCapSettings{})
-	if capBytes <= 0 {
-		t.Skip("model token limits unavailable in this environment")
-	}
-	if tokens := capBytes / reasoningCapBytesPerToken; tokens > reasoningCapMaxTokens {
-		t.Fatalf("cap %d tokens exceeds the %d token ceiling", tokens, reasoningCapMaxTokens)
-	}
-}
-
 func TestReasoningCapNilPayloadYieldsNoCap(t *testing.T) {
 	if got := reasoningCapBytes(nil, reasoningCapSettings{}); got != 0 {
 		t.Fatalf("cap for a nil payload = %d, want 0", got)
@@ -210,8 +266,8 @@ func TestReasoningCapUnknownModelUsesFallbackWindow(t *testing.T) {
 	if capBytes <= 0 {
 		t.Fatalf("unknown model produced no cap: %d", capBytes)
 	}
-	if tokens := capBytes / reasoningCapBytesPerToken; tokens > reasoningCapMaxTokens {
-		t.Fatalf("cap %d tokens exceeds the %d token ceiling", tokens, reasoningCapMaxTokens)
+	if tokens := capBytes / reasoningCapBytesPerToken; tokens > reasoningCapDefaultTokensHigh {
+		t.Fatalf("cap %d tokens exceeds the default high-effort ceiling %d", tokens, reasoningCapDefaultTokensHigh)
 	}
 }
 

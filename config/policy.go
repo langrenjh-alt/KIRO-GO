@@ -39,7 +39,7 @@ const (
 // migration.
 type ReasoningCapConfig struct {
 	Mode        string  `json:"mode,omitempty"`        // off | observe | enforce
-	MaxTokens   int     `json:"maxTokens,omitempty"`   // 0 = built-in absolute ceiling
+	MaxTokens   int     `json:"maxTokens,omitempty"`   // 0 = built-in effort-specific ceilings
 	RatioLow    float64 `json:"ratioLow,omitempty"`    // 0 = built-in ratio for effort=low
 	RatioMedium float64 `json:"ratioMedium,omitempty"` // 0 = built-in ratio for effort=medium
 	RatioHigh   float64 `json:"ratioHigh,omitempty"`   // 0 = built-in ratio for effort=high

@@ -160,7 +160,7 @@
   "settings.reasoningCapRatioMedium": "比例：medium",
   "settings.reasoningCapRatioHigh": "比例：high",
   "settings.reasoningCapRatioXHigh": "比例：xhigh/max",
-  "settings.reasoningCapRatioHint": "各比例为模型上下文窗口的占比，结果再受 Token 上限压制。留 0 表示沿用内置默认值（4% / 8% / 15% / 25%，上限 53248）。",
+  "settings.reasoningCapRatioHint": "各比例为模型上下文窗口的占比，结果再受 Token 上限压制。留 0 表示沿用内置比例 4% / 8% / 15% / 25%，以及 low / medium / high / xhigh(max) 的 4096 / 6144 / 8192 / 12288 分档上限。显式配置的 Token 上限会覆盖这些默认分档。",
   "settings.saveReasoningCap": "保存思考预算",
   "settings.reasoningCapSaved": "思考预算已保存",
   "settings.policyValueInvalid": "策略参数超出允许范围",

@@ -39,10 +39,14 @@ const (
 	reasoningCapRatioHigh   = 0.15
 	reasoningCapRatioXHigh  = 0.25
 
-	// A pure ratio scales the wrong way on a 1M-token window: the resulting
+	// A pure ratio scales the wrong way on large-context models: the resulting
 	// limit is reachable in principle but takes so long that the account slot
-	// stays occupied anyway. This absolute ceiling keeps the stop timely.
-	reasoningCapMaxTokens = 52 << 10
+	// stays occupied anyway. Effort-specific ceilings keep the stop timely while
+	// preserving a useful ladder between effort levels.
+	reasoningCapDefaultTokensLow    = 4 << 10
+	reasoningCapDefaultTokensMedium = 6 << 10
+	reasoningCapDefaultTokensHigh   = 8 << 10
+	reasoningCapDefaultTokensXHigh  = 12 << 10
 
 	// Windows are reported in tokens while reasoning arrives as bytes. Reuse the
 	// package's existing conservative ratio so both budgets agree.
@@ -160,11 +164,20 @@ func validateReasoningCapConfig(cfg config.ReasoningCapConfig) string {
 	return ""
 }
 
-func (s reasoningCapSettings) maxTokens() int {
+func (s reasoningCapSettings) maxTokensForEffort(effort string) int {
 	if s.MaxTokens > 0 {
 		return s.MaxTokens
 	}
-	return reasoningCapMaxTokens
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "low":
+		return reasoningCapDefaultTokensLow
+	case "medium":
+		return reasoningCapDefaultTokensMedium
+	case "xhigh", "max":
+		return reasoningCapDefaultTokensXHigh
+	default:
+		return reasoningCapDefaultTokensHigh
+	}
 }
 
 func reasoningCapEffortForPayload(payload *KiroPayload) string {
@@ -191,11 +204,19 @@ func reasoningCapBytes(payload *KiroPayload, settings reasoningCapSettings) int 
 		usable = window
 	}
 	tokens := int(float64(usable) * settings.ratioForEffort(reasoningCapEffortForPayload(payload)))
-	if limit := settings.maxTokens(); tokens > limit {
+	if limit := settings.maxTokensForEffort(reasoningCapEffortForPayload(payload)); tokens > limit {
 		tokens = limit
 	}
 	if tokens < 1 {
 		return 0
 	}
 	return tokens * reasoningCapBytesPerToken
+}
+
+func applyReasoningCapSettings(payload *KiroPayload, callback *KiroStreamCallback, settings reasoningCapSettings) {
+	if payload == nil || callback == nil || !payload.AgentReasoningCapEnabled || settings.Mode == reasoningCapOff {
+		return
+	}
+	callback.ReasoningCapMode = settings.Mode
+	callback.ReasoningCapBytes = reasoningCapBytes(payload, settings)
 }

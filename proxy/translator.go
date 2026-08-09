@@ -273,8 +273,8 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		toolNames = append(toolNames, tool.Name)
 	}
 	recognizedHarness := isCodingAgentSystemPrompt(extractSystemPrompt(req.System))
-	autoCompletionProtocol := config.GetAgentCompletionMarkerEnabled() &&
-		codingAgentCompletionProtocolEnabled(toolChoice, recognizedHarness, toolNames)
+	autoReasoningCap := codingAgentCompletionProtocolEnabled(toolChoice, recognizedHarness, toolNames)
+	autoCompletionProtocol := config.GetAgentCompletionMarkerEnabled() && autoReasoningCap
 	forcedToolGuard := codingAgentForcedToolChoiceGuardEnabled(toolChoice, recognizedHarness, toolNames)
 	if ((req.OutputConfig == nil || req.OutputConfig.Format == nil) && autoCompletionProtocol) || forcedToolGuard {
 		if autoCompletionProtocol {
@@ -450,6 +450,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	payload.HistoryMode = historyMode
 	payload.AgentCompletionMarker = agentCompletionMarker
 	payload.AgentCompletionProtocolEnabled = autoCompletionProtocol || forcedToolGuard
+	payload.AgentReasoningCapEnabled = autoReasoningCap || forcedToolGuard
 	payload.ConversationState.ChatTriggerType = "MANUAL"
 	payload.ConversationState.AgentTaskType = "vibe"
 	payload.ConversationState.AgentContinuationId = uuid.New().String()
@@ -1670,8 +1671,8 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		(strings.EqualFold(strings.TrimSpace(req.ResponseFormat.Type), "json_object") ||
 			strings.EqualFold(strings.TrimSpace(req.ResponseFormat.Type), "json_schema"))
 	recognizedHarness := isCodingAgentSystemPrompt(systemPrompt)
-	autoCompletionProtocol := config.GetAgentCompletionMarkerEnabled() &&
-		codingAgentCompletionProtocolEnabled(toolChoice, recognizedHarness, toolNames)
+	autoReasoningCap := codingAgentCompletionProtocolEnabled(toolChoice, recognizedHarness, toolNames)
+	autoCompletionProtocol := config.GetAgentCompletionMarkerEnabled() && autoReasoningCap
 	forcedToolGuard := codingAgentForcedToolChoiceGuardEnabled(toolChoice, recognizedHarness, toolNames)
 	if (!structuredOutput && autoCompletionProtocol) || forcedToolGuard {
 		if autoCompletionProtocol {
@@ -1895,6 +1896,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	payload.HistoryMode = historyMode
 	payload.AgentCompletionMarker = agentCompletionMarker
 	payload.AgentCompletionProtocolEnabled = autoCompletionProtocol || forcedToolGuard
+	payload.AgentReasoningCapEnabled = autoReasoningCap || forcedToolGuard
 	payload.ConversationState.ChatTriggerType = "MANUAL"
 	payload.ConversationState.AgentTaskType = "vibe"
 	payload.ConversationState.ConversationID = buildConversationID(modelID, stableSystemPrompt, firstOpenAIConversationAnchor(nonSystemMessages))

@@ -216,6 +216,7 @@ func restoreAgentRecoveryOriginalPayload(payload *KiroPayload) bool {
 
 	marker := payload.AgentCompletionMarker
 	completionProtocolEnabled := payload.AgentCompletionProtocolEnabled
+	reasoningCapEnabled := payload.AgentReasoningCapEnabled
 	completionRetries := payload.AgentCompletionRetries
 	actionContinuations := payload.AgentActionContinuations
 	fullContextRecoveries := payload.AgentFullContextRecoveries
@@ -251,6 +252,7 @@ func restoreAgentRecoveryOriginalPayload(payload *KiroPayload) bool {
 	payload.ReasoningSignatureRetry = reasoningSignatureRetry
 	payload.AgentCompletionMarker = marker
 	payload.AgentCompletionProtocolEnabled = completionProtocolEnabled
+	payload.AgentReasoningCapEnabled = reasoningCapEnabled
 	payload.AgentCompletionRetries = completionRetries
 	payload.AgentActionContinuations = actionContinuations
 	payload.AgentFullContextRecoveries = fullContextRecoveries
@@ -1817,6 +1819,7 @@ func cloneKiroPayload(payload *KiroPayload) *KiroPayload {
 	clone.ReasoningSignatureRetry = payload.ReasoningSignatureRetry
 	clone.AgentCompletionMarker = payload.AgentCompletionMarker
 	clone.AgentCompletionProtocolEnabled = payload.AgentCompletionProtocolEnabled
+	clone.AgentReasoningCapEnabled = payload.AgentReasoningCapEnabled
 	clone.AgentCompletionRetries = payload.AgentCompletionRetries
 	clone.AgentActionContinuations = payload.AgentActionContinuations
 	clone.AgentFullContextRecoveries = payload.AgentFullContextRecoveries
