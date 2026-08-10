@@ -4,7 +4,7 @@
 - changed field: Kiro upstream forwarding, Anthropic conversion, streaming response contracts, bearer refresh, and quota failover
 - baseline: `4a141f8748c1952fd02b36223cb241af59f7ae63`
 - reference: `hank9999/kiro.rs` commit `5ca5703a57a970f0707108cd866b02d4f0f765cb`
-- source checkout: `C:\Users\blwu4\AppData\Local\Temp\codex-kiro-rs-019fea63`
+- source checkout: clean local clone of the reference commit
 
 ## Ported Contracts
 
@@ -35,7 +35,7 @@ git diff --check                                              -> exit 0 (line-en
 
 The serial full `go test -p 1 ./... -count=1` check still reaches the pre-existing untracked package `exports/reasoning-effort-20260808`, whose `MODIFIED_FILE.go` reports undefined `MapModel`, `ClaudeRequest`, `isClaudeThinkingRequested`, `OpenAIRequest`, `ParseModelAndThinking`, and `ClaudeThinkingConfig`. The failure is isolated from `proxy` and the main binary; that untracked fixture was preserved.
 
-The baseline run was executed from detached worktree `C:\Users\blwu4\AppData\Local\Temp\kirogo-baseline-port-kiro-rs` at `4a141f8` and returned `ok   kiro-go/proxy 13.971s`. `ROLLBACK.sh` restored `exports/kiro-rs-port-20260810/rollback/handler-target-actual.txt` to the baseline SHA-256 `0A28375872617F005E45C5519B59ACC4154D4103D65010486FD7AA15428098AD`.
+The baseline run was executed from a detached worktree at `4a141f8` and returned `ok   kiro-go/proxy 13.971s`. `ROLLBACK.sh` restored `exports/kiro-rs-port-20260810/rollback/handler-target-actual.txt` to the baseline SHA-256 `0A28375872617F005E45C5519B59ACC4154D4103D65010486FD7AA15428098AD`.
 
 The `/cc` endpoint intentionally retains kiro.rs' full-response buffering contract. Its per-request memory use therefore grows linearly with the buffered response size; ordinary `/v1/messages` does not take this path.
 
