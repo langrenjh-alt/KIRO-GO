@@ -746,6 +746,42 @@ func TestAgentMarkerPrefixCanSpanFrames(t *testing.T) {
 	}
 }
 
+func TestAgentMarkerFinalStopsDuplicateSummaryRound(t *testing.T) {
+	const marker = "<agent_final_0123456789abcdef>"
+	stream := bytes.NewReader(bytes.Join([][]byte{
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": marker + "first summary"}),
+		awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{"text": "late reasoning"}),
+		awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+			"toolUseId": "toolu_late", "name": "shell_command", "input": `{"command":"echo late"}`, "stop": true,
+		}),
+		awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{"stopReason": "TOOL_USE"}),
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": marker + "duplicate summary"}),
+		awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{"text": "post-terminal reasoning"}),
+		awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+			"toolUseId": "toolu_post_terminal", "name": "shell_command", "input": `{"command":"echo post-terminal"}`, "stop": true,
+		}),
+		awsEventStreamFrame(t, "meteringEvent", map[string]interface{}{"usage": 1.25}),
+	}, nil))
+
+	var texts []string
+	var reasoning, tools int
+	var stopReason string
+	var credits float64
+	err := parseEventStreamWithKeepAlive(stream, &KiroStreamCallback{
+		AgentCompletionMarker: marker,
+		OnText:                func(text string, _ bool) { texts = append(texts, text) },
+		OnReasoning:           func(KiroReasoningContentEvent) { reasoning++ },
+		OnToolUse:             func(KiroToolUse) { tools++ },
+		OnStopReason:          func(reason string) { stopReason = reason },
+		OnCredits:             func(value float64) { credits = value },
+	}, 0)
+	if err != nil || len(texts) != 1 || !strings.Contains(texts[0], "first summary") ||
+		reasoning != 0 || tools != 0 || stopReason != "end_turn" || credits != 1.25 {
+		t.Fatalf("duplicate summary round escaped final marker: err=%v texts=%v reasoning=%d tools=%d stop=%q credits=%v",
+			err, texts, reasoning, tools, stopReason, credits)
+	}
+}
+
 func TestAgentMarkerDoesNotCompleteWithoutNativeTerminal(t *testing.T) {
 	const marker = "<agent_final_0123456789abcdef>"
 	stream := bytes.NewReader(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{

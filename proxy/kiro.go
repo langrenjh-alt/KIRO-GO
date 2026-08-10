@@ -1624,6 +1624,11 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 	var agentOutputObserved bool
 	var assistantTextObserved bool
 	var agentVisibleTextObserved bool
+	var agentCompletionFinalized bool
+	agentMarkerFinalCandidate := func() bool {
+		return agentCompletionRequired && callback.AgentCompletionMarker != "" &&
+			markerState == agentCompletionPrefixComplete && agentVisibleTextObserved
+	}
 	var clientOutputObserved bool
 	var clientAssistantText strings.Builder
 	// Accounted only while no tool call and no visible text have appeared, so a
@@ -1767,6 +1772,9 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 		// Dispatch by event type.
 		switch eventType {
 		case "assistantResponseEvent":
+			if agentCompletionFinalized {
+				continue
+			}
 			if toolObserved && agentCompletionRequired {
 				// A structured tool call must terminate the assistant content for
 				// agent clients. Kiro occasionally emits late narration after the
@@ -1803,6 +1811,9 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 				}
 			}
 		case "reasoningContentEvent":
+			if agentCompletionFinalized || agentMarkerFinalCandidate() {
+				continue
+			}
 			if toolObserved && agentCompletionRequired {
 				continue
 			}
@@ -1847,6 +1858,9 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 				}
 			}
 		case "toolUseEvent":
+			if agentCompletionFinalized || agentMarkerFinalCandidate() {
+				continue
+			}
 			if err := toolUses.push(event, callback); err != nil {
 				return reportKiroStreamError(callback, &KiroStreamProtocolError{Code: "upstream_tool_json_error", Err: err})
 			}
@@ -1862,7 +1876,18 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 			}
 		case "metadataEvent":
 			if reason := firstStringField(event, "stopReason", "stop_reason"); reason != "" {
+				if agentCompletionFinalized {
+					continue
+				}
 				upstreamStopReason = normalizeKiroStopReason(reason)
+				// A marker-qualified final is authoritative. Do not let a stale
+				// TOOL_USE metadata event reopen the completed agent turn.
+				if agentMarkerFinalCandidate() && upstreamStopReason == "tool_use" {
+					upstreamStopReason = "end_turn"
+				}
+				if agentMarkerFinalCandidate() && upstreamStopReason == "end_turn" {
+					agentCompletionFinalized = true
+				}
 				if callback.OnStopReason != nil {
 					callback.OnStopReason(upstreamStopReason)
 				}
