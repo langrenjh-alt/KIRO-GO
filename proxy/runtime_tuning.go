@@ -73,7 +73,9 @@ func nonNegativeEnvInt(name string, fallback int) int {
 func earlyStreamPreludeEnabled() bool {
 	value, ok := os.LookupEnv("KIRO_EARLY_STREAM_PRELUDE")
 	if !ok || strings.TrimSpace(value) == "" {
-		return false
+		// Match kiro.rs: once the upstream response headers are accepted, send
+		// the downstream stream envelope before waiting for the first token.
+		return true
 	}
 	enabled, err := strconv.ParseBool(strings.TrimSpace(value))
 	return err == nil && enabled

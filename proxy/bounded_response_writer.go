@@ -9,7 +9,7 @@ import (
 
 const (
 	defaultDownstreamWriteTimeout = 15 * time.Second
-	defaultSSEFlushWindow         = 10 * time.Millisecond
+	defaultSSEFlushWindow         = 0 * time.Millisecond
 	immediateSSEFlushes           = 3
 )
 

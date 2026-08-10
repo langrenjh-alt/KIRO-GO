@@ -202,8 +202,13 @@ func TestClaudeOutputConfigFormatReachesKiroSystemPriming(t *testing.T) {
 	}
 	payload := ClaudeToKiro(&request, false)
 	priming := structuredOutputPriming(t, payload)
-	if !strings.HasPrefix(priming, "Keep the existing instruction.\n\n<structured_output>") {
-		t.Fatalf("structured output constraint was not appended after system prompt: %s", priming)
+	if !strings.HasPrefix(priming, "Keep the existing instruction.\n\n") {
+		t.Fatalf("system prompt was not preserved at the start of Kiro priming: %s", priming)
+	}
+	policyIndex := strings.Index(priming, chunkedWriteSystemPolicy)
+	structuredIndex := strings.Index(priming, "<structured_output>")
+	if policyIndex < 0 || structuredIndex < 0 || structuredIndex <= policyIndex {
+		t.Fatalf("structured output constraint did not follow the system instructions: %s", priming)
 	}
 	if !strings.Contains(priming, `"answer":{"type":"integer"}`) {
 		t.Fatalf("schema did not reach Kiro system priming: %s", priming)

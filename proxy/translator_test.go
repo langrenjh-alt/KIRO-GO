@@ -473,10 +473,10 @@ func TestToolResultsContinuationUsesNativeKiroContext(t *testing.T) {
 	}
 }
 
-func TestEnsureObjectSchemaRemovesKiroRejectedFieldsRecursively(t *testing.T) {
+func TestEnsureObjectSchemaMatchesKiroRSNormalization(t *testing.T) {
 	input := map[string]interface{}{
 		"type":                 "object",
-		"required":             []interface{}{},
+		"required":             []interface{}{"path", 42, nil},
 		"additionalProperties": false,
 		"properties": map[string]interface{}{
 			"path": map[string]interface{}{
@@ -495,18 +495,33 @@ func TestEnsureObjectSchemaRemovesKiroRejectedFieldsRecursively(t *testing.T) {
 		"anyOf": []interface{}{
 			map[string]interface{}{
 				"type":                 "object",
-				"required":             []interface{}{},
+				"required":             []interface{}{"force", false},
 				"additionalProperties": false,
 			},
 		},
 	}
 
 	got := ensureObjectSchema(input).(map[string]interface{})
-	if schemaContainsKey(got, "additionalProperties") {
-		t.Fatalf("expected additionalProperties to be removed recursively, got %#v", got)
+	if got["required"] == nil {
+		t.Fatalf("required was omitted: %#v", got)
 	}
-	if schemaContainsKey(got, "required") {
-		t.Fatalf("expected empty/nil required fields to be removed recursively, got %#v", got)
+	if required, ok := got["required"].([]interface{}); !ok || len(required) != 1 || required[0] != "path" {
+		t.Fatalf("top-level required=%#v, want [path]", got["required"])
+	}
+	if got["additionalProperties"] != false {
+		t.Fatalf("top-level additionalProperties=%#v, want false", got["additionalProperties"])
+	}
+	nested := got["properties"].(map[string]interface{})["path"].(map[string]interface{})
+	if nested["required"] != nil || nested["additionalProperties"] == nil {
+		t.Fatalf("nested schema was unexpectedly normalized: %#v", nested)
+	}
+	options := got["properties"].(map[string]interface{})["options"].(map[string]interface{})
+	if options["additionalProperties"] != false {
+		t.Fatalf("nested additionalProperties was not preserved: %#v", options)
+	}
+	anyOf := got["anyOf"].([]interface{})[0].(map[string]interface{})
+	if _, exists := anyOf["required"]; !exists {
+		t.Fatalf("nested required was unexpectedly removed: %#v", anyOf)
 	}
 	if _, stillPresent := input["additionalProperties"]; !stillPresent {
 		t.Fatalf("expected sanitizer not to mutate caller schema")
@@ -531,33 +546,12 @@ func TestConvertOpenAIToolsSanitizesSchemaAndDescription(t *testing.T) {
 		t.Fatalf("expected fallback tool description")
 	}
 	schema := tools[0].ToolSpecification.InputSchema.JSON.(map[string]interface{})
-	if schemaContainsKey(schema, "additionalProperties") {
-		t.Fatalf("expected OpenAI tool schema to be sanitized, got %#v", schema)
+	if schema["additionalProperties"] != false {
+		t.Fatalf("expected OpenAI tool schema to preserve additionalProperties, got %#v", schema)
 	}
-	if schemaContainsKey(schema, "required") {
-		t.Fatalf("expected empty required field to be removed, got %#v", schema)
+	if required, ok := schema["required"].([]interface{}); !ok || len(required) != 0 {
+		t.Fatalf("expected empty required array, got %#v", schema["required"])
 	}
-}
-
-func schemaContainsKey(value interface{}, key string) bool {
-	switch v := value.(type) {
-	case map[string]interface{}:
-		if _, ok := v[key]; ok {
-			return true
-		}
-		for _, child := range v {
-			if schemaContainsKey(child, key) {
-				return true
-			}
-		}
-	case []interface{}:
-		for _, child := range v {
-			if schemaContainsKey(child, key) {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func TestParseModelAndThinking(t *testing.T) {

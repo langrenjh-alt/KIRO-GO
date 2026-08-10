@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"encoding/json"
+	"fmt"
+	"kiro-go/config"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -182,5 +184,40 @@ func TestOpenAINonStreamTruncatesAtStop(t *testing.T) {
 	message := openAIChatContractMap(t, choice["message"], "non-stream stop message")
 	if message["content"] != "before" || choice["finish_reason"] != "stop" {
 		t.Fatalf("choice = %#v", choice)
+	}
+}
+
+func TestOpenAIStopOnlyOutputRetriesInsteadOfReturningEmptySuccess(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		name := "non-stream"
+		if stream {
+			name = "stream"
+		}
+		t.Run(name, func(t *testing.T) {
+			calls := 0
+			h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
+				calls++
+				callback.OnText("<STOP>", false)
+				callback.OnStopReason("END_TURN")
+				callback.OnComplete(10, 1)
+				return nil
+			})
+			body := fmt.Sprintf(`{"model":"claude-opus-5","messages":[{"role":"user","content":"test"}],"stop":"<STOP>","stream":%t}`, stream)
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+			rec := httptest.NewRecorder()
+
+			h.handleOpenAIChat(rec, req)
+
+			responseBody := rec.Body.String()
+			if calls != maxKiroTransportPreResponseRetries+1 || !strings.Contains(responseBody, "upstream returned no client-visible output") {
+				t.Fatalf("calls=%d status=%d body=%s", calls, rec.Code, responseBody)
+			}
+			if strings.Contains(responseBody, `"finish_reason":"stop"`) || strings.Contains(responseBody, "<STOP>") {
+				t.Fatalf("stop-only output leaked or completed successfully: %s", responseBody)
+			}
+			if !stream && rec.Code != http.StatusBadGateway {
+				t.Fatalf("non-stream status=%d body=%s", rec.Code, responseBody)
+			}
+		})
 	}
 }

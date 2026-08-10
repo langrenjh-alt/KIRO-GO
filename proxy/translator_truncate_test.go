@@ -46,7 +46,9 @@ func TestClaudeToKiroPreservesOversizedHistory(t *testing.T) {
 		t.Fatalf("current message lost after truncation, got %q", cur.Content[:min(80, len(cur.Content))])
 	}
 
-	if got, want := len(payload.ConversationState.History), len(msgs)+1; got != want {
+	// kiro.rs closes a trailing historical user turn with the same neutral
+	// assistant acknowledgement it sends before the current message.
+	if got, want := len(payload.ConversationState.History), len(msgs)+2; got != want {
 		t.Fatalf("history entries=%d, want %d; input was dropped", got, want)
 	}
 	foundFirstUser := false

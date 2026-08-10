@@ -65,6 +65,7 @@ type webSearchMCPError struct {
 	StatusCode int
 	RPCCode    *int
 	RetryAfter string
+	Body       string
 	Message    string
 	Err        error
 }
@@ -351,6 +352,7 @@ func (h *Handler) executeWebSearch(
 	execution := &webSearchExecution{}
 	excluded := make(map[string]bool)
 	retryCounts := make(map[string]int)
+	forceRefreshed := make(map[string]bool)
 	retrySameID := ""
 	rpcRejections := 0
 	var lastErr error
@@ -412,6 +414,13 @@ func (h *Handler) executeWebSearch(
 		}
 
 		result, err := call(ctx, account, upstreamQuery)
+		if err != nil && isWebSearchBearerTokenInvalidError(err) &&
+			!account.IsApiKeyCredential() && !forceRefreshed[account.ID] {
+			forceRefreshed[account.ID] = true
+			if refreshErr := h.refreshAccountTokenContext(ctx, account, true); refreshErr == nil {
+				result, err = call(ctx, account, upstreamQuery)
+			}
+		}
 		h.releaseAccount(account)
 		if err != nil {
 			lastErr = err
@@ -549,11 +558,30 @@ func isWebSearchTimeout(err error) bool {
 	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
+func isWebSearchBearerTokenInvalidError(err error) bool {
+	var upstream *webSearchMCPError
+	if !errors.As(err, &upstream) ||
+		(upstream.StatusCode != http.StatusUnauthorized && upstream.StatusCode != http.StatusForbidden) {
+		return false
+	}
+	return strings.Contains(upstream.Body, "The bearer token included in the request is invalid")
+}
+
+func isWebSearchMonthlyRequestCountError(err error) bool {
+	var upstream *webSearchMCPError
+	return errors.As(err, &upstream) &&
+		upstream.StatusCode == http.StatusPaymentRequired &&
+		isMonthlyRequestCountBody(upstream.Body)
+}
+
 func (h *Handler) handleWebSearchAccountFailure(account *config.Account, err error) {
 	var upstream *webSearchMCPError
 	if errors.As(err, &upstream) {
 		switch upstream.StatusCode {
 		case http.StatusPaymentRequired, http.StatusTooManyRequests:
+			if isWebSearchMonthlyRequestCountError(err) {
+				h.disableAccount(account, "DISABLED", "Monthly request quota exhausted (MONTHLY_REQUEST_COUNT)")
+			}
 			h.pool.RecordError(account.ID, true)
 			return
 		case http.StatusForbidden:
@@ -994,9 +1022,19 @@ func callMCPWebSearchWithOptionsInternal(
 		case http.StatusForbidden:
 			message = "web search MCP upstream denied web search access"
 		}
+		errorBody, readErr := io.ReadAll(io.LimitReader(resp.Body, webSearchMCPRetryMaxBytes+1))
+		if readErr != nil {
+			return nil, &webSearchMCPError{
+				StatusCode: resp.StatusCode,
+				RetryAfter: strings.TrimSpace(resp.Header.Get("Retry-After")),
+				Message:    "web search MCP error response could not be read",
+				Err:        readErr,
+			}
+		}
 		return nil, &webSearchMCPError{
 			StatusCode: resp.StatusCode,
 			RetryAfter: strings.TrimSpace(resp.Header.Get("Retry-After")),
+			Body:       string(errorBody),
 			Message:    message,
 		}
 	}

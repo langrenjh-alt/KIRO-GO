@@ -273,6 +273,26 @@ func TestCallMCPWebSearchPropagatesHTTPStatus(t *testing.T) {
 	}
 }
 
+func TestCallMCPWebSearchPreservesMonthlyQuotaReasonForClassification(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusPaymentRequired)
+		_, _ = io.WriteString(w, `{"error":{"reason":"MONTHLY_REQUEST_COUNT"}}`)
+	}))
+	defer server.Close()
+
+	_, err := callMCPWebSearchWithOptions(context.Background(), nil, "query", webSearchMCPCallOptions{
+		Endpoint: server.URL,
+		Client:   server.Client(),
+	})
+	if !isWebSearchMonthlyRequestCountError(err) {
+		t.Fatalf("monthly quota response was not classified: %v", err)
+	}
+	var upstreamErr *webSearchMCPError
+	if !errors.As(err, &upstreamErr) || !strings.Contains(upstreamErr.Body, "MONTHLY_REQUEST_COUNT") {
+		t.Fatalf("upstream body was not preserved for internal classification: %#v", err)
+	}
+}
+
 func TestCallMCPWebSearchRejectsProviderErrorsAndInvalidSuccess(t *testing.T) {
 	tests := []struct {
 		name string
@@ -1047,6 +1067,97 @@ func TestHandleWebSearchPaymentRequiredStartsQuotaCooldown(t *testing.T) {
 	}
 	if got := classifyError((&webSearchMCPError{StatusCode: http.StatusPaymentRequired}).Error()); got != "quota" {
 		t.Fatalf("HTTP 402 log classification = %q, want quota", got)
+	}
+}
+
+func TestWebSearchBearerInvalidForcesOneOAuthRefresh(t *testing.T) {
+	if err := config.Init(t.TempDir() + "/config.json"); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	const accountID = "websearch-bearer-refresh-account"
+	if err := config.AddAccount(config.Account{
+		ID:           accountID,
+		Enabled:      true,
+		AccessToken:  "stale-access-token",
+		RefreshToken: "refresh-token",
+		AuthMethod:   "idc",
+		ProfileArn:   "arn:aws:codewhisperer:us-east-1:1:profile/websearch-refresh",
+	}); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+	p := accountpool.GetPool()
+	p.Reload()
+	var calls, refreshes int
+	h := &Handler{
+		pool: p,
+		tokenRefresher: func(_ context.Context, account *config.Account, _ bool) error {
+			refreshes++
+			account.AccessToken = "fresh-access-token"
+			return nil
+		},
+	}
+	tool := ClaudeTool{Type: "web_search_20250305", Name: "web_search"}
+	execution, err := h.executeWebSearch(context.Background(), "query", "query", tool,
+		func(_ context.Context, account *config.Account, _ string) (*webSearchResultSet, error) {
+			calls++
+			if account.AccessToken != "fresh-access-token" {
+				return nil, &webSearchMCPError{
+					StatusCode: http.StatusUnauthorized,
+					Body:       `{"message":"The bearer token included in the request is invalid."}`,
+					Message:    "web search MCP upstream returned HTTP 401",
+				}
+			}
+			return testWebSearchResultSet(), nil
+		})
+	if err != nil {
+		t.Fatalf("executeWebSearch returned an error: %v", err)
+	}
+	if execution == nil || execution.Account == nil || execution.Account.ID != accountID {
+		t.Fatalf("unexpected execution: %#v", execution)
+	}
+	if calls != 2 || refreshes != 1 {
+		t.Fatalf("calls=%d refreshes=%d, want one forced refresh and two MCP calls", calls, refreshes)
+	}
+}
+
+func TestWebSearchMonthlyRequestCountDisablesAccount(t *testing.T) {
+	if err := config.Init(t.TempDir() + "/config.json"); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	const accountID = "websearch-monthly-quota-account"
+	if err := config.AddAccount(config.Account{
+		ID:          accountID,
+		Enabled:     true,
+		AccessToken: "access-token",
+		ProfileArn:  "arn:aws:codewhisperer:us-east-1:1:profile/websearch-quota",
+	}); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+	p := accountpool.GetPool()
+	p.Reload()
+	h := &Handler{pool: p}
+	account := p.GetByID(accountID)
+	if account == nil {
+		t.Fatal("quota account not found")
+	}
+	h.handleWebSearchAccountFailure(account, &webSearchMCPError{
+		StatusCode: http.StatusPaymentRequired,
+		Body:       `{"reason":"MONTHLY_REQUEST_COUNT"}`,
+		Message:    "web search MCP quota exceeded (HTTP 402)",
+	})
+	var disabled *config.Account
+	for _, stored := range config.GetAccounts() {
+		if stored.ID == accountID {
+			copy := stored
+			disabled = &copy
+			break
+		}
+	}
+	if disabled == nil || disabled.Enabled || !strings.Contains(disabled.BanReason, "MONTHLY_REQUEST_COUNT") {
+		t.Fatalf("monthly quota did not disable account: %#v", disabled)
+	}
+	if got := p.AvailableCount(); got != 0 {
+		t.Fatalf("available accounts after monthly quota = %d, want 0", got)
 	}
 }
 

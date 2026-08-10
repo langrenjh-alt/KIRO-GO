@@ -81,7 +81,7 @@ The previous response ended without either the completion marker or a structured
 
 func outputContinuationInstruction(marker string) string {
 	instruction := `<output_continuation>
-The immediately preceding assistant message was cut off only because the upstream output-token limit was reached. Continue directly from its final byte. Do not repeat, summarize, restart, quote, or wrap any part of the preceding output. Preserve the original language, format, and task state. Emit only the missing continuation.`
+The immediately preceding assistant message was cut off before a normal terminal event, either because the upstream output-token limit was reached or because the stream disconnected. Continue directly from its final byte. Do not repeat, summarize, restart, quote, or wrap any part of the preceding output. Preserve the original language, format, and task state. Emit only the missing continuation.`
 	if marker != "" {
 		instruction += fmt.Sprintf(` This is still the same coding-agent turn. If no external action remains, begin this continuation with the exact private completion marker %s. If external action is required, emit the real native structured tool call instead of describing it.`, marker)
 	}
@@ -239,6 +239,7 @@ func restoreAgentRecoveryOriginalPayload(payload *KiroPayload) bool {
 	lastPayloadBytes := payload.lastAttemptPayloadBytes
 	lastEstimatedTokens := payload.lastAttemptEstimatedInputTokens
 	lastAttemptStartedAt := payload.lastAttemptStartedAt
+	forcedBearerRefreshAccounts := cloneBoolMap(payload.forcedBearerRefreshAccounts)
 
 	*payload = restored
 	payload.ToolNameMap = toolNameMap
@@ -278,6 +279,7 @@ func restoreAgentRecoveryOriginalPayload(payload *KiroPayload) bool {
 	payload.lastAttemptPayloadBytes = lastPayloadBytes
 	payload.lastAttemptEstimatedInputTokens = lastEstimatedTokens
 	payload.lastAttemptStartedAt = lastAttemptStartedAt
+	payload.forcedBearerRefreshAccounts = forcedBearerRefreshAccounts
 	return true
 }
 
@@ -532,8 +534,47 @@ func resolveKiroOutputTruncation(payload *KiroPayload, err error, stopReason, vi
 	return nil
 }
 
+// isKiroOutputContinuationError limits replay to failures where the upstream
+// response may have been cut off after a valid visible prefix. Semantic agent
+// failures and partial tool JSON need their own recovery paths because replaying
+// them as assistant text can duplicate or corrupt a tool turn.
+func isKiroOutputContinuationError(err error) bool {
+	if err == nil || isUpstreamOutputTruncatedError(err) ||
+		isUpstreamIncompleteResponseError(err) || isKiroToolJSONError(err) {
+		return false
+	}
+	if isKiroTransportError(err) {
+		return true
+	}
+	if isKiroTransientHTTPError(err) {
+		return true
+	}
+	code, ok := kiroStreamProtocolErrorCode(err)
+	if ok {
+		return code == upstreamBodyIdleTimeoutCode || code == upstreamGenerationTimeoutCode
+	}
+	// Keep the same narrow text-based classifications used by the ordinary
+	// transport retry path for HTTP/2 peer resets that arrive as plain errors.
+	return isRetryableKiroStreamError(err)
+}
+
+func prepareKiroOutputContinuationAfterError(payload *KiroPayload, err error, visibleAttempt string, completedToolNames []string) bool {
+	if payload == nil || payload.StructuredOutput || !isKiroOutputContinuationError(err) {
+		return false
+	}
+	if payload.outputContinuationAttemptText == "" && visibleAttempt != "" {
+		if len(visibleAttempt) <= maxKiroOutputContinuationBytes {
+			payload.outputContinuationAttemptText = visibleAttempt
+		} else {
+			payload.outputContinuationAttemptOverflow = true
+		}
+	}
+	return prepareKiroOutputContinuation(payload, completedToolNames)
+}
+
 func takeKiroOutputContinuationRetry(payload *KiroPayload, err error) bool {
-	if payload == nil || !payload.outputContinuationPending || !isUpstreamOutputTruncatedError(err) {
+	if payload == nil || !payload.outputContinuationPending ||
+		(!isUpstreamOutputTruncatedError(err) && !isKiroOutputContinuationError(err)) {
 		return false
 	}
 	payload.outputContinuationPending = false
@@ -1777,8 +1818,8 @@ func completedOpenAIToolNames(toolCalls []ToolCall) []string {
 	return names
 }
 
-func shouldFinishStreamAfterAgentContinuation(payload *KiroPayload, err error, toolCount int) bool {
-	if payload == nil || !payload.agentActionContinuationTimeout || payload.AgentActionContinuations == 0 || err == nil || toolCount > 0 {
+func shouldFinishStreamAfterAgentContinuation(payload *KiroPayload, err error, toolCount int, clientVisibleOutputWritten bool) bool {
+	if payload == nil || !payload.agentActionContinuationTimeout || payload.AgentActionContinuations == 0 || err == nil || toolCount > 0 || !clientVisibleOutputWritten {
 		return false
 	}
 	// A continuation timeout is an operational fallback: the already-forwarded
@@ -1853,5 +1894,17 @@ func cloneKiroPayload(payload *KiroPayload) *KiroPayload {
 	clone.lastAttemptPayloadBytes = payload.lastAttemptPayloadBytes
 	clone.lastAttemptEstimatedInputTokens = payload.lastAttemptEstimatedInputTokens
 	clone.lastAttemptStartedAt = payload.lastAttemptStartedAt
+	clone.forcedBearerRefreshAccounts = cloneBoolMap(payload.forcedBearerRefreshAccounts)
 	return &clone
+}
+
+func cloneBoolMap(source map[string]bool) map[string]bool {
+	if len(source) == 0 {
+		return nil
+	}
+	clone := make(map[string]bool, len(source))
+	for key, value := range source {
+		clone[key] = value
+	}
+	return clone
 }

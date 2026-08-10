@@ -2,13 +2,14 @@ package proxy
 
 import (
 	"errors"
+	"net/http"
 	"testing"
 	"time"
 
 	"kiro-go/config"
 )
 
-func TestPreResponseTransportRetryIsBoundedToOne(t *testing.T) {
+func TestPreResponseTransportRetryIsBounded(t *testing.T) {
 	payload := &KiroPayload{}
 	account := &config.Account{ID: "transport-retry"}
 	retryCount := 0
@@ -25,8 +26,16 @@ func TestPreResponseTransportRetryIsBoundedToOne(t *testing.T) {
 	retried, err = (&Handler{}).retryKiroPreResponse(
 		payload, account, &retryCount, map[string]bool{}, &retrySameID, errors.New("stream INTERNAL_ERROR"),
 	)
-	if err != nil || retried || retryCount != 1 || retrySameID != "" {
+	if err != nil || !retried || retryCount != 2 || retrySameID != account.ID {
 		t.Fatalf("second retry: retried=%v err=%v count=%d same_id=%q", retried, err, retryCount, retrySameID)
+	}
+
+	retrySameID = ""
+	retried, err = (&Handler{}).retryKiroPreResponse(
+		payload, account, &retryCount, map[string]bool{}, &retrySameID, errors.New("stream INTERNAL_ERROR"),
+	)
+	if err != nil || retried || retryCount != 2 || retrySameID != "" {
+		t.Fatalf("third retry: retried=%v err=%v count=%d same_id=%q", retried, err, retryCount, retrySameID)
 	}
 }
 
@@ -85,6 +94,28 @@ func TestPreResponseToolJSONDoesNotUseTransportRetry(t *testing.T) {
 
 	retried, err := (&Handler{}).retryKiroPreResponse(
 		payload, account, &retryCount, map[string]bool{}, &retrySameID, toolJSONErr,
+	)
+	if err != nil || retried || retryCount != 0 || retrySameID != "" {
+		t.Fatalf("retried=%v err=%v count=%d same_id=%q", retried, err, retryCount, retrySameID)
+	}
+}
+
+func TestPreResponseMonthlyQuotaDoesNotUseTransportRetry(t *testing.T) {
+	payload := &KiroPayload{}
+	account := &config.Account{ID: "monthly-quota"}
+	retryCount := 0
+	retrySameID := ""
+
+	retried, err := (&Handler{}).retryKiroPreResponse(
+		payload,
+		account,
+		&retryCount,
+		map[string]bool{},
+		&retrySameID,
+		&KiroHTTPError{
+			StatusCode: http.StatusPaymentRequired,
+			Body:       `{"reason":"MONTHLY_REQUEST_COUNT"}`,
+		},
 	)
 	if err != nil || retried || retryCount != 0 || retrySameID != "" {
 		t.Fatalf("retried=%v err=%v count=%d same_id=%q", retried, err, retryCount, retrySameID)

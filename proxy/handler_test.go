@@ -1052,6 +1052,10 @@ func TestClaudePromptCacheIsolationSeed(t *testing.T) {
 	if got := claudePromptCacheIsolationSeed(&req, ""); got != "session:session-123" {
 		t.Fatalf("session-only seed = %q", got)
 	}
+	req.Metadata.UserID = `{"device_id":"device","session_id":"8bb5523b-ec7c-4540-a9ca-beb6d79f1552"}`
+	if got := claudePromptCacheIsolationSeed(&req, "client-key-id"); got != "key:client-key-id|session:8bb5523b-ec7c-4540-a9ca-beb6d79f1552" {
+		t.Fatalf("JSON session seed = %q", got)
+	}
 	req.Metadata.UserID = "user-without-session"
 	if got := claudePromptCacheIsolationSeed(&req, "client-key-id"); got != "key:client-key-id" {
 		t.Fatalf("key fallback seed = %q", got)

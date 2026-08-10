@@ -66,6 +66,32 @@ func TestBoundedResponseWriterFlushesFirstEventsImmediately(t *testing.T) {
 	}
 }
 
+func TestResponseWritePolicyDefaultsToImmediateSSEFlush(t *testing.T) {
+	t.Setenv("KIRO_SSE_FLUSH_WINDOW_MS", "")
+	policy := responseWritePolicyFromEnv()
+	if policy.flushWindow != 0 {
+		t.Fatalf("default flush window=%s, want immediate flush", policy.flushWindow)
+	}
+
+	recorder := httptest.NewRecorder()
+	wrapped, bounded := wrapBoundedResponseWriterWithPolicy(recorder, func() {}, nil, policy)
+	flusher := wrapped.(http.Flusher)
+	const events = immediateSSEFlushes + 3
+	for i := 0; i < events; i++ {
+		_, _ = wrapped.Write([]byte("event"))
+		flusher.Flush()
+	}
+	bounded.finish()
+	if bounded.flushes != events {
+		t.Fatalf("default immediate flushes=%d, want %d", bounded.flushes, events)
+	}
+
+	t.Setenv("KIRO_SSE_FLUSH_WINDOW_MS", "25")
+	if got := responseWritePolicyFromEnv().flushWindow; got != 25*time.Millisecond {
+		t.Fatalf("explicit flush window=%s, want 25ms", got)
+	}
+}
+
 func TestBoundedResponseWriterForcesOnlyFirstVisibleFlush(t *testing.T) {
 	tracker := &latencyTracker{}
 	_, timing := withRequestTiming(context.Background(), tracker)

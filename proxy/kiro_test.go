@@ -537,23 +537,27 @@ func TestNormalizeKiroCallErrorClassifiesResponseHeaderTimeout(t *testing.T) {
 	}
 }
 
-func TestParseEventStreamDoesNotKeepAliveWhileFramesAreActive(t *testing.T) {
+func TestParseEventStreamKeepsIndependentHeartbeatWhileFramesAreActive(t *testing.T) {
 	reader, writer := io.Pipe()
 	t.Cleanup(func() {
 		_ = reader.Close()
 		_ = writer.Close()
 	})
 
-	frames := [][]byte{
-		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "a"}),
-		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "b"}),
-		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "c"}),
-	}
 	go func() {
-		for _, frame := range frames {
+		for _, frame := range [][]byte{
+			awsEventStreamFrame(t, "contextUsageEvent", map[string]interface{}{"contextUsagePercentage": 1}),
+			awsEventStreamFrame(t, "contextUsageEvent", map[string]interface{}{"contextUsagePercentage": 2}),
+			awsEventStreamFrame(t, "contextUsageEvent", map[string]interface{}{"contextUsagePercentage": 3}),
+			awsEventStreamFrame(t, "contextUsageEvent", map[string]interface{}{"contextUsagePercentage": 4}),
+			awsEventStreamFrame(t, "contextUsageEvent", map[string]interface{}{"contextUsagePercentage": 5}),
+			awsEventStreamFrame(t, "contextUsageEvent", map[string]interface{}{"contextUsagePercentage": 6}),
+		} {
 			time.Sleep(5 * time.Millisecond)
 			_, _ = writer.Write(frame)
 		}
+		time.Sleep(10 * time.Millisecond)
+		_, _ = writer.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "abc"}))
 		_ = writer.Close()
 	}()
 
@@ -562,12 +566,43 @@ func TestParseEventStreamDoesNotKeepAliveWhileFramesAreActive(t *testing.T) {
 	err := parseEventStreamWithKeepAlive(reader, &KiroStreamCallback{
 		OnKeepAlive: func() { keepAlives++ },
 		OnText:      func(text string, _ bool) { content.WriteString(text) },
-	}, 30*time.Millisecond)
+	}, 15*time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if keepAlives != 0 || content.String() != "abc" {
-		t.Fatalf("keepalives=%d content=%q, want no keepalive and intact active stream", keepAlives, content.String())
+	if keepAlives < 2 || content.String() != "abc" {
+		t.Fatalf("keepalives=%d content=%q, want independent heartbeats and intact active stream", keepAlives, content.String())
+	}
+}
+
+func TestParseEventStreamIgnoresUnknownNonJSONEvent(t *testing.T) {
+	stream := bytes.NewReader(bytes.Join([][]byte{
+		awsEventStreamFrameWithRawPayload(t, map[string]string{
+			":message-type": "event",
+			":event-type":   "futureKiroEvent",
+		}, []byte("not-json")),
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "continued"}),
+	}, nil))
+	var content strings.Builder
+	err := parseEventStream(stream, &KiroStreamCallback{
+		OnText: func(text string, _ bool) { content.WriteString(text) },
+	})
+	if err != nil {
+		t.Fatalf("unknown event terminated stream: %v", err)
+	}
+	if content.String() != "continued" {
+		t.Fatalf("content=%q, want continued output after unknown event", content.String())
+	}
+}
+
+func TestParseEventStreamStillRejectsMalformedKnownEvent(t *testing.T) {
+	stream := bytes.NewReader(awsEventStreamFrameWithRawPayload(t, map[string]string{
+		":message-type": "event",
+		":event-type":   "assistantResponseEvent",
+	}, []byte("not-json")))
+	err := parseEventStream(stream, &KiroStreamCallback{})
+	if err == nil || !strings.Contains(err.Error(), "invalid assistantResponseEvent payload") {
+		t.Fatalf("malformed known event was accepted: %v", err)
 	}
 }
 
@@ -1425,6 +1460,11 @@ func awsEventStreamFrameWithHeaders(t *testing.T, stringHeaders map[string]strin
 	if err != nil {
 		t.Fatalf("marshal payload: %v", err)
 	}
+	return awsEventStreamFrameWithRawPayload(t, stringHeaders, payloadBytes)
+}
+
+func awsEventStreamFrameWithRawPayload(t *testing.T, stringHeaders map[string]string, payloadBytes []byte) []byte {
+	t.Helper()
 
 	var headers []byte
 	for name, value := range stringHeaders {

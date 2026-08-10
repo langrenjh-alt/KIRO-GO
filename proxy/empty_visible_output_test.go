@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -410,7 +411,23 @@ func TestClaudeBufferedCallSuppressesReasoningWhenThinkingIsDisabled(t *testing.
 	}
 }
 
-func TestClaudeStreamReturnsSuccessfulEmptyMessageWithoutRetry(t *testing.T) {
+func TestClaudeBufferedCallExtractsTaggedReasoningWhenThinkingIsEnabled(t *testing.T) {
+	h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
+		callback.OnText("<thinking>inspect the request</thinking>answer", false)
+		callback.OnComplete(10, 4)
+		return nil
+	})
+
+	result, err := h.callClaudeBuffered("claude-opus-5", emptyVisibleOutputPayload(), true, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Content != "answer" || result.Reasoning.Text != "inspect the request" {
+		t.Fatalf("content=%q reasoning=%q", result.Content, result.Reasoning.Text)
+	}
+}
+
+func TestClaudeStreamRejectsEmptyUpstreamAfterBoundedRetries(t *testing.T) {
 	var calls int
 	h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
 		calls++
@@ -421,17 +438,295 @@ func TestClaudeStreamReturnsSuccessfulEmptyMessageWithoutRetry(t *testing.T) {
 
 	h.handleClaudeStream(rec, emptyVisibleOutputPayload(), "claude-opus-5", "claude-opus-5", false, claudeThinkingResponseOptions{}, 5, nil, "")
 
-	if calls != 1 {
-		t.Fatalf("calls=%d, want one attempt", calls)
+	if calls != maxKiroTransportPreResponseRetries+1 {
+		t.Fatalf("calls=%d, want bounded attempts=%d", calls, maxKiroTransportPreResponseRetries+1)
 	}
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "message_stop") {
+	if rec.Code != http.StatusBadGateway || strings.Contains(rec.Body.String(), "message_stop") ||
+		!strings.Contains(rec.Body.String(), "upstream returned no client-visible output") {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	if strings.Contains(rec.Body.String(), "empty_visible_output") {
-		t.Fatalf("empty success was converted to an error: %s", rec.Body.String())
-	}
 	logs := h.getRequestLogs()
-	if len(logs) != 1 || logs[0].Status != "success" || logs[0].Error != "" {
-		t.Fatalf("request logs=%#v, want one successful empty response", logs)
+	if len(logs) != calls+1 {
+		t.Fatalf("request logs=%#v, want one settled success plus terminal error per attempt", logs)
+	}
+	settled := 0
+	for _, log := range logs {
+		if log.Status == "success" {
+			settled++
+			if log.Tokens <= 0 {
+				t.Fatalf("empty attempt was not charged: %#v", log)
+			}
+		}
+	}
+	if settled != calls {
+		t.Fatalf("settled attempts=%d, want %d: %#v", settled, calls, logs)
+	}
+}
+
+func TestClaudeStreamRetriesHiddenReasoningUntilVisibleAnswer(t *testing.T) {
+	var calls int
+	h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
+		calls++
+		if calls == 1 {
+			callback.OnReasoning(KiroReasoningContentEvent{Text: "private reasoning"})
+		} else {
+			callback.OnText("visible answer", false)
+		}
+		callback.OnComplete(10, 4)
+		return nil
+	})
+	rec := httptest.NewRecorder()
+
+	h.handleClaudeStream(rec, emptyVisibleOutputPayload(), "claude-opus-5", "claude-opus-5", false, claudeThinkingResponseOptions{}, 5, nil, "")
+
+	body := rec.Body.String()
+	if calls != 2 || rec.Code != http.StatusOK || !strings.Contains(body, "visible answer") ||
+		strings.Contains(body, "private reasoning") || !strings.Contains(body, "message_stop") {
+		t.Fatalf("calls=%d status=%d body=%s", calls, rec.Code, body)
+	}
+	for _, log := range h.getRequestLogs() {
+		if log.Status == "success" && log.Tokens <= 0 {
+			t.Fatalf("hidden-reasoning attempt was not charged: %#v", log)
+		}
+	}
+}
+
+func TestClaudeNonStreamRetriesHiddenReasoningUntilVisibleAnswer(t *testing.T) {
+	var calls int
+	h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
+		calls++
+		if calls == 1 {
+			callback.OnReasoning(KiroReasoningContentEvent{Text: "private reasoning"})
+		} else {
+			callback.OnText("visible answer", false)
+		}
+		callback.OnComplete(10, 4)
+		return nil
+	})
+	rec := httptest.NewRecorder()
+
+	h.handleClaudeNonStream(rec, emptyVisibleOutputPayload(), "claude-opus-5", "claude-opus-5", false, claudeThinkingResponseOptions{}, 5, nil, "")
+
+	body := rec.Body.String()
+	if calls != 2 || rec.Code != http.StatusOK || !strings.Contains(body, "visible answer") || strings.Contains(body, "private reasoning") {
+		t.Fatalf("calls=%d status=%d body=%s", calls, rec.Code, body)
+	}
+	for _, log := range h.getRequestLogs() {
+		if log.Status == "success" && log.Tokens <= 0 {
+			t.Fatalf("hidden-reasoning attempt was not charged: %#v", log)
+		}
+	}
+}
+
+func TestClaudeRejectsThinkingTagOnlyWhenThinkingIsDisabled(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		name := "non-stream"
+		if stream {
+			name = "stream"
+		}
+		t.Run(name, func(t *testing.T) {
+			var calls int
+			h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
+				calls++
+				callback.OnText("<thinking>private tagged reasoning</thinking>", false)
+				callback.OnComplete(10, 4)
+				return nil
+			})
+			rec := httptest.NewRecorder()
+			if stream {
+				h.handleClaudeStream(rec, emptyVisibleOutputPayload(), "claude-opus-5", "claude-opus-5", false, claudeThinkingResponseOptions{}, 5, nil, "")
+			} else {
+				h.handleClaudeNonStream(rec, emptyVisibleOutputPayload(), "claude-opus-5", "claude-opus-5", false, claudeThinkingResponseOptions{}, 5, nil, "")
+			}
+			if calls != maxKiroTransportPreResponseRetries+1 || rec.Code != http.StatusBadGateway ||
+				strings.Contains(rec.Body.String(), "private tagged reasoning") ||
+				!strings.Contains(rec.Body.String(), "upstream returned no client-visible output") {
+				t.Fatalf("calls=%d status=%d body=%s", calls, rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestClaudeReasoningOnlyWithOmittedThinkingDisplayRetries(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		name := "non-stream"
+		if stream {
+			name = "stream"
+		}
+		t.Run(name, func(t *testing.T) {
+			var calls int
+			h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
+				calls++
+				callback.OnReasoning(KiroReasoningContentEvent{Text: "private omitted reasoning"})
+				callback.OnComplete(10, 4)
+				return nil
+			})
+			rec := httptest.NewRecorder()
+			opts := claudeThinkingResponseOptions{Format: "thinking", OmitDisplay: true}
+			if stream {
+				h.handleClaudeStream(rec, emptyVisibleOutputPayload(), "claude-opus-5", "claude-opus-5", true, opts, 5, nil, "")
+			} else {
+				h.handleClaudeNonStream(rec, emptyVisibleOutputPayload(), "claude-opus-5", "claude-opus-5", true, opts, 5, nil, "")
+			}
+			if calls != maxKiroTransportPreResponseRetries+1 || rec.Code != http.StatusBadGateway ||
+				strings.Contains(rec.Body.String(), "private omitted reasoning") ||
+				!strings.Contains(rec.Body.String(), "upstream returned no client-visible output") {
+				t.Fatalf("calls=%d status=%d body=%s", calls, rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestClaudeNonStreamRejectsEmptyUpstreamAfterBoundedRetries(t *testing.T) {
+	var calls int
+	h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
+		calls++
+		callback.OnComplete(10, 4)
+		return nil
+	})
+	rec := httptest.NewRecorder()
+
+	h.handleClaudeNonStream(rec, emptyVisibleOutputPayload(), "claude-opus-5", "claude-opus-5", false, claudeThinkingResponseOptions{}, 5, nil, "")
+
+	body := rec.Body.String()
+	if calls != maxKiroTransportPreResponseRetries+1 || rec.Code != http.StatusBadGateway ||
+		strings.Contains(body, "\"content\"") || !strings.Contains(body, "upstream returned no client-visible output") {
+		t.Fatalf("calls=%d status=%d body=%s", calls, rec.Code, body)
+	}
+	settled := 0
+	for _, log := range h.getRequestLogs() {
+		if log.Status == "success" {
+			settled++
+			if log.Tokens <= 0 {
+				t.Fatalf("empty attempt was not charged: %#v", log)
+			}
+		}
+	}
+	if settled != calls {
+		t.Fatalf("settled attempts=%d, want %d", settled, calls)
+	}
+}
+
+func TestOpenAIAdaptersRejectEmptyUpstreamAfterBoundedRetries(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(map[bool]string{false: "non-stream", true: "stream"}[stream], func(t *testing.T) {
+			var calls int
+			h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
+				calls++
+				callback.OnComplete(10, 4)
+				return nil
+			})
+			rec := httptest.NewRecorder()
+			payload := emptyVisibleOutputPayload()
+			if stream {
+				h.handleOpenAIStream(rec, payload, "claude-opus-5", "claude-opus-5", false, false, 5, "")
+			} else {
+				h.handleOpenAINonStream(rec, payload, "claude-opus-5", "claude-opus-5", false, 5, "")
+			}
+			if calls != maxKiroTransportPreResponseRetries+1 || rec.Code != http.StatusBadGateway ||
+				!strings.Contains(rec.Body.String(), "upstream returned no client-visible output") {
+				t.Fatalf("calls=%d status=%d body=%s", calls, rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestResponsesAdaptersRejectEmptyUpstreamAfterBoundedRetries(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(map[bool]string{false: "non-stream", true: "stream"}[stream], func(t *testing.T) {
+			var calls int
+			h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
+				calls++
+				callback.OnComplete(10, 4)
+				return nil
+			})
+			rec := httptest.NewRecorder()
+			payload := emptyVisibleOutputPayload()
+			req := &ResponsesRequest{Model: "claude-opus-5", Stream: stream}
+			if stream {
+				h.handleResponsesStream(rec, payload, "claude-opus-5", "claude-opus-5", false, 5, "", "resp_empty", req, nil, false)
+			} else {
+				h.handleResponsesNonStream(rec, payload, "claude-opus-5", "claude-opus-5", false, 5, "", "resp_empty", req, nil, false)
+			}
+			if calls != maxKiroTransportPreResponseRetries+1 || !strings.Contains(rec.Body.String(), "upstream returned no client-visible output") {
+				t.Fatalf("calls=%d status=%d body=%s", calls, rec.Code, rec.Body.String())
+			}
+			if stream && rec.Code != http.StatusOK {
+				t.Fatalf("stream status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			if !stream && rec.Code != http.StatusBadGateway {
+				t.Fatalf("non-stream status=%d body=%s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestPublicAdaptersShareInvalidBearerRefresh(t *testing.T) {
+	tests := []struct {
+		name     string
+		protocol string
+		stream   bool
+	}{
+		{name: "claude stream", protocol: "claude", stream: true},
+		{name: "claude non-stream", protocol: "claude"},
+		{name: "chat stream", protocol: "chat", stream: true},
+		{name: "chat non-stream", protocol: "chat"},
+		{name: "responses stream", protocol: "responses", stream: true},
+		{name: "responses non-stream", protocol: "responses"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var calls, refreshes int
+			h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
+				calls++
+				if calls == 1 {
+					return &KiroHTTPError{
+						StatusCode: http.StatusForbidden,
+						Endpoint:   "test",
+						Body:       `{"message":"The bearer token included in the request is invalid."}`,
+					}
+				}
+				if callback.OnStreamReady != nil {
+					callback.OnStreamReady()
+				}
+				callback.OnText("visible after bearer refresh", false)
+				callback.OnComplete(10, 4)
+				return nil
+			})
+			h.tokenRefresher = func(_ context.Context, account *config.Account, force bool) error {
+				if !force {
+					t.Fatal("invalid bearer recovery did not force refresh")
+				}
+				refreshes++
+				account.AccessToken = "fresh-token"
+				return nil
+			}
+			rec := httptest.NewRecorder()
+			payload := emptyVisibleOutputPayload()
+			switch test.protocol {
+			case "claude":
+				if test.stream {
+					h.handleClaudeStream(rec, payload, "claude-opus-5", "claude-opus-5", false, claudeThinkingResponseOptions{}, 5, nil, "")
+				} else {
+					h.handleClaudeNonStream(rec, payload, "claude-opus-5", "claude-opus-5", false, claudeThinkingResponseOptions{}, 5, nil, "")
+				}
+			case "chat":
+				if test.stream {
+					h.handleOpenAIStream(rec, payload, "claude-opus-5", "claude-opus-5", false, false, 5, "")
+				} else {
+					h.handleOpenAINonStream(rec, payload, "claude-opus-5", "claude-opus-5", false, 5, "")
+				}
+			case "responses":
+				req := &ResponsesRequest{Model: "claude-opus-5", Stream: test.stream}
+				if test.stream {
+					h.handleResponsesStream(rec, payload, "claude-opus-5", "claude-opus-5", false, 5, "", "resp_refresh", req, nil, false)
+				} else {
+					h.handleResponsesNonStream(rec, payload, "claude-opus-5", "claude-opus-5", false, 5, "", "resp_refresh", req, nil, false)
+				}
+			}
+			if calls != 2 || refreshes != 1 || !strings.Contains(rec.Body.String(), "visible after bearer refresh") {
+				t.Fatalf("calls=%d refreshes=%d status=%d body=%s", calls, refreshes, rec.Code, rec.Body.String())
+			}
+		})
 	}
 }

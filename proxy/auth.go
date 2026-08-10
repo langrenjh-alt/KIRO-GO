@@ -70,8 +70,8 @@ func appendUniqueCredential(keys []string, candidate string) []string {
 
 func isClaudeCredentialPath(path string) bool {
 	switch path {
-	case "/v1/messages", "/messages", "/anthropic/v1/messages",
-		"/v1/messages/count_tokens", "/messages/count_tokens":
+	case "/v1/messages", "/messages", "/anthropic/v1/messages", "/cc/v1/messages",
+		"/v1/messages/count_tokens", "/messages/count_tokens", "/cc/v1/messages/count_tokens":
 		return true
 	default:
 		return false

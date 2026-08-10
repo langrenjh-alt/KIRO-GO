@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"compress/zlib"
+	"crypto/sha256"
 	"encoding/ascii85"
 	"encoding/base64"
 	"encoding/json"
@@ -251,11 +252,138 @@ type ClaudeOutputTokensDetails struct {
 
 const maxToolDescLen = 10237
 
+func utf8SafePrefix(value string, maxBytes int) int {
+	if maxBytes <= 0 {
+		return 0
+	}
+	if len(value) <= maxBytes {
+		return len(value)
+	}
+	end := maxBytes
+	for end > 0 && !utf8.ValidString(value[:end]) {
+		end--
+	}
+	return end
+}
+
+// These compatibility instructions are part of the kiro.rs Claude Code
+// adapter. Keep them in the upstream prompt so large Write/Edit operations are
+// split deterministically instead of being silently truncated by Kiro.
+const (
+	writeToolDescriptionSuffix = "- IMPORTANT: If the content to write exceeds 150 lines, you MUST only write the first 50 lines using this tool, then use `Edit` tool to append the remaining content in chunks of no more than 50 lines each. If needed, leave a unique placeholder to help append content. Do NOT attempt to write all content at once."
+	editToolDescriptionSuffix  = "- IMPORTANT: If the `new_string` content exceeds 50 lines, you MUST split it into multiple Edit calls, each replacing no more than 50 lines at a time. If used to append content, leave a unique placeholder to help append content. On the final chunk, do NOT include the placeholder."
+	chunkedWriteSystemPolicy   = "When the Write or Edit tool has content size limits, always comply silently. Never suggest bypassing these limits via alternative tools. Never ask the user whether to switch approaches. Complete all chunked operations without commentary."
+)
+
+// trimClaudeAssistantPrefill mirrors kiro.rs: Kiro currentMessage must be a
+// user turn, so a trailing assistant prefill and everything after the final
+// user message are discarded before building history.
+func trimClaudeAssistantPrefill(messages []ClaudeMessage) []ClaudeMessage {
+	if len(messages) == 0 || strings.EqualFold(strings.TrimSpace(messages[len(messages)-1].Role), "user") {
+		return messages
+	}
+	lastUser := -1
+	for i := len(messages) - 1; i >= 0; i-- {
+		if strings.EqualFold(strings.TrimSpace(messages[i].Role), "user") {
+			lastUser = i
+			break
+		}
+	}
+	if lastUser < 0 {
+		return nil
+	}
+	return messages[:lastUser+1]
+}
+
+// extractClaudeSessionID accepts both metadata.user_id forms emitted by Claude
+// Code and returns only a validated UUID for use as conversationId.
+func extractClaudeSessionID(userID string) string {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return ""
+	}
+	var envelope map[string]interface{}
+	if json.Unmarshal([]byte(userID), &envelope) == nil {
+		if session, ok := envelope["session_id"].(string); ok {
+			if parsed, err := uuid.Parse(strings.TrimSpace(session)); err == nil {
+				return parsed.String()
+			}
+		}
+	}
+	const marker = "session_"
+	if index := strings.Index(userID, marker); index >= 0 {
+		candidate := userID[index+len(marker):]
+		if len(candidate) >= 36 {
+			candidate = candidate[:36]
+			if parsed, err := uuid.Parse(candidate); err == nil {
+				return parsed.String()
+			}
+		}
+	}
+	return ""
+}
+
+// mergeAdjacentKiroHistory follows kiro.rs's role buffering. Kiro expects
+// alternating user/assistant turns; clients can legally send consecutive
+// blocks of either role after retries or context compaction.
+func mergeAdjacentKiroHistory(history []KiroHistoryMessage) []KiroHistoryMessage {
+	if len(history) < 2 {
+		return history
+	}
+	merged := make([]KiroHistoryMessage, 0, len(history))
+	for _, message := range history {
+		if len(merged) == 0 {
+			merged = append(merged, message)
+			continue
+		}
+		last := &merged[len(merged)-1]
+		if last.UserInputMessage != nil && message.UserInputMessage != nil {
+			lastUser, nextUser := last.UserInputMessage, message.UserInputMessage
+			lastUser.Content = joinHistoryText(lastUser.Content, nextUser.Content)
+			lastUser.Images = append(lastUser.Images, nextUser.Images...)
+			if nextUser.UserInputMessageContext != nil {
+				if lastUser.UserInputMessageContext == nil {
+					lastUser.UserInputMessageContext = &UserInputMessageContext{}
+				}
+				lastUser.UserInputMessageContext.Tools = append(lastUser.UserInputMessageContext.Tools, nextUser.UserInputMessageContext.Tools...)
+				lastUser.UserInputMessageContext.ToolResults = append(lastUser.UserInputMessageContext.ToolResults, nextUser.UserInputMessageContext.ToolResults...)
+			}
+			continue
+		}
+		if last.AssistantResponseMessage != nil && message.AssistantResponseMessage != nil {
+			lastAssistant, nextAssistant := last.AssistantResponseMessage, message.AssistantResponseMessage
+			lastAssistant.Content = joinHistoryText(lastAssistant.Content, nextAssistant.Content)
+			lastAssistant.ToolUses = append(lastAssistant.ToolUses, nextAssistant.ToolUses...)
+			if lastAssistant.ReasoningContent == nil {
+				lastAssistant.ReasoningContent = nextAssistant.ReasoningContent
+			}
+			continue
+		}
+		merged = append(merged, message)
+	}
+	return merged
+}
+
+// ensureKiroHistoryEndsWithAssistant mirrors kiro.rs's role buffering. When
+// the request contains consecutive user turns before the current message,
+// merging leaves a history user turn immediately before currentMessage. Kiro
+// requires alternating roles, so close that buffered turn with a neutral
+// assistant acknowledgement.
+func ensureKiroHistoryEndsWithAssistant(history []KiroHistoryMessage) []KiroHistoryMessage {
+	if len(history) == 0 || history[len(history)-1].UserInputMessage == nil {
+		return history
+	}
+	return append(history, KiroHistoryMessage{
+		AssistantResponseMessage: &KiroAssistantResponseMessage{Content: "OK"},
+	})
+}
+
 func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	modelID := MapModel(req.Model)
 	origin := "AI_EDITOR"
 	historyMode := configuredKiroHistoryMode()
 	nativeActiveHistory := historyMode == kiroHistoryModeNativeActive
+	messages := trimClaudeAssistantPrefill(req.Messages)
 
 	// 提取系统提示
 	systemPrompt := buildClaudeSystemPrompt(req, thinking)
@@ -293,8 +421,8 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	var currentImages []KiroImage
 	var currentToolResults []KiroToolResult
 
-	for i, msg := range req.Messages {
-		isLast := i == len(req.Messages)-1
+	for i, msg := range messages {
+		isLast := i == len(messages)-1
 
 		if msg.Role == "user" {
 			content, images, toolResults := extractClaudeUserContent(msg.Content)
@@ -334,7 +462,9 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		}
 	}
 
-	history = trimLeadingAssistantHistory(history)
+	history = ensureKiroHistoryEndsWithAssistant(
+		mergeAdjacentKiroHistory(trimLeadingAssistantHistory(history)),
+	)
 
 	// Keep system instructions in history instead of user content.
 	if systemPrompt != "" {
@@ -360,10 +490,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	// (orphaned tool results, e.g. after context compaction), flatten them into
 	// the current message text so the upstream does not reject the request.
 	currentToolResultIDs := collectToolResultIDs(currentToolResults)
-	keepCurrentToolResults := currentToolResultsMatchLastAssistant(history, currentToolResultIDs)
-	if nativeActiveHistory {
-		keepCurrentToolResults = currentToolResultsExactlyMatchLastAssistant(history, currentToolResults)
-	}
+	keepCurrentToolResults := currentToolResultsExactlyMatchLastAssistant(history, currentToolResults)
 	nativeFallbackEvidence := ""
 	if nativeActiveHistory && !keepCurrentToolResults && len(currentToolResults) > 0 && len(history) > 0 {
 		if assistant := history[len(history)-1].AssistantResponseMessage; assistant != nil {
@@ -454,7 +581,13 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	payload.ConversationState.ChatTriggerType = "MANUAL"
 	payload.ConversationState.AgentTaskType = "vibe"
 	payload.ConversationState.AgentContinuationId = uuid.New().String()
-	payload.ConversationState.ConversationID = buildConversationID(modelID, stableSystemPrompt, firstClaudeConversationAnchor(req.Messages))
+	conversationID := buildConversationID(modelID, stableSystemPrompt, firstClaudeConversationAnchor(messages))
+	if req.Metadata != nil {
+		if sessionID := extractClaudeSessionID(req.Metadata.UserID); sessionID != "" {
+			conversationID = sessionID
+		}
+	}
+	payload.ConversationState.ConversationID = conversationID
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
 		Content: finalContent,
 		ModelID: modelID,
@@ -498,6 +631,9 @@ func buildClaudeSystemPrompt(req *ClaudeRequest, thinking bool) string {
 	}
 	systemPrompt := extractSystemPrompt(req.System)
 	systemPrompt = applyPromptFilters(systemPrompt)
+	if systemPrompt != "" && !strings.Contains(systemPrompt, chunkedWriteSystemPolicy) {
+		systemPrompt = appendSystemInstruction(systemPrompt, chunkedWriteSystemPolicy)
+	}
 	thinkingPrompt := claudeThinkingPrompt(req, thinking)
 	if thinkingPrompt == "" {
 		return systemPrompt
@@ -814,6 +950,7 @@ func extractSystemPrompt(system interface{}) string {
 
 func extractClaudeUserContent(content interface{}) (string, []KiroImage, []KiroToolResult) {
 	var text string
+	var textBlocks int
 	var images []KiroImage
 	var toolResults []KiroToolResult
 
@@ -832,7 +969,11 @@ func extractClaudeUserContent(content interface{}) (string, []KiroImage, []KiroT
 			switch blockType {
 			case "text", "input_text":
 				if t, ok := block["text"].(string); ok {
+					if textBlocks > 0 {
+						text += "\n"
+					}
 					text += t
+					textBlocks++
 				}
 			case "document", "input_file":
 				// Kiro's wire format has image support but no document block.
@@ -1069,7 +1210,7 @@ func extractToolResultContent(content interface{}) (string, []KiroImage) {
 				images = append(images, *img)
 			}
 		}
-		return strings.Join(parts, ""), images
+		return strings.Join(parts, "\n"), images
 	}
 	return "", nil
 }
@@ -1275,8 +1416,16 @@ func convertClaudeTools(tools []ClaudeTool) ([]KiroToolWrapper, map[string]strin
 			continue
 		}
 		desc := tool.Description
-		if len(desc) > maxToolDescLen {
-			desc = desc[:maxToolDescLen] + "..."
+		switch strings.ToLower(name) {
+		case "write":
+			desc = strings.TrimSpace(desc) + "\n" + writeToolDescriptionSuffix
+		case "edit":
+			desc = strings.TrimSpace(desc) + "\n" + editToolDescriptionSuffix
+		}
+		if len(desc) > 10000 {
+			desc = desc[:utf8SafePrefix(desc, 10000)]
+		} else if len(desc) > maxToolDescLen {
+			desc = desc[:utf8SafePrefix(desc, maxToolDescLen)] + "..."
 		}
 		sanitized := shortenToolName(sanitizeToolName(name))
 		if sanitized != name {
@@ -1291,16 +1440,45 @@ func convertClaudeTools(tools []ClaudeTool) ([]KiroToolWrapper, map[string]strin
 	return result, nameMap
 }
 
-// ensureObjectSchema 确保工具 schema 顶层是 object，并清理 Kiro 不接受的字段。
+// ensureObjectSchema mirrors kiro.rs's top-level tool-schema normalization.
+// Valid nested JSON Schema constructs are preserved rather than stripped.
 func ensureObjectSchema(schema interface{}) interface{} {
 	m, ok := schema.(map[string]interface{})
 	if !ok {
-		return map[string]interface{}{"type": "object"}
+		return map[string]interface{}{
+			"type":                 "object",
+			"properties":           map[string]interface{}{},
+			"required":             []interface{}{},
+			"additionalProperties": true,
+		}
 	}
 	cleaned := cloneSchemaMap(m)
-	cleanSchema(cleaned)
-	if _, hasType := cleaned["type"]; !hasType {
+	if typeName, valid := cleaned["type"].(string); !valid || strings.TrimSpace(typeName) == "" {
 		cleaned["type"] = "object"
+	}
+	if properties, valid := cleaned["properties"].(map[string]interface{}); !valid || properties == nil {
+		cleaned["properties"] = map[string]interface{}{}
+	}
+
+	required := make([]interface{}, 0)
+	switch values := cleaned["required"].(type) {
+	case []interface{}:
+		for _, value := range values {
+			if name, ok := value.(string); ok {
+				required = append(required, name)
+			}
+		}
+	case []string:
+		for _, name := range values {
+			required = append(required, name)
+		}
+	}
+	cleaned["required"] = required
+
+	switch cleaned["additionalProperties"].(type) {
+	case bool, map[string]interface{}:
+	default:
+		cleaned["additionalProperties"] = true
 	}
 	return cleaned
 }
@@ -1328,42 +1506,7 @@ func cloneSchemaValue(v interface{}) interface{} {
 	}
 }
 
-// cleanSchema 递归清理会导致 Kiro 400 的 schema 字段。
-func cleanSchema(m map[string]interface{}) {
-	delete(m, "additionalProperties")
-
-	// required 必须是非空数组，否则 Kiro 会报 Improperly formed request。
-	if req, exists := m["required"]; exists {
-		switch arr := req.(type) {
-		case nil:
-			delete(m, "required")
-		case []interface{}:
-			if len(arr) == 0 {
-				delete(m, "required")
-			}
-		case []string:
-			if len(arr) == 0 {
-				delete(m, "required")
-			}
-		default:
-			delete(m, "required")
-		}
-	}
-
-	for _, v := range m {
-		switch val := v.(type) {
-		case map[string]interface{}:
-			cleanSchema(val)
-		case []interface{}:
-			for _, item := range val {
-				if sub, ok := item.(map[string]interface{}); ok {
-					cleanSchema(sub)
-				}
-			}
-		}
-	}
-}
-
+// normalizeToolDesc supplies a stable fallback when a tool has no description.
 func normalizeToolDesc(desc, name string) string {
 	if strings.TrimSpace(desc) != "" {
 		return desc
@@ -1402,20 +1545,26 @@ func sanitizeToolName(name string) string {
 }
 
 func shortenToolName(name string) string {
-	if len(name) <= 64 {
+	const maxBytes = 63
+	const suffixBytes = 8
+	if len([]byte(name)) <= maxBytes {
 		return name
 	}
-	// MCP tools: mcp__server__tool -> mcp__tool
-	if strings.HasPrefix(name, "mcp__") {
-		lastIdx := strings.LastIndex(name, "__")
-		if lastIdx > 5 {
-			shortened := "mcp__" + name[lastIdx+2:]
-			if len(shortened) <= 64 {
-				return shortened
-			}
+	// Kiro accepts at most 63 bytes. Keep a stable prefix and append a digest
+	// so distinct MCP tools cannot collide after truncation. Trim only at a
+	// UTF-8 boundary; the wire name must remain valid JSON text.
+	digest := sha256.Sum256([]byte(name))
+	suffix := fmt.Sprintf("%x", digest[:])[:suffixBytes]
+	prefixBudget := maxBytes - 1 - suffixBytes
+	prefix := name
+	for len([]byte(prefix)) > prefixBudget {
+		_, size := utf8.DecodeLastRuneInString(prefix)
+		if size <= 0 || size > len(prefix) {
+			break
 		}
+		prefix = prefix[:len(prefix)-size]
 	}
-	return name[:64]
+	return prefix + "_" + suffix
 }
 
 // ==================== Kiro -> Claude 转换 ====================
@@ -1785,6 +1934,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 			}
 		}
 	}
+	history = ensureKiroHistoryEndsWithAssistant(mergeAdjacentKiroHistory(history))
 
 	// Keep system instructions in history instead of user content.
 	if systemPrompt != "" {
@@ -1809,10 +1959,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	// flatten them into the current message text in legacy mode (see ClaudeToKiro
 	// for rationale).
 	currentToolResultIDs := collectToolResultIDs(currentToolResults)
-	keepCurrentToolResults := currentToolResultsMatchLastAssistant(history, currentToolResultIDs)
-	if nativeActiveHistory {
-		keepCurrentToolResults = currentToolResultsExactlyMatchLastAssistant(history, currentToolResults)
-	}
+	keepCurrentToolResults := currentToolResultsExactlyMatchLastAssistant(history, currentToolResults)
 	nativeFallbackEvidence := ""
 	if nativeActiveHistory && !keepCurrentToolResults && len(currentToolResults) > 0 && len(history) > 0 {
 		if assistant := history[len(history)-1].AssistantResponseMessage; assistant != nil {
@@ -2801,31 +2948,36 @@ func KiroToOpenAIResponse(content string, toolUses []KiroToolUse, inputTokens, o
 	}
 }
 
-// extractThinkingFromContent 从内容中提取 <thinking> 标签内的内容
+// extractThinkingFromContent extracts real thinking blocks while preserving
+// quoted tag literals. An unterminated real block is reasoning, not visible
+// assistant text; accepting it as text can produce a successful empty response
+// when thinking display is disabled.
 func extractThinkingFromContent(content string) (string, string) {
-	var reasoning string
-	result := content
-
+	var visible strings.Builder
+	var reasoning strings.Builder
+	rest := content
 	for {
-		start := strings.Index(result, "<thinking>")
-		if start == -1 {
+		start := findRealThinkingStartTag(rest)
+		if start < 0 {
+			visible.WriteString(rest)
 			break
 		}
-		end := strings.Index(result[start:], "</thinking>")
-		if end == -1 {
+		visible.WriteString(rest[:start])
+		afterOpen := rest[start+len(thinkingOpenTag):]
+		end := findRealThinkingEndTag(afterOpen)
+		if end < 0 {
+			end = findThinkingEndTagAtBufferEnd(afterOpen)
+		}
+		if end < 0 {
+			pending := true
+			reasoning.WriteString(trimThinkingLeadingNewline(afterOpen, &pending))
 			break
 		}
-		end += start
-
-		// 提取 thinking 内容
-		thinkingContent := result[start+10 : end]
-		reasoning += thinkingContent
-
-		// 从结果中移除 thinking 标签
-		result = result[:start] + result[end+11:]
+		pending := true
+		reasoning.WriteString(trimThinkingLeadingNewline(afterOpen[:end], &pending))
+		rest = afterOpen[end+len(thinkingCloseTag):]
 	}
-
-	return strings.TrimSpace(result), reasoning
+	return strings.TrimSpace(visible.String()), reasoning.String()
 }
 
 // KiroToOpenAIResponseWithReasoning 带 reasoning_content 的 OpenAI 响应

@@ -327,6 +327,175 @@ func TestStreamingMarkedEndTurnDoesNotStartAgentContinuation(t *testing.T) {
 	}
 }
 
+func TestStreamingAgentContinuationTimeoutKeepsPriorVisibleOutput(t *testing.T) {
+	tests := []struct {
+		name      string
+		invoke    func(*Handler, *httptest.ResponseRecorder)
+		terminal  string
+		forbidden string
+	}{
+		{
+			name: "Claude Messages",
+			invoke: func(h *Handler, rec *httptest.ResponseRecorder) {
+				h.handleClaudeStream(rec, completionProtocolTestPayload(), "claude-opus-5", "claude-opus-5", false, claudeThinkingResponseOptions{}, 5, nil, "")
+			},
+			terminal:  `event: message_stop`,
+			forbidden: `event: error`,
+		},
+		{
+			name: "Chat Completions",
+			invoke: func(h *Handler, rec *httptest.ResponseRecorder) {
+				req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+					"model":"claude-opus-5",
+					"messages":[{"role":"system","content":"You are Codex, a coding agent."},{"role":"user","content":"inspect"}],
+					"tools":[{"type":"function","function":{"name":"shell_command","parameters":{"type":"object"}}}],
+					"stream":true
+				}`))
+				h.handleOpenAIChat(rec, req)
+			},
+			terminal:  `data: [DONE]`,
+			forbidden: `"error":`,
+		},
+		{
+			name: "Responses",
+			invoke: func(h *Handler, rec *httptest.ResponseRecorder) {
+				req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+					"model":"claude-opus-5",
+					"instructions":"You are Codex, a coding agent.",
+					"input":"inspect the implementation",
+					"tools":[{"type":"function","name":"shell_command","parameters":{"type":"object"}}],
+					"stream":true,
+					"store":false
+				}`))
+				h.handleOpenAIResponses(rec, req)
+			},
+			terminal:  `"type":"response.completed"`,
+			forbidden: `"type":"response.failed"`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
+				calls++
+				switch calls {
+				case 1:
+					callback.OnText("I will inspect the implementation now.", false)
+					callback.OnStopReason("END_TURN")
+					callback.OnComplete(10, 4)
+					return nil
+				case 2:
+					if payload.AgentActionContinuations == 0 {
+						t.Fatal("second call was not the bounded agent continuation")
+					}
+					return newUpstreamAgentContinuationTimeoutError(1)
+				default:
+					t.Fatalf("continuation timeout triggered unexpected call %d", calls)
+					return nil
+				}
+			})
+			rec := httptest.NewRecorder()
+
+			test.invoke(h, rec)
+
+			body := rec.Body.String()
+			if calls != 2 || rec.Code != http.StatusOK ||
+				!strings.Contains(body, "I will inspect the implementation now.") ||
+				!strings.Contains(body, test.terminal) {
+				t.Fatalf("calls=%d status=%d body=%s", calls, rec.Code, body)
+			}
+			if strings.Contains(body, test.forbidden) || strings.Contains(body, upstreamAgentContinuationTimeoutCode) ||
+				strings.Contains(body, "upstream returned no client-visible output") {
+				t.Fatalf("bounded continuation success was overwritten: %s", body)
+			}
+		})
+	}
+}
+
+func TestAgentContinuationTimeoutRequiresPreviouslyWrittenClientOutput(t *testing.T) {
+	payload := completionProtocolTestPayload()
+	payload.agentActionContinuationTimeout = true
+	payload.AgentActionContinuations = 1
+	err := newUpstreamAgentContinuationTimeoutError(1)
+
+	if shouldFinishStreamAfterAgentContinuation(payload, err, 0, false) {
+		t.Fatal("continuation timeout succeeded without prior client-visible output")
+	}
+	if !shouldFinishStreamAfterAgentContinuation(payload, err, 0, true) {
+		t.Fatal("continuation timeout rejected a previously written visible prefix")
+	}
+}
+
+func TestStreamingAgentContinuationTimeoutWithoutVisibleOutputFails(t *testing.T) {
+	tests := []struct {
+		name      string
+		invoke    func(*Handler, *httptest.ResponseRecorder)
+		required  string
+		forbidden string
+	}{
+		{
+			name: "Claude Messages",
+			invoke: func(h *Handler, rec *httptest.ResponseRecorder) {
+				h.handleClaudeStream(rec, completionProtocolTestPayload(), "claude-opus-5", "claude-opus-5", false, claudeThinkingResponseOptions{}, 5, nil, "")
+			},
+			required:  upstreamAgentContinuationTimeoutCode,
+			forbidden: `event: message_stop`,
+		},
+		{
+			name: "Chat Completions",
+			invoke: func(h *Handler, rec *httptest.ResponseRecorder) {
+				req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+					"model":"claude-opus-5",
+					"messages":[{"role":"system","content":"You are Codex, a coding agent."},{"role":"user","content":"inspect"}],
+					"tools":[{"type":"function","function":{"name":"shell_command","parameters":{"type":"object"}}}],
+					"stream":true
+				}`))
+				h.handleOpenAIChat(rec, req)
+			},
+			required:  `"error":`,
+			forbidden: `"finish_reason":"stop"`,
+		},
+		{
+			name: "Responses",
+			invoke: func(h *Handler, rec *httptest.ResponseRecorder) {
+				req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+					"model":"claude-opus-5",
+					"instructions":"You are Codex, a coding agent.",
+					"input":"inspect",
+					"tools":[{"type":"function","name":"shell_command","parameters":{"type":"object"}}],
+					"stream":true,
+					"store":false
+				}`))
+				h.handleOpenAIResponses(rec, req)
+			},
+			required:  `"type":"response.failed"`,
+			forbidden: `"type":"response.completed"`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
+				calls++
+				payload.agentActionContinuationTimeout = true
+				payload.AgentActionContinuations = 1
+				callback.OnComplete(10, 0)
+				return newUpstreamAgentContinuationTimeoutError(1)
+			})
+			rec := httptest.NewRecorder()
+
+			test.invoke(h, rec)
+
+			body := rec.Body.String()
+			if calls == 0 || !strings.Contains(body, test.required) || strings.Contains(body, test.forbidden) {
+				t.Fatalf("calls=%d status=%d body=%s", calls, rec.Code, body)
+			}
+		})
+	}
+}
+
 func TestStreamingMissingTerminalUsesFullContextFallbackAcrossProtocols(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -1635,23 +1804,11 @@ func TestVisibleReasoningOnlyWithoutMarkerDoesNotTriggerSemanticRetry(t *testing
 	}
 }
 
-func TestHiddenReasoningOnlyWithoutMarkerDoesNotTriggerSemanticRetry(t *testing.T) {
+func TestHiddenReasoningOnlyWithoutMarkerRetriesForOpenAIFormats(t *testing.T) {
 	tests := []struct {
 		name   string
 		invoke func(*Handler, *httptest.ResponseRecorder)
 	}{
-		{
-			name: "Claude stream",
-			invoke: func(h *Handler, rec *httptest.ResponseRecorder) {
-				h.handleClaudeStream(rec, emptyVisibleOutputPayload(), "claude-opus-5", "claude-opus-5", false, claudeThinkingResponseOptions{}, 5, nil, "")
-			},
-		},
-		{
-			name: "Claude non-stream",
-			invoke: func(h *Handler, rec *httptest.ResponseRecorder) {
-				h.handleClaudeNonStream(rec, emptyVisibleOutputPayload(), "claude-opus-5", "claude-opus-5", false, claudeThinkingResponseOptions{}, 5, nil, "")
-			},
-		},
 		{
 			name: "Chat Completions stream",
 			invoke: func(h *Handler, rec *httptest.ResponseRecorder) {
@@ -1708,24 +1865,24 @@ func TestHiddenReasoningOnlyWithoutMarkerDoesNotTriggerSemanticRetry(t *testing.
 
 			test.invoke(h, rec)
 
-			if calls != 1 {
-				t.Fatalf("upstream calls=%d, want 1", calls)
+			if calls != maxKiroTransportPreResponseRetries+1 {
+				t.Fatalf("upstream calls=%d, want %d", calls, maxKiroTransportPreResponseRetries+1)
 			}
 			body := rec.Body.String()
-			if rec.Code != http.StatusOK {
+			if rec.Code != http.StatusOK && rec.Code != http.StatusBadGateway {
 				t.Fatalf("status=%d body=%s", rec.Code, body)
 			}
-			if strings.Contains(body, "private reasoning") || strings.Contains(body, upstreamIncompleteResponseCode) {
-				t.Fatalf("discarded reasoning attempt leaked into recovered response: %s", body)
+			if strings.Contains(body, "private reasoning") || !strings.Contains(body, "upstream returned no client-visible output") {
+				t.Fatalf("discarded reasoning attempt was accepted or leaked: %s", body)
 			}
-			if test.name == "Responses stream" && strings.Count(body, "event: response.in_progress") != 1 {
-				t.Fatalf("Responses retry emitted duplicate in-progress events: %s", body)
+			if strings.Contains(body, upstreamIncompleteResponseCode) {
+				t.Fatalf("empty-output retry was mislabeled incomplete agent response: %s", body)
 			}
 		})
 	}
 }
 
-func TestClaudeStreamReasoningOnlyWithoutMarkerCompletesNormally(t *testing.T) {
+func TestClaudeStreamReasoningOnlyWithoutMarkerIsRejectedAfterBoundedRetries(t *testing.T) {
 	calls := 0
 	h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
 		calls++
@@ -1737,19 +1894,20 @@ func TestClaudeStreamReasoningOnlyWithoutMarkerCompletesNormally(t *testing.T) {
 
 	h.handleClaudeStream(rec, emptyVisibleOutputPayload(), "claude-opus-5", "claude-opus-5", false, claudeThinkingResponseOptions{}, 5, nil, "")
 
-	if calls != 1 {
-		t.Fatalf("upstream calls=%d, want 1", calls)
+	if calls != maxKiroTransportPreResponseRetries+1 {
+		t.Fatalf("upstream calls=%d, want %d", calls, maxKiroTransportPreResponseRetries+1)
 	}
 	body := rec.Body.String()
-	if rec.Code != http.StatusOK || strings.Contains(body, upstreamIncompleteResponseCode) {
+	if rec.Code != http.StatusBadGateway || strings.Contains(body, "message_stop") ||
+		!strings.Contains(body, "upstream returned no client-visible output") {
 		t.Fatalf("status=%d body=%s", rec.Code, body)
 	}
-	if strings.Contains(body, "private reasoning") || !strings.Contains(body, "message_stop") {
+	if strings.Contains(body, "private reasoning") {
 		t.Fatalf("hidden reasoning-only response was encoded incorrectly: %s", body)
 	}
 }
 
-func TestBufferedClaudeReasoningOnlyWithoutMarkerDoesNotRetry(t *testing.T) {
+func TestBufferedClaudeReasoningOnlyWithoutMarkerIsRejectedAfterBoundedRetries(t *testing.T) {
 	calls := 0
 	h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
 		calls++
@@ -1759,10 +1917,7 @@ func TestBufferedClaudeReasoningOnlyWithoutMarkerDoesNotRetry(t *testing.T) {
 	})
 
 	result, err := h.callClaudeBuffered("claude-opus-5", emptyVisibleOutputPayload(), false, 5)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if calls != 1 || result.Content != "" || result.Reasoning.Text != "" {
-		t.Fatalf("calls=%d content=%q reasoning=%q", calls, result.Content, result.Reasoning.Text)
+	if !isUpstreamEmptyResponseError(err) || calls != maxKiroTransportPreResponseRetries+1 || result != nil {
+		t.Fatalf("calls=%d err=%v result=%#v", calls, err, result)
 	}
 }

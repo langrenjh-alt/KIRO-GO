@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"kiro-go/config"
 	"net/http"
@@ -15,8 +16,12 @@ import (
 
 func TestEarlyStreamPreludeEnabled(t *testing.T) {
 	t.Setenv("KIRO_EARLY_STREAM_PRELUDE", "")
+	if !earlyStreamPreludeEnabled() {
+		t.Fatal("empty KIRO_EARLY_STREAM_PRELUDE did not keep the default enabled")
+	}
+	t.Setenv("KIRO_EARLY_STREAM_PRELUDE", "false")
 	if earlyStreamPreludeEnabled() {
-		t.Fatal("empty KIRO_EARLY_STREAM_PRELUDE unexpectedly enabled the feature")
+		t.Fatal("false KIRO_EARLY_STREAM_PRELUDE did not disable the feature")
 	}
 	t.Setenv("KIRO_EARLY_STREAM_PRELUDE", "true")
 	if !earlyStreamPreludeEnabled() {
@@ -257,11 +262,41 @@ func TestEarlyStreamPreludeIsNotRepeatedAfterPreOutputDisconnect(t *testing.T) {
 			if strings.Contains(recorder.Body.String(), `"error"`) || !strings.Contains(recorder.Body.String(), "recovered after disconnect") {
 				t.Fatalf("stream did not recover cleanly: %s", recorder.Body.String())
 			}
+			if protocol == "claude" {
+				assertClaudeContentBlocksSerialized(t, recorder.Body.String())
+				assertClaudeTextBlocksContainDelta(t, recorder.Body.String())
+			}
 		})
 	}
 }
 
-func TestEarlyStreamPreludeDoesNotReplayAfterUpstreamOutput(t *testing.T) {
+func TestClaudeEarlyPreludeDoesNotLeakEmptyBlockAcrossSemanticRetry(t *testing.T) {
+	t.Setenv("KIRO_EARLY_STREAM_PRELUDE", "true")
+	var calls int
+	h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
+		calls++
+		callback.OnStreamReady()
+		if calls == 1 {
+			callback.OnComplete(8, 1)
+			return nil
+		}
+		callback.OnText("visible after empty retry", false)
+		callback.OnComplete(8, 3)
+		return nil
+	})
+
+	recorder := httptest.NewRecorder()
+	invokeEarlyPreludeProtocol("claude", h, recorder, emptyVisibleOutputPayload())
+	if calls != 2 || recorder.Code != http.StatusOK ||
+		!strings.Contains(recorder.Body.String(), "visible after empty retry") {
+		t.Fatalf("calls=%d status=%d body=%s", calls, recorder.Code, recorder.Body.String())
+	}
+	assertSingleEarlyPrelude(t, "claude", recorder.Body.String())
+	assertClaudeContentBlocksSerialized(t, recorder.Body.String())
+	assertClaudeTextBlocksContainDelta(t, recorder.Body.String())
+}
+
+func TestEarlyStreamPreludeContinuesAfterUpstreamOutput(t *testing.T) {
 	t.Setenv("KIRO_EARLY_STREAM_PRELUDE", "true")
 	for _, protocol := range []string{"claude", "chat"} {
 		t.Run(protocol, func(t *testing.T) {
@@ -269,18 +304,34 @@ func TestEarlyStreamPreludeDoesNotReplayAfterUpstreamOutput(t *testing.T) {
 			h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
 				calls++
 				callback.OnStreamReady()
+				if protocol == "claude" && calls == 2 {
+					callback.OnText("continued suffix", false)
+					callback.OnComplete(8, 3)
+					return nil
+				}
 				callback.OnText("already delivered", false)
 				return io.ErrUnexpectedEOF
 			})
 
 			recorder := httptest.NewRecorder()
 			invokeEarlyPreludeProtocol(protocol, h, recorder, emptyVisibleOutputPayload())
-			if calls != 1 {
-				t.Fatalf("upstream calls=%d, want no replay after output", calls)
+			wantCalls := 1
+			if protocol == "claude" {
+				wantCalls = 2
+			}
+			if calls != wantCalls {
+				t.Fatalf("upstream calls=%d, want %d", calls, wantCalls)
 			}
 			assertSingleEarlyPrelude(t, protocol, recorder.Body.String())
-			if strings.Count(recorder.Body.String(), "already delivered") != 1 || !strings.Contains(recorder.Body.String(), `"error"`) {
-				t.Fatalf("stream was replayed or lost its terminal error: %s", recorder.Body.String())
+			if strings.Count(recorder.Body.String(), "already delivered") != 1 {
+				t.Fatalf("stream duplicated the visible prefix: %s", recorder.Body.String())
+			}
+			if protocol == "claude" {
+				if !strings.Contains(recorder.Body.String(), "continued suffix") || strings.Contains(recorder.Body.String(), `"error"`) {
+					t.Fatalf("Claude continuation did not complete cleanly: %s", recorder.Body.String())
+				}
+			} else if !strings.Contains(recorder.Body.String(), `"error"`) {
+				t.Fatalf("chat stream lost its terminal error: %s", recorder.Body.String())
 			}
 		})
 	}
@@ -430,6 +481,36 @@ func assertSingleEarlyPrelude(t *testing.T, protocol, body string) {
 	}
 	if count != 1 {
 		t.Fatalf("%s prelude count=%d, want 1; body=%s", protocol, count, body)
+	}
+}
+
+func assertClaudeTextBlocksContainDelta(t *testing.T, body string) {
+	t.Helper()
+	textBlocks := make(map[int]bool)
+	for _, event := range decodeResponseContractSSE(t, body) {
+		indexValue, hasIndex := event.Data["index"].(float64)
+		if !hasIndex {
+			continue
+		}
+		index := int(indexValue)
+		switch event.Name {
+		case "content_block_start":
+			block, ok := event.Data["content_block"].(map[string]interface{})
+			if ok && block["type"] == "text" {
+				textBlocks[index] = false
+			}
+		case "content_block_delta":
+			delta, ok := event.Data["delta"].(map[string]interface{})
+			if ok && delta["type"] == "text_delta" && strings.TrimSpace(fmt.Sprint(delta["text"])) != "" {
+				if _, tracked := textBlocks[index]; tracked {
+					textBlocks[index] = true
+				}
+			}
+		case "content_block_stop":
+			if sawDelta, tracked := textBlocks[index]; tracked && !sawDelta {
+				t.Fatalf("Claude emitted an empty text block at index %d: %s", index, body)
+			}
+		}
 	}
 }
 

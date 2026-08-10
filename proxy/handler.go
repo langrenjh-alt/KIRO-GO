@@ -51,6 +51,10 @@ type Handler struct {
 	pool               *pool.AccountPool
 	webSearchMCPCaller webSearchMCPCaller
 	kiroCaller         kiroAPICaller
+	// tokenRefresher is an internal seam for request-triggered bearer refresh;
+	// production uses refreshAccountTokenContext and tests can model IdP rotation
+	// without making a network call.
+	tokenRefresher func(context.Context, *config.Account, bool) error
 	// 运行时统计 (使用原子操作)
 	totalRequests   int64
 	successRequests int64
@@ -479,13 +483,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 路由
 	switch {
 	// API 端点（需要验证 API Key）
-	case path == "/v1/messages" || path == "/messages" || path == "/anthropic/v1/messages":
+	case path == "/v1/messages" || path == "/messages" || path == "/anthropic/v1/messages" || path == "/cc/v1/messages":
 		ar := h.authenticateForClaude(w, r)
 		if ar == nil {
 			return
 		}
 		h.handleClaudeMessages(w, ar)
-	case path == "/v1/messages/count_tokens" || path == "/messages/count_tokens":
+	case path == "/v1/messages/count_tokens" || path == "/messages/count_tokens" || path == "/cc/v1/messages/count_tokens":
 		ar := h.authenticateForClaude(w, r)
 		if ar == nil {
 			return
@@ -541,8 +545,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func isGenerationAPIPath(path string) bool {
 	switch path {
-	case "/v1/messages", "/messages", "/anthropic/v1/messages",
-		"/v1/messages/count_tokens", "/messages/count_tokens",
+	case "/v1/messages", "/messages", "/anthropic/v1/messages", "/cc/v1/messages",
+		"/v1/messages/count_tokens", "/messages/count_tokens", "/cc/v1/messages/count_tokens",
 		"/v1/chat/completions", "/chat/completions",
 		"/v1/responses", "/responses":
 		return true
@@ -1009,6 +1013,10 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		h.sendClaudeError(w, 400, "invalid_request_error", "Invalid JSON: "+err.Error())
 		return
 	}
+	// Claude Code may still send a trailing assistant prefill. Kiro cannot
+	// continue an assistant turn, so mirror kiro.rs and discard that suffix
+	// before validating and converting the request.
+	req.Messages = trimClaudeAssistantPrefill(req.Messages)
 	if msg := validateClaudeRequestShape(&req); msg != "" {
 		h.sendClaudeError(w, 400, "invalid_request_error", msg)
 		return
@@ -1100,7 +1108,11 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// Stream or non-stream
 	if req.Stream {
-		h.handleClaudeStream(w, kiroPayload, req.Model, requestedModel, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		if r.URL.Path == "/cc/v1/messages" {
+			h.handleClaudeCodeBufferedStream(w, kiroPayload, req.Model, requestedModel, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		} else {
+			h.handleClaudeStream(w, kiroPayload, req.Model, requestedModel, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		}
 	} else {
 		h.handleClaudeNonStream(w, kiroPayload, req.Model, requestedModel, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
 	}
@@ -1133,6 +1145,9 @@ func (h *Handler) retryKiroPreResponse(payload *KiroPayload, account *config.Acc
 	if isKiroToolJSONError(cause) {
 		return false, nil
 	}
+	if isMonthlyRequestCountError(cause) {
+		return false, nil
+	}
 	if isKiroRecoveryTimeoutError(cause) {
 		return false, nil
 	}
@@ -1160,6 +1175,38 @@ func (h *Handler) retryKiroPreResponse(payload *KiroPayload, account *config.Acc
 	*retryCount++
 	*retrySameID = account.ID
 	return true, nil
+}
+
+// claudeAttemptHasClientOutput accepts only content that the Claude adapter can
+// actually expose. Upstream reasoning and signatures are not enough when the
+// request omits thinking display, so reasoning-only attempts remain retryable.
+func claudeAttemptHasClientOutput(visible bool, toolCount int) bool {
+	return visible || toolCount > 0
+}
+
+// protocolAttemptHasClientOutput is the adapter-level guard used when a
+// caller/test seam supplies callbacks without going through parseEventStream.
+// Native reasoning counts only when the downstream request explicitly asks for
+// it; a hidden reasoning event must never become a successful empty message.
+func protocolAttemptHasClientOutput(visible, reasoning string, toolCount int, allowReasoning bool) bool {
+	if strings.TrimSpace(visible) != "" || toolCount > 0 {
+		return true
+	}
+	return allowReasoning && strings.TrimSpace(reasoning) != ""
+}
+
+func protocolClientVisibleAttemptText(payload *KiroPayload, rawContent string, toolCount int) string {
+	if payload == nil || rawContent == "" {
+		return ""
+	}
+	visible, _ := extractThinkingFromContent(rawContent)
+	visible, _ = filterAgentCompletionContent(payload, visible, toolCount)
+	visible, _ = truncateAtStopSequence(visible, payload.StopSequences)
+	return strings.TrimSpace(visible)
+}
+
+func claudeClientVisibleAttemptText(payload *KiroPayload, rawContent string, toolCount int) string {
+	return protocolClientVisibleAttemptText(payload, rawContent, toolCount)
 }
 
 func (h *Handler) retryAgentRecoveryAfterInputTooLong(endpoint string, payload *KiroPayload, account *config.Account, retrySameID *string, err error) bool {
@@ -1253,13 +1300,19 @@ func claudePromptCacheIsolationSeed(req *ClaudeRequest, apiKeyID string, provide
 		}
 	}
 	if req != nil && req.Metadata != nil {
-		if _, sessionID, ok := strings.Cut(req.Metadata.UserID, "_session_"); ok {
-			if sessionID = strings.TrimSpace(sessionID); sessionID != "" {
-				if keySeed != "" {
-					return keySeed + "|session:" + sessionID
-				}
-				return "session:" + sessionID
+		sessionID := extractClaudeSessionID(req.Metadata.UserID)
+		// Keep the legacy suffix behavior for deployments that used a
+		// non-UUID session token before metadata.user_id accepted JSON.
+		if sessionID == "" {
+			if _, legacyID, ok := strings.Cut(req.Metadata.UserID, "_session_"); ok {
+				sessionID = strings.TrimSpace(legacyID)
 			}
+		}
+		if sessionID != "" {
+			if keySeed != "" {
+				return keySeed + "|session:" + sessionID
+			}
+			return "session:" + sessionID
 		}
 	}
 	return keySeed
@@ -1298,6 +1351,7 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 	preResponseRetryCount := 0
 	retrySameID := ""
 	var lastErr error
+	clientVisibleOutputWritten := prelude != nil && len(prelude.Blocks) > 0
 	streamCommitted := false
 	preludeSent := false
 	pingSent := false
@@ -1412,14 +1466,13 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 		hiddenThinkingObserved := false
 		suppressedReasoningObserved := false
 		visibleOutputProduced := prelude != nil && len(prelude.Blocks) > 0
+		attemptClientVisibleOutputWritten := false
 		toolBlockIndexes := make(map[string]int)
 		toolClientIDs := make(map[string]string)
 		ignoredToolUses := make(map[string]bool)
 		activeToolUseID := ""
 		var deferredToolOutput []func()
 		var deferredCompletedToolUses []KiroToolUse
-		upstreamOutputStarted := false
-
 		closeActiveBlock := func() {
 			if activeBlockIndex < 0 {
 				return
@@ -1533,6 +1586,15 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 			activeBlockType = blockType
 			sendInitialPing()
 		}
+		// The envelope/ping is emitted as soon as upstream headers arrive, but a
+		// content block is opened only for a real delta. This keeps a failed or
+		// empty retry from leaving an unterminated/empty block in the public SSE.
+		onAttemptStreamReady := func() {
+			if onStreamReady == nil {
+				return
+			}
+			onStreamReady()
+		}
 		flushPendingSignatureBlock := func() {
 			if stopFilter.Matched() != "" || !thinking || thinkingFormat != "thinking" || pendingThinkingSignature == "" || activeBlockType == "thinking" {
 				return
@@ -1542,11 +1604,14 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 		}
 
 		var textBuffer string
+		var thinkingTagLookbehind byte
 		var inThinkingBlock bool
 		var dropTagThinking bool
 		var thinkingSource thinkingStreamSource
 		var reasoningPhaseSealed bool
 		var thinkingStarted bool
+		var stripThinkingLeadingNewline bool
+		var stripThinkingClosingSeparator bool
 		var eventThinkingOpen bool
 		structuredOutput := payload.StructuredOutput
 		structuredJSON := &incrementalJSONStream{}
@@ -1584,6 +1649,7 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 				"index": idx,
 			})
 			visibleOutputProduced = true
+			attemptClientVisibleOutputWritten = true
 		}
 		emitHiddenThinkingBlock := func() {
 			if suppressRecoveryOutput || !hiddenThinkingObserved || thinkingBlockEmitted || stopFilter.Matched() != "" {
@@ -1606,6 +1672,9 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 				"delta": map[string]string{"type": "text_delta", "text": text},
 			})
 			visibleOutputProduced = true
+			if strings.TrimSpace(text) != "" {
+				attemptClientVisibleOutputWritten = true
+			}
 		}
 
 		sendText := func(text string, thinkingState int) {
@@ -1654,6 +1723,9 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 					"delta": map[string]string{"type": "text_delta", "text": outputText},
 				})
 				visibleOutputProduced = true
+				if strings.TrimSpace(text) != "" {
+					attemptClientVisibleOutputWritten = true
+				}
 			case "reasoning_content":
 				if text == "" {
 					return
@@ -1665,6 +1737,9 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 					"delta": map[string]string{"type": "text_delta", "text": text},
 				})
 				visibleOutputProduced = true
+				if strings.TrimSpace(text) != "" {
+					attemptClientVisibleOutputWritten = true
+				}
 			default:
 				if thinkingOpts.OmitDisplay {
 					if text != "" {
@@ -1686,6 +1761,9 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 						"delta": map[string]string{"type": "thinking_delta", "thinking": text},
 					})
 					visibleOutputProduced = true
+					if strings.TrimSpace(text) != "" {
+						attemptClientVisibleOutputWritten = true
+					}
 				}
 				if thinkingState == 3 && activeBlockType == "thinking" {
 					closeActiveBlock()
@@ -1743,29 +1821,48 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 
 			for {
 				if !inThinkingBlock {
-					thinkingStart := strings.Index(textBuffer, thinkingOpenTag)
+					if stripThinkingClosingSeparator {
+						var wait bool
+						textBuffer, wait = consumeThinkingClosingSeparator(textBuffer, forceFlush)
+						if wait {
+							break
+						}
+						stripThinkingClosingSeparator = false
+					}
+					thinkingStart := findRealThinkingStartTagWithLookbehind(textBuffer, thinkingTagLookbehind)
+					if !forceFlush && thinkingStart >= 0 && thinkingStart+len(thinkingOpenTag) == len(textBuffer) {
+						thinkingStart = -1
+					}
 					if thinkingStart != -1 {
-						if thinkingStart > 0 {
+						if thinkingStart > 0 && strings.TrimSpace(textBuffer[:thinkingStart]) != "" {
 							sendText(textBuffer[:thinkingStart], 0)
 						}
 						textBuffer = textBuffer[thinkingStart+len(thinkingOpenTag):]
+						thinkingTagLookbehind = 0
 						inThinkingBlock = true
 						dropTagThinking = reasoningPhaseSealed || !allowTagSource(&thinkingSource)
 						thinkingStarted = false
+						stripThinkingLeadingNewline = true
 					} else if forceFlush {
 						sendText(textBuffer, 0)
 						textBuffer = ""
 						break
 					} else {
-						ready, pending := splitBeforePartialTag(textBuffer, thinkingOpenTag)
+						ready, pending := splitBeforeThinkingStartTag(textBuffer)
 						sendText(ready, 0)
+						if ready != "" {
+							thinkingTagLookbehind = ready[len(ready)-1]
+						}
 						textBuffer = pending
 						break
 					}
 				} else {
-					thinkingEnd := strings.Index(textBuffer, thinkingCloseTag)
+					thinkingEnd := findRealThinkingEndTagWithLookbehind(textBuffer, thinkingTagLookbehind)
+					if thinkingEnd == -1 && forceFlush {
+						thinkingEnd = findThinkingEndTagAtBufferEndWithLookbehind(textBuffer, thinkingTagLookbehind)
+					}
 					if thinkingEnd != -1 {
-						content := textBuffer[:thinkingEnd]
+						content := trimThinkingLeadingNewline(textBuffer[:thinkingEnd], &stripThinkingLeadingNewline)
 						if !dropTagThinking {
 							if !thinkingStarted {
 								sendText(content, 1)
@@ -1775,17 +1872,21 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 							}
 						}
 						textBuffer = textBuffer[thinkingEnd+len(thinkingCloseTag):]
+						thinkingTagLookbehind = 0
 						inThinkingBlock = false
+						stripThinkingClosingSeparator = true
 						dropTagThinking = false
 						thinkingStarted = false
+						stripThinkingLeadingNewline = false
 					} else if forceFlush {
 						if textBuffer != "" {
+							content := trimThinkingLeadingNewline(textBuffer, &stripThinkingLeadingNewline)
 							if !dropTagThinking {
 								if !thinkingStarted {
-									sendText(textBuffer, 1)
+									sendText(content, 1)
 									sendText("", 3)
 								} else {
-									sendText(textBuffer, 3)
+									sendText(content, 3)
 								}
 							}
 							textBuffer = ""
@@ -1793,10 +1894,15 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 						inThinkingBlock = false
 						dropTagThinking = false
 						thinkingStarted = false
+						stripThinkingLeadingNewline = false
 						break
 					} else {
-						ready, pending := splitBeforePartialTag(textBuffer, thinkingCloseTag)
+						ready, pending := splitBeforeThinkingEndTag(textBuffer)
+						if ready != "" {
+							thinkingTagLookbehind = ready[len(ready)-1]
+						}
 						if ready != "" && !dropTagThinking {
+							ready = trimThinkingLeadingNewline(ready, &stripThinkingLeadingNewline)
 							if !thinkingStarted {
 								sendText(ready, 1)
 								thinkingStarted = true
@@ -1980,7 +2086,9 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 		}
 
 		callback := &KiroStreamCallback{
-			OnStreamReady: onStreamReady,
+			RequireClientOutput:      true,
+			AllowReasoningOnlyOutput: thinking && !thinkingOpts.OmitDisplay,
+			OnStreamReady:            onAttemptStreamReady,
 			OnKeepAlive: func() {
 				ensureMessageStart()
 				h.sendSSE(w, flusher, "ping", map[string]interface{}{"type": "ping"})
@@ -1988,9 +2096,6 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 				streamCommitted = true
 			},
 			OnText: func(text string, isThinking bool) {
-				if text != "" {
-					upstreamOutputStarted = true
-				}
 				if activeToolUseID != "" {
 					deferredText := text
 					deferredThinking := isThinking
@@ -2002,9 +2107,6 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 				handleText(text, isThinking)
 			},
 			OnReasoning: func(event KiroReasoningContentEvent) {
-				if event.Text != "" || event.Signature != "" || event.RedactedContent != "" {
-					upstreamOutputStarted = true
-				}
 				if activeToolUseID != "" {
 					deferredEvent := event
 					deferredToolOutput = append(deferredToolOutput, func() {
@@ -2015,17 +2117,12 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 				handleReasoning(event)
 			},
 			OnToolUseStart: func(toolUseID, name string) {
-				upstreamOutputStarted = true
 				beginToolUse(toolUseID, name)
 			},
 			OnToolUseInputDelta: func(toolUseID, delta string) {
-				if delta != "" {
-					upstreamOutputStarted = true
-				}
 				emitToolUseInputDelta(toolUseID, delta)
 			},
 			OnToolUse: func(toolUse KiroToolUse) {
-				upstreamOutputStarted = true
 				completeToolUse(toolUse)
 			},
 			OnComplete: func(inTok, outTok int) {
@@ -2046,12 +2143,13 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 			},
 		}
 
-		call := h.kiroCaller
-		if call == nil {
-			call = CallKiroAPI
-		}
-		err := call(account, payload, callback)
+		err := h.callKiroWithBearerRefresh(account, payload, callback)
 		err = resolveKiroOutputTruncation(payload, err, upstreamStopReason, rawContentBuilder.String(), completedKiroToolNames(toolUses))
+		visibleAttemptSource := rawContentBuilder.String()
+		if agentCompletionProtocolEnabled(payload) {
+			visibleAttemptSource = completionGate.VisibleText()
+		}
+		clientVisibleAttemptText := claudeClientVisibleAttemptText(payload, visibleAttemptSource, len(toolUses))
 		if err == nil {
 			if completionErr := agentCompletionResponseError(
 				payload,
@@ -2068,12 +2166,23 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 				}
 			}
 		}
-		if shouldFinishStreamAfterAgentContinuation(payload, err, len(toolUses)) {
+		if attemptClientVisibleOutputWritten {
+			clientVisibleOutputWritten = true
+		}
+		finishedAfterContinuation := shouldFinishStreamAfterAgentContinuation(payload, err, len(toolUses), clientVisibleOutputWritten)
+		if finishedAfterContinuation {
 			logger.Warnf("[KiroAPI] finishing Claude stream after bounded agent continuation request_id=%s account_id=%s phase=%s completions=%d actions=%d full_context=%d: %v",
 				msgID, account.ID, kiroAgentRecoveryPhase(payload, err), payload.AgentCompletionRetries,
 				payload.AgentActionContinuations, payload.AgentFullContextRecoveries, err)
 			err = nil
 			upstreamStopReason = "end_turn"
+		}
+		if err == nil && !finishedAfterContinuation && !claudeAttemptHasClientOutput(
+			visibleOutputProduced || clientVisibleAttemptText != "",
+			len(toolUses),
+		) {
+			err = newUpstreamEmptyResponseError()
+			logger.Warnf("[KiroAPI] empty upstream output request_id=%s account_id=%s; retrying before accepting an empty Claude turn", msgID, account.ID)
 		}
 		h.releaseAccount(account)
 		if err != nil {
@@ -2094,7 +2203,7 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 					time.Since(reqStart).Milliseconds(),
 				))
 			}
-			if isUpstreamIncompleteResponseError(err) || isUpstreamOutputTruncatedError(err) {
+			if isUpstreamIncompleteResponseError(err) || isUpstreamOutputTruncatedError(err) || isUpstreamEmptyResponseError(err) {
 				if eventThinkingOpen {
 					sendText("", 3)
 					eventThinkingOpen = false
@@ -2107,6 +2216,12 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 				return
 			}
 			lastErr = err
+			if prelude == nil && visibleOutputProduced && !holdToolText && activeToolUseID == "" &&
+				len(deferredCompletedToolUses) == 0 && len(deferredToolOutput) == 0 &&
+				prepareKiroOutputContinuationAfterError(payload, err, rawContentBuilder.String(), completedKiroToolNames(toolUses)) {
+				logger.Warnf("[KiroAPI] retrying Claude stream after mid-response disconnect request_id=%s account_id=%s continuation=%d/%d: %v",
+					msgID, account.ID, payload.OutputContinuations, maxKiroOutputContinuations, err)
+			}
 			if takeKiroOutputContinuationRetry(payload, err) {
 				retryUsage.markLastVisibleContinuation()
 				retryUsage.markLastContinuationAttemptOutput()
@@ -2123,8 +2238,23 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 				sendClaudeStreamFailure(http.StatusBadRequest, "invalid_request_error", err.Error())
 				return
 			}
+			if isUpstreamEmptyResponseError(err) {
+				retried, retryErr := h.retryKiroPreResponse(payload, account, &preResponseRetryCount, excluded, &retrySameID, err)
+				if retryErr != nil {
+					return
+				}
+				if retried {
+					attemptLimit++
+					logger.Warnf("[KiroAPI] retrying Claude stream after empty upstream output request_id=%s account_id=%s retry=%d/%d", msgID, account.ID, preResponseRetryCount, maxKiroTransportPreResponseRetries)
+					continue
+				}
+				h.recordFailureWithDetails("claude", model, account.ID, err)
+				sendClaudeStreamFailure(http.StatusBadGateway, "api_error", "upstream returned no client-visible output after retries")
+				return
+			}
+			clientVisibleOutputStarted := visibleOutputProduced || activeToolUseID != "" || len(toolUses) > 0 || len(deferredCompletedToolUses) > 0
 			if code, protocolErr := kiroStreamProtocolErrorCode(err); protocolErr {
-				if !upstreamOutputStarted && isKiroToolJSONError(err) && toolJSONRetryCounts[account.ID] < maxKiroToolJSONRetries && h.allowUpstreamRetry() {
+				if !clientVisibleOutputStarted && isKiroToolJSONError(err) && toolJSONRetryCounts[account.ID] < maxKiroToolJSONRetries && h.allowUpstreamRetry() {
 					toolJSONRetryCounts[account.ID]++
 					attemptLimit++
 					// Prefer a fresh account for malformed tool fragments. A Kiro
@@ -2138,7 +2268,7 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 					logger.Warnf("[KiroAPI] retrying Claude stream after truncated tool JSON account_id=%s retry=%d/%d: %v", account.ID, toolJSONRetryCounts[account.ID], maxKiroToolJSONRetries, err)
 					continue
 				}
-				canRetry := !upstreamOutputStarted || isUpstreamIncompleteResponseError(err)
+				canRetry := !clientVisibleOutputStarted || isUpstreamIncompleteResponseError(err)
 				if isUpstreamIncompleteResponseError(err) && !agentCompletionRetryAllowed(payload, err) {
 					canRetry = false
 				}
@@ -2168,7 +2298,7 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 					return
 				}
 				retrySameID = decision.RetrySameID
-				if !upstreamOutputStarted {
+				if !clientVisibleOutputStarted {
 					if !h.waitBeforeRateLimitRetry(payload, decision) {
 						return
 					}
@@ -2183,7 +2313,7 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 				sendClaudeStreamFailure(http.StatusBadRequest, "invalid_request_error", err.Error())
 				return
 			}
-			if !upstreamOutputStarted && isRetryableKiroStreamError(err) {
+			if !clientVisibleOutputStarted && isRetryableKiroStreamError(err) {
 				retried, retryErr := h.retryKiroPreResponse(payload, account, &preResponseRetryCount, excluded, &retrySameID, err)
 				if retryErr != nil {
 					return
@@ -2195,9 +2325,20 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 					continue
 				}
 			}
+			if !clientVisibleOutputStarted && !isUpstreamIncompleteResponseError(err) && !isKiroToolJSONError(err) && !isKiroTransientHTTPError(err) {
+				retried, retryErr := h.retryKiroPreResponse(payload, account, &preResponseRetryCount, excluded, &retrySameID, err)
+				if retryErr != nil {
+					return
+				}
+				if retried {
+					attemptLimit++
+					logger.Warnf("[KiroAPI] retrying Claude stream after upstream error without client-visible output request_id=%s account_id=%s retry=%d/%d: %v", msgID, account.ID, preResponseRetryCount, maxKiroTransportPreResponseRetries, err)
+					continue
+				}
+			}
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
-			if !upstreamOutputStarted {
+			if !clientVisibleOutputStarted {
 				continue
 			}
 			h.recordFailureWithDetails("claude", model, account.ID, err)
@@ -2649,6 +2790,8 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 
 		callback := &KiroStreamCallback{
+			RequireClientOutput:      true,
+			AllowReasoningOnlyOutput: thinking && !thinkingOpts.OmitDisplay,
 			OnText: func(text string, isThinking bool) {
 				if isThinking {
 					if !thinking {
@@ -2700,15 +2843,14 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			},
 		}
 
-		call := h.kiroCaller
-		if call == nil {
-			call = CallKiroAPI
-		}
-		err := call(account, payload, callback)
+		err := h.callKiroWithBearerRefresh(account, payload, callback)
 		err = resolveKiroOutputTruncation(payload, err, upstreamStopReason, content, completedKiroToolNames(toolUses))
+		clientVisibleAttemptText := claudeClientVisibleAttemptText(payload, content, len(toolUses))
+		var visibleContent string
+		var markerSeen bool
 		if err == nil {
-			visibleContent, _ := extractThinkingFromContent(content)
-			visibleContent, markerSeen := filterAgentCompletionContent(payload, visibleContent, len(toolUses))
+			visibleContent, _ = extractThinkingFromContent(content)
+			visibleContent, markerSeen = filterAgentCompletionContent(payload, visibleContent, len(toolUses))
 			if completionErr := agentCompletionResponseError(
 				payload,
 				suppressedReasoningObserved || thinkingContent != "" || thinkingSignature != "" || len(redactedThinking) > 0,
@@ -2720,6 +2862,15 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 				err = completionErr
 				prepareReasoningOnlyRetry(payload, err)
 			}
+		}
+		clientVisibleThinking := thinking && !thinkingOpts.OmitDisplay &&
+			(strings.TrimSpace(thinkingContent) != "" || thinkingSignature != "" || len(redactedThinking) > 0)
+		if err == nil && !claudeAttemptHasClientOutput(
+			clientVisibleAttemptText != "" || clientVisibleThinking,
+			len(toolUses),
+		) {
+			err = newUpstreamEmptyResponseError()
+			logger.Warnf("[KiroAPI] empty upstream output request_id=%s account_id=%s; retrying before accepting an empty Claude turn", payload.requestID, account.ID)
 		}
 		h.releaseAccount(account)
 		if err != nil {
@@ -2738,11 +2889,30 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 				return
 			}
 			lastErr = err
+			if strings.TrimSpace(content) != "" && len(toolUses) == 0 &&
+				prepareKiroOutputContinuationAfterError(payload, err, content, nil) {
+				logger.Warnf("[KiroAPI] retrying Claude non-stream after mid-response disconnect request_id=%s account_id=%s continuation=%d/%d: %v",
+					payload.requestID, account.ID, payload.OutputContinuations, maxKiroOutputContinuations, err)
+			}
 			if takeKiroOutputContinuationRetry(payload, err) {
 				retryUsage.markLastContinuationAttemptOutput()
 				retrySameID = account.ID
 				attemptLimit++
 				continue
+			}
+			if isUpstreamEmptyResponseError(err) {
+				retried, retryErr := h.retryKiroPreResponse(payload, account, &preResponseRetryCount, excluded, &retrySameID, err)
+				if retryErr != nil {
+					return
+				}
+				if retried {
+					attemptLimit++
+					logger.Warnf("[KiroAPI] retrying Claude non-stream after empty upstream output account_id=%s retry=%d/%d", account.ID, preResponseRetryCount, maxKiroTransportPreResponseRetries)
+					continue
+				}
+				h.recordFailureWithDetails("claude", model, account.ID, err)
+				h.sendClaudeError(w, http.StatusBadGateway, "api_error", "upstream returned no client-visible output after retries")
+				return
 			}
 			if isKiroInputTooLongError(err) {
 				if h.retryAgentRecoveryAfterInputTooLong("Claude non-stream", payload, account, &retrySameID, err) {
@@ -2788,6 +2958,17 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 				h.recordFailureWithDetails("claude", model, account.ID, err)
 				h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 				return
+			}
+			if !isUpstreamIncompleteResponseError(err) && !isKiroToolJSONError(err) && !isKiroTransientHTTPError(err) {
+				retried, retryErr := h.retryKiroPreResponse(payload, account, &preResponseRetryCount, excluded, &retrySameID, err)
+				if retryErr != nil {
+					return
+				}
+				if retried {
+					attemptLimit++
+					logger.Warnf("[KiroAPI] retrying Claude non-stream after upstream error account_id=%s retry=%d/%d: %v", account.ID, preResponseRetryCount, maxKiroTransportPreResponseRetries, err)
+					continue
+				}
 			}
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
@@ -3217,6 +3398,7 @@ func (h *Handler) handleOpenAIStreamWithCache(w http.ResponseWriter, payload *Ki
 	reqStart := time.Now()
 	preResponseRetryCount := 0
 	streamCommitted := false
+	clientVisibleOutputWritten := false
 	preludeSent := false
 	earlyPreludeEnabled := earlyStreamPreludeEnabled()
 	cacheState := newOpenAIPromptCacheState(h.promptCache, cacheProfile)
@@ -3264,15 +3446,19 @@ func (h *Handler) handleOpenAIStreamWithCache(w http.ResponseWriter, payload *Ki
 		var rawContentBuilder strings.Builder
 		var rawReasoningBuilder strings.Builder
 		var textBuffer string
+		var thinkingTagLookbehind byte
 		var inThinkingBlock bool
 		var dropTagThinking bool
 		var thinkingSource thinkingStreamSource
 		var reasoningPhaseSealed bool
 		var thinkingStarted bool
+		var stripThinkingLeadingNewline bool
+		var stripThinkingClosingSeparator bool
 		var eventThinkingOpen bool
 		var upstreamStopReason string
 		var contextWindowExceeded bool
 		var suppressedReasoningObserved bool
+		attemptClientVisibleOutputWritten := false
 		upstreamOutputStarted := false
 		stopFilter := newStopSequenceFilter(payload.StopSequences)
 		completionGate := newAgentCompletionGateForPayload(payload)
@@ -3327,6 +3513,7 @@ func (h *Handler) handleOpenAIStreamWithCache(w http.ResponseWriter, payload *Ki
 		}
 
 		sendChunk := func(content string, thinkingState int) {
+			semanticContent := strings.TrimSpace(content) != ""
 			if content == "" && thinkingState == 2 {
 				return
 			}
@@ -3436,6 +3623,9 @@ func (h *Handler) handleOpenAIStreamWithCache(w http.ResponseWriter, payload *Ki
 			data, _ := json.Marshal(chunk)
 			fmt.Fprintf(w, "data: %s\n\n", string(data))
 			flusher.Flush()
+			if semanticContent {
+				attemptClientVisibleOutputWritten = true
+			}
 		}
 		flushPendingStopText := func() {
 			pending := stopFilter.Flush()
@@ -3479,29 +3669,48 @@ func (h *Handler) handleOpenAIStreamWithCache(w http.ResponseWriter, payload *Ki
 
 			for {
 				if !inThinkingBlock {
-					thinkingStart := strings.Index(textBuffer, thinkingOpenTag)
+					if stripThinkingClosingSeparator {
+						var wait bool
+						textBuffer, wait = consumeThinkingClosingSeparator(textBuffer, forceFlush)
+						if wait {
+							break
+						}
+						stripThinkingClosingSeparator = false
+					}
+					thinkingStart := findRealThinkingStartTagWithLookbehind(textBuffer, thinkingTagLookbehind)
+					if !forceFlush && thinkingStart >= 0 && thinkingStart+len(thinkingOpenTag) == len(textBuffer) {
+						thinkingStart = -1
+					}
 					if thinkingStart != -1 {
-						if thinkingStart > 0 {
+						if thinkingStart > 0 && strings.TrimSpace(textBuffer[:thinkingStart]) != "" {
 							sendChunk(textBuffer[:thinkingStart], 0)
 						}
 						textBuffer = textBuffer[thinkingStart+len(thinkingOpenTag):]
+						thinkingTagLookbehind = 0
 						inThinkingBlock = true
 						dropTagThinking = reasoningPhaseSealed || !allowTagSource(&thinkingSource)
 						thinkingStarted = false
+						stripThinkingLeadingNewline = true
 					} else if forceFlush {
 						sendChunk(textBuffer, 0)
 						textBuffer = ""
 						break
 					} else {
-						ready, pending := splitBeforePartialTag(textBuffer, thinkingOpenTag)
+						ready, pending := splitBeforeThinkingStartTag(textBuffer)
 						sendChunk(ready, 0)
+						if ready != "" {
+							thinkingTagLookbehind = ready[len(ready)-1]
+						}
 						textBuffer = pending
 						break
 					}
 				} else {
-					thinkingEnd := strings.Index(textBuffer, thinkingCloseTag)
+					thinkingEnd := findRealThinkingEndTagWithLookbehind(textBuffer, thinkingTagLookbehind)
+					if thinkingEnd == -1 && forceFlush {
+						thinkingEnd = findThinkingEndTagAtBufferEndWithLookbehind(textBuffer, thinkingTagLookbehind)
+					}
 					if thinkingEnd != -1 {
-						content := textBuffer[:thinkingEnd]
+						content := trimThinkingLeadingNewline(textBuffer[:thinkingEnd], &stripThinkingLeadingNewline)
 						if !dropTagThinking {
 							if !thinkingStarted {
 								sendChunk(content, 1)
@@ -3511,17 +3720,21 @@ func (h *Handler) handleOpenAIStreamWithCache(w http.ResponseWriter, payload *Ki
 							}
 						}
 						textBuffer = textBuffer[thinkingEnd+len(thinkingCloseTag):]
+						thinkingTagLookbehind = 0
 						inThinkingBlock = false
+						stripThinkingClosingSeparator = true
 						dropTagThinking = false
 						thinkingStarted = false
+						stripThinkingLeadingNewline = false
 					} else if forceFlush {
 						if textBuffer != "" {
+							content := trimThinkingLeadingNewline(textBuffer, &stripThinkingLeadingNewline)
 							if !dropTagThinking {
 								if !thinkingStarted {
-									sendChunk(textBuffer, 1)
+									sendChunk(content, 1)
 									sendChunk("", 3)
 								} else {
-									sendChunk(textBuffer, 3)
+									sendChunk(content, 3)
 								}
 							}
 							textBuffer = ""
@@ -3529,10 +3742,15 @@ func (h *Handler) handleOpenAIStreamWithCache(w http.ResponseWriter, payload *Ki
 						inThinkingBlock = false
 						dropTagThinking = false
 						thinkingStarted = false
+						stripThinkingLeadingNewline = false
 						break
 					} else {
-						ready, pending := splitBeforePartialTag(textBuffer, thinkingCloseTag)
+						ready, pending := splitBeforeThinkingEndTag(textBuffer)
+						if ready != "" {
+							thinkingTagLookbehind = ready[len(ready)-1]
+						}
 						if ready != "" && !dropTagThinking {
+							ready = trimThinkingLeadingNewline(ready, &stripThinkingLeadingNewline)
 							if !thinkingStarted {
 								sendChunk(ready, 1)
 								thinkingStarted = true
@@ -3617,7 +3835,9 @@ func (h *Handler) handleOpenAIStreamWithCache(w http.ResponseWriter, payload *Ki
 		}
 
 		callback := &KiroStreamCallback{
-			OnStreamReady: onStreamReady,
+			RequireClientOutput:      true,
+			AllowReasoningOnlyOutput: thinking,
+			OnStreamReady:            onStreamReady,
 			OnKeepAlive: func() {
 				writeSSEKeepAlive(w, flusher)
 				streamCommitted = true
@@ -3709,12 +3929,8 @@ func (h *Handler) handleOpenAIStreamWithCache(w http.ResponseWriter, payload *Ki
 			},
 		}
 
-		call := h.kiroCaller
-		if call == nil {
-			call = CallKiroAPI
-		}
 		cacheState.compute(account.ID)
-		err := call(account, payload, callback)
+		err := h.callKiroWithBearerRefresh(account, payload, callback)
 		err = resolveKiroOutputTruncation(payload, err, upstreamStopReason, rawContentBuilder.String(), completedKiroToolNamesFromOpenAIToolCalls(toolCalls))
 		if err == nil {
 			if completionErr := agentCompletionResponseError(
@@ -3732,12 +3948,27 @@ func (h *Handler) handleOpenAIStreamWithCache(w http.ResponseWriter, payload *Ki
 				}
 			}
 		}
-		if shouldFinishStreamAfterAgentContinuation(payload, err, len(toolCalls)) {
+		if attemptClientVisibleOutputWritten {
+			clientVisibleOutputWritten = true
+		}
+		finishedAfterContinuation := shouldFinishStreamAfterAgentContinuation(payload, err, len(toolCalls), clientVisibleOutputWritten)
+		if finishedAfterContinuation {
 			logger.Warnf("[KiroAPI] finishing OpenAI stream after bounded agent continuation request_id=%s account_id=%s phase=%s completions=%d actions=%d full_context=%d: %v",
 				chatID, account.ID, kiroAgentRecoveryPhase(payload, err), payload.AgentCompletionRetries,
 				payload.AgentActionContinuations, payload.AgentFullContextRecoveries, err)
 			err = nil
 			upstreamStopReason = "end_turn"
+		}
+		if err == nil && !finishedAfterContinuation {
+			visibleAttempt := completionGate.VisibleText()
+			if visibleAttempt == "" && !agentCompletionProtocolEnabled(payload) {
+				visibleAttempt = rawContentBuilder.String()
+			}
+			visibleAttempt = protocolClientVisibleAttemptText(payload, visibleAttempt, len(toolCalls))
+			if !protocolAttemptHasClientOutput(visibleAttempt, rawReasoningBuilder.String(), len(toolCalls), thinking) {
+				err = newUpstreamEmptyResponseError()
+				logger.Warnf("[KiroAPI] empty OpenAI stream output request_id=%s account_id=%s", chatID, account.ID)
+			}
 		}
 		h.releaseAccount(account)
 		if err != nil {
@@ -3781,6 +4012,24 @@ func (h *Handler) handleOpenAIStreamWithCache(w http.ResponseWriter, payload *Ki
 					h.sendOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 				} else {
 					finishWithStreamError("invalid_request_error", err)
+				}
+				return
+			}
+			if isUpstreamEmptyResponseError(err) {
+				retried, retryErr := h.retryKiroPreResponse(payload, account, &preResponseRetryCount, excluded, &retrySameID, err)
+				if retryErr != nil {
+					return
+				}
+				if retried {
+					attemptLimit++
+					logger.Warnf("[KiroAPI] retrying OpenAI stream after empty upstream output request_id=%s account_id=%s retry=%d/%d", chatID, account.ID, preResponseRetryCount, maxKiroTransportPreResponseRetries)
+					continue
+				}
+				h.recordFailureWithDetails("openai", model, account.ID, err)
+				if !streamCommitted {
+					h.sendOpenAIError(w, http.StatusBadGateway, "api_error", "upstream returned no client-visible output after retries")
+				} else {
+					finishWithStreamError("api_error", err)
 				}
 				return
 			}
@@ -4027,6 +4276,8 @@ func (h *Handler) handleOpenAINonStreamWithCache(w http.ResponseWriter, payload 
 		}
 
 		callback := &KiroStreamCallback{
+			RequireClientOutput:      true,
+			AllowReasoningOnlyOutput: thinking,
 			OnText: func(text string, isThinking bool) {
 				if matchedStopSequence != "" {
 					return
@@ -4058,16 +4309,14 @@ func (h *Handler) handleOpenAINonStreamWithCache(w http.ResponseWriter, payload 
 			},
 		}
 
-		call := h.kiroCaller
-		if call == nil {
-			call = CallKiroAPI
-		}
 		cacheState.compute(account.ID)
-		err := call(account, payload, callback)
+		err := h.callKiroWithBearerRefresh(account, payload, callback)
 		err = resolveKiroOutputTruncation(payload, err, upstreamStopReason, content, completedKiroToolNames(toolUses))
+		var visibleAttempt string
 		if err == nil {
 			visibleContent, _ := extractThinkingFromContent(content)
 			visibleContent, markerSeen := filterAgentCompletionContent(payload, visibleContent, len(toolUses))
+			visibleAttempt = protocolClientVisibleAttemptText(payload, visibleContent, len(toolUses))
 			if completionErr := agentCompletionResponseError(
 				payload,
 				suppressedReasoningObserved || reasoningContent != "",
@@ -4079,6 +4328,10 @@ func (h *Handler) handleOpenAINonStreamWithCache(w http.ResponseWriter, payload 
 				err = completionErr
 				prepareReasoningOnlyRetry(payload, err)
 			}
+		}
+		if err == nil && !protocolAttemptHasClientOutput(visibleAttempt, reasoningContent, len(toolUses), thinking) {
+			err = newUpstreamEmptyResponseError()
+			logger.Warnf("[KiroAPI] empty OpenAI output request_id=%s account_id=%s", payload.requestID, account.ID)
 		}
 		h.releaseAccount(account)
 		if err != nil {
@@ -4111,6 +4364,20 @@ func (h *Handler) handleOpenAINonStreamWithCache(w http.ResponseWriter, payload 
 				}
 				h.recordFailureWithDetails("openai", model, account.ID, err)
 				h.sendOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+				return
+			}
+			if isUpstreamEmptyResponseError(err) {
+				retried, retryErr := h.retryKiroPreResponse(payload, account, &preResponseRetryCount, excluded, &retrySameID, err)
+				if retryErr != nil {
+					return
+				}
+				if retried {
+					attemptLimit++
+					logger.Warnf("[KiroAPI] retrying OpenAI non-stream after empty upstream output account_id=%s retry=%d/%d", account.ID, preResponseRetryCount, maxKiroTransportPreResponseRetries)
+					continue
+				}
+				h.recordFailureWithDetails("openai", model, account.ID, err)
+				h.sendOpenAIError(w, http.StatusBadGateway, "api_error", "upstream returned no client-visible output after retries")
 				return
 			}
 			if !isKiroToolJSONError(err) && isRetryableKiroStreamError(err) &&
@@ -4261,6 +4528,47 @@ func (h *Handler) refreshAccountToken(account *config.Account, force bool) error
 	return h.refreshAccountTokenContext(context.Background(), account, force)
 }
 
+func isKiroBearerTokenInvalidError(err error) bool {
+	var httpErr *KiroHTTPError
+	if !errors.As(err, &httpErr) ||
+		(httpErr.StatusCode != http.StatusUnauthorized && httpErr.StatusCode != http.StatusForbidden) {
+		return false
+	}
+	return strings.Contains(httpErr.Body, "The bearer token included in the request is invalid")
+}
+
+func (h *Handler) callKiroWithBearerRefresh(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
+	call := h.kiroCaller
+	if call == nil {
+		call = CallKiroAPI
+	}
+	err := call(account, payload, callback)
+	if !isKiroBearerTokenInvalidError(err) || account == nil || account.IsApiKeyCredential() {
+		return err
+	}
+
+	if payload != nil {
+		if payload.forcedBearerRefreshAccounts == nil {
+			payload.forcedBearerRefreshAccounts = make(map[string]bool)
+		}
+		if payload.forcedBearerRefreshAccounts[account.ID] {
+			return err
+		}
+		payload.forcedBearerRefreshAccounts[account.ID] = true
+	}
+
+	ctx := context.Background()
+	if payload != nil && payload.requestContext != nil {
+		ctx = payload.requestContext
+	}
+	if refreshErr := h.refreshAccountTokenContext(ctx, account, true); refreshErr != nil {
+		logger.Warnf("[KiroAPI] forced bearer refresh failed request_id=%s account_id=%s: %v", kiroPayloadRequestID(payload), account.ID, refreshErr)
+		return err
+	}
+	logger.Infof("[KiroAPI] forced bearer refresh succeeded request_id=%s account_id=%s; retrying upstream once", kiroPayloadRequestID(payload), account.ID)
+	return call(account, payload, callback)
+}
+
 func (h *Handler) refreshAccountTokenContext(ctx context.Context, account *config.Account, force bool) error {
 	if account == nil {
 		return fmt.Errorf("account is nil")
@@ -4273,6 +4581,10 @@ func (h *Handler) refreshAccountTokenContext(ctx context.Context, account *confi
 	if !force && (account.ExpiresAt == 0 || time.Now().Unix() < account.ExpiresAt-tokenRefreshSkewSeconds) {
 		return nil
 	}
+	if h.tokenRefresher != nil {
+		return h.tokenRefresher(ctx, account, force)
+	}
+	accessTokenBeforeWait := account.AccessToken
 
 	h.tokenRefreshOnce.Do(func() {
 		h.tokenRefreshGate = make(chan struct{}, 1)
@@ -4289,11 +4601,13 @@ func (h *Handler) refreshAccountTokenContext(ctx context.Context, account *confi
 	// lock. Adopt the freshest persisted token before refreshing so we never
 	// reuse an already-rotated (one-time-use) refresh token.
 	if latest := h.pool.GetByID(account.ID); latest != nil {
+		refreshedByPeer := force && accessTokenBeforeWait != "" && latest.AccessToken != "" &&
+			latest.AccessToken != accessTokenBeforeWait
 		account.AccessToken = latest.AccessToken
 		account.RefreshToken = latest.RefreshToken
 		account.ExpiresAt = latest.ExpiresAt
 		account.ProfileArn = latest.ProfileArn
-		if !force && (account.ExpiresAt == 0 || time.Now().Unix() < account.ExpiresAt-tokenRefreshSkewSeconds) {
+		if refreshedByPeer || (!force && (account.ExpiresAt == 0 || time.Now().Unix() < account.ExpiresAt-tokenRefreshSkewSeconds)) {
 			return nil
 		}
 	}

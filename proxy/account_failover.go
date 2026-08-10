@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -55,12 +56,40 @@ func isRateLimitError(err error) bool {
 
 func isQuotaErrorMessage(msg string) bool {
 	msg = strings.ToLower(msg)
-	return strings.Contains(msg, "quota") || strings.Contains(msg, "rate limit") || strings.Contains(msg, "429")
+	return strings.Contains(msg, "quota") || strings.Contains(msg, "rate limit") ||
+		strings.Contains(msg, "429") || strings.Contains(msg, "monthly_request_count")
 }
 
 func isOverageErrorMessage(msg string) bool {
 	msg = strings.ToLower(msg)
 	return strings.Contains(msg, "402") && strings.Contains(msg, "overage")
+}
+
+// isMonthlyRequestCountBody mirrors kiro.rs's endpoint classifier. The
+// upstream has emitted this reason both at the top level and under error, and
+// a few gateways return the literal reason as plain text.
+func isMonthlyRequestCountBody(body string) bool {
+	if strings.Contains(body, "MONTHLY_REQUEST_COUNT") {
+		return true
+	}
+	var value map[string]interface{}
+	if err := json.Unmarshal([]byte(body), &value); err != nil {
+		return false
+	}
+	if reason, ok := value["reason"].(string); ok && reason == "MONTHLY_REQUEST_COUNT" {
+		return true
+	}
+	if nested, ok := value["error"].(map[string]interface{}); ok {
+		if reason, ok := nested["reason"].(string); ok && reason == "MONTHLY_REQUEST_COUNT" {
+			return true
+		}
+	}
+	return false
+}
+
+func isMonthlyRequestCountError(err error) bool {
+	var httpErr *KiroHTTPError
+	return errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusPaymentRequired && isMonthlyRequestCountBody(httpErr.Body)
 }
 
 func isSuspensionErrorMessage(msg string) bool {
@@ -144,6 +173,9 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 		// framing errors do not indicate a bad credential. Penalizing them can
 		// cool every account after a shared network incident.
 		return
+	case isMonthlyRequestCountError(err):
+		h.disableAccount(account, "DISABLED", "Monthly request quota exhausted (MONTHLY_REQUEST_COUNT)")
+		h.pool.RecordError(account.ID, true)
 	case isOverageErrorMessage(errMsg):
 		h.disableAccountOverage(account)
 		h.pool.RecordError(account.ID, false)

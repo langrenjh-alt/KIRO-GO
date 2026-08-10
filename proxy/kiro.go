@@ -34,7 +34,7 @@ const (
 	maxKiroToolAggregateBytes          = 16 << 20
 	maxKiroActiveToolUses              = 128
 	maxKiroToolJSONRetries             = 2
-	maxKiroTransportPreResponseRetries = 1
+	maxKiroTransportPreResponseRetries = 2
 	maxKiroAgentCompletionRetries      = 2
 	maxKiroAgentActionContinuations    = 2
 	maxKiroAgentFullContextRecoveries  = 1
@@ -410,6 +410,9 @@ type KiroPayload struct {
 	lastAttemptPayloadBytes         int
 	lastAttemptEstimatedInputTokens int
 	lastAttemptStartedAt            time.Time
+	// forcedBearerRefreshAccounts limits upstream-invalid bearer recovery to one
+	// forced refresh per credential for this logical downstream request.
+	forcedBearerRefreshAccounts map[string]bool
 }
 
 func bindKiroPayloadContext(payload *KiroPayload, ctx context.Context) *KiroPayload {
@@ -643,6 +646,13 @@ type KiroStreamCallback struct {
 	// BodyIdleTimeout limits continuous upstream silence between complete AWS
 	// Event Stream frames. Downstream keepalive writes do not reset it.
 	BodyIdleTimeout time.Duration
+	// RequireClientOutput makes a clean upstream terminal event insufficient for
+	// success. The protocol adapter must observe visible text, permitted
+	// reasoning, or a completed tool call before accepting the attempt.
+	RequireClientOutput bool
+	// AllowReasoningOnlyOutput lets native reasoning count as client output when
+	// the downstream request explicitly asks to display thinking.
+	AllowReasoningOnlyOutput bool
 	// OnKeepAlive runs serially with the other stream callbacks while the
 	// upstream is silent, so downstream SSE writes cannot interleave.
 	OnKeepAlive func()
@@ -672,6 +682,7 @@ const (
 	upstreamOutputTruncatedCode          = "upstream_output_truncated"
 	upstreamRecoveryTimeoutCode          = "upstream_recovery_timeout"
 	upstreamAgentContinuationTimeoutCode = "upstream_agent_continuation_timeout"
+	upstreamEmptyResponseCode            = "upstream_empty_response"
 )
 
 var errUpstreamIncompleteResponse = errors.New("upstream did not complete the agent turn")
@@ -679,6 +690,18 @@ var errUpstreamAgentMarkerMismatch = errors.New("upstream did not complete the a
 var errUpstreamAgentActionOnly = errors.New("upstream END_TURN had neither a completion marker nor a structured tool call")
 var errUpstreamAgentToolChoiceMismatch = errors.New("upstream did not satisfy the required tool choice")
 var errUpstreamOutputTruncated = errors.New("upstream output reached the token limit")
+var errUpstreamEmptyResponse = errors.New("upstream returned no client-visible output")
+
+func newUpstreamEmptyResponseError() error {
+	return &KiroStreamProtocolError{
+		Code: upstreamEmptyResponseCode,
+		Err:  errUpstreamEmptyResponse,
+	}
+}
+
+func isUpstreamEmptyResponseError(err error) bool {
+	return errors.Is(err, errUpstreamEmptyResponse)
+}
 
 type KiroHTTPError struct {
 	StatusCode int
@@ -1328,7 +1351,7 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 	applyKiroBaseHeaders(req, account, headerValues)
 	req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
 	req.Header.Set("x-amzn-codewhisperer-optout", "true")
-	req.Header.Set("Amz-Sdk-Request", "attempt=1; max=1")
+	req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
 	req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
 
 	if timing != nil {
@@ -1431,6 +1454,33 @@ func accountEmailForLog(account *config.Account) string {
 
 // ==================== Event Stream Parsing ====================
 
+// kiroClientVisibleAssistantText applies the same semantic boundary used by
+// downstream protocol adapters before an upstream turn is accepted. Kiro can
+// wrap hidden reasoning in ordinary assistantResponseEvent frames; counting
+// those bytes as visible text is the root of a number of false 200 responses.
+func kiroClientVisibleAssistantText(content, marker string, allowThinking bool) string {
+	visible, thinking := extractThinkingFromContent(content)
+	if marker != "" {
+		if stripped, found := stripAgentCompletionMarker(visible, marker); found {
+			visible = stripped
+		}
+	}
+	if allowThinking && strings.TrimSpace(thinking) != "" {
+		return strings.TrimSpace(thinking)
+	}
+	return strings.TrimSpace(visible)
+}
+
+func isKnownKiroEventType(eventType string) bool {
+	switch eventType {
+	case "assistantResponseEvent", "reasoningContentEvent", "toolUseEvent",
+		"meteringEvent", "metadataEvent", "contextUsageEvent":
+		return true
+	default:
+		return false
+	}
+}
+
 // parseEventStream decodes an AWS binary Event Stream response body.
 func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	return parseEventStreamWithKeepAlive(body, callback, kiroStreamKeepAliveInterval)
@@ -1506,7 +1556,7 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 	var frames <-chan kiroEventStreamFrame
 	var done chan struct{}
 	var keepAlive <-chan time.Time
-	var keepAliveTimer *time.Timer
+	var keepAliveTicker *time.Ticker
 	var thinkingTimeout <-chan time.Time
 	var thinkingTimer *time.Timer
 	var bodyIdleTimeout <-chan time.Time
@@ -1521,27 +1571,15 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 		go streamKiroEventStreamFrames(body, frameStream, done)
 
 		if callback.OnKeepAlive != nil && keepAliveInterval > 0 {
-			keepAliveTimer = time.NewTimer(keepAliveInterval)
-			defer keepAliveTimer.Stop()
-			keepAlive = keepAliveTimer.C
+			keepAliveTicker = time.NewTicker(keepAliveInterval)
+			defer keepAliveTicker.Stop()
+			keepAlive = keepAliveTicker.C
 		}
 		if callback.BodyIdleTimeout > 0 {
 			bodyIdleTimer = time.NewTimer(callback.BodyIdleTimeout)
 			defer bodyIdleTimer.Stop()
 			bodyIdleTimeout = bodyIdleTimer.C
 		}
-	}
-	resetKeepAlive := func() {
-		if keepAliveTimer == nil {
-			return
-		}
-		if !keepAliveTimer.Stop() {
-			select {
-			case <-keepAliveTimer.C:
-			default:
-			}
-		}
-		keepAliveTimer.Reset(keepAliveInterval)
 	}
 	resetBodyIdle := func() {
 		if bodyIdleTimer == nil {
@@ -1586,6 +1624,8 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 	var agentOutputObserved bool
 	var assistantTextObserved bool
 	var agentVisibleTextObserved bool
+	var clientOutputObserved bool
+	var clientAssistantText strings.Builder
 	// Accounted only while no tool call and no visible text have appeared, so a
 	// multi-round agent task resets it at every outward action and never
 	// accumulates across the whole task.
@@ -1621,7 +1661,6 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 				return reportKiroStreamError(callback, newUpstreamBodyIdleTimeoutError(callback.BodyIdleTimeout))
 			case <-keepAlive:
 				callback.OnKeepAlive()
-				resetKeepAlive()
 				continue
 			case next, ok := <-frames:
 				if !ok {
@@ -1629,7 +1668,6 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 				} else {
 					frame = next
 				}
-				resetKeepAlive()
 			}
 		}
 		if frame.err == io.EOF {
@@ -1704,6 +1742,9 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 		if len(payloadBytes) == 0 {
 			continue
 		}
+		if !isKnownKiroEventType(eventType) {
+			continue
+		}
 
 		var event map[string]interface{}
 		decoder := json.NewDecoder(bytes.NewReader(payloadBytes))
@@ -1736,6 +1777,7 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 			if content, ok := event["content"].(string); ok && content != "" {
 				agentOutputObserved = true
 				assistantTextObserved = true
+				clientAssistantText.WriteString(content)
 				if callback.AgentCompletionMarker != "" {
 					if markerState == agentCompletionPrefixPending {
 						markerProbe.WriteString(content)
@@ -1773,6 +1815,10 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 			}
 			if reasoning.Text != "" || reasoning.Signature != "" || reasoning.RedactedContent != "" {
 				agentOutputObserved = true
+				if callback.AllowReasoningOnlyOutput &&
+					(strings.TrimSpace(reasoning.Text) != "" || strings.TrimSpace(reasoning.RedactedContent) != "") {
+					clientOutputObserved = true
+				}
 				startThinkingTimer()
 				if callback.ReasoningCapBytes > 0 && callback.ReasoningCapMode != reasoningCapOff &&
 					!toolObserved && !assistantTextObserved {
@@ -1833,6 +1879,18 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 	if err := toolUses.finish(callback); err != nil {
 		return reportKiroStreamError(callback, &KiroStreamProtocolError{Code: "upstream_tool_json_error", Err: err})
 	}
+	if toolObserved {
+		// finish validated every accumulated tool payload. A completed tool call
+		// is a client-visible turn even when the upstream sent no trailing text.
+		clientOutputObserved = true
+	}
+	if kiroClientVisibleAssistantText(
+		clientAssistantText.String(),
+		callback.AgentCompletionMarker,
+		callback.AllowReasoningOnlyOutput,
+	) != "" {
+		clientOutputObserved = true
+	}
 	// IAM Identity Center / Enterprise streams can end cleanly without a
 	// metadataEvent. Their terminal metering frame is a safe fallback because
 	// billing is emitted only after generation has finished. Explicit metadata
@@ -1854,6 +1912,9 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 	}
 	if callback.OnComplete != nil {
 		callback.OnComplete(inputTokens, outputTokens)
+	}
+	if callback.RequireClientOutput && !clientOutputObserved {
+		return reportKiroStreamError(callback, newUpstreamEmptyResponseError())
 	}
 	if upstreamStopReason == "max_tokens" {
 		return reportKiroStreamError(callback, newUpstreamOutputTruncatedError())

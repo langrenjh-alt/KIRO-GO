@@ -1,12 +1,14 @@
 package proxy
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,6 +33,146 @@ func TestAccountFailureClassifiers(t *testing.T) {
 		if !tc.fn(tc.msg) {
 			t.Fatalf("%s classifier did not match %q", tc.name, tc.msg)
 		}
+	}
+}
+
+func TestMonthlyRequestCountClassifier(t *testing.T) {
+	for _, body := range []string{
+		`{"reason":"MONTHLY_REQUEST_COUNT"}`,
+		`{"error":{"reason":"MONTHLY_REQUEST_COUNT"}}`,
+		`MONTHLY_REQUEST_COUNT`,
+	} {
+		err := &KiroHTTPError{StatusCode: http.StatusPaymentRequired, Endpoint: "test", Body: body}
+		if !isMonthlyRequestCountError(err) {
+			t.Fatalf("monthly request limit was not recognized: %s", body)
+		}
+	}
+	for _, err := range []error{
+		&KiroHTTPError{StatusCode: http.StatusPaymentRequired, Endpoint: "test", Body: `{"reason":"OVERAGE"}`},
+		&KiroHTTPError{StatusCode: http.StatusPaymentRequired, Endpoint: "test", Body: `{"reason":"monthly_request_count"}`},
+		&KiroHTTPError{StatusCode: http.StatusForbidden, Endpoint: "test", Body: `{"reason":"MONTHLY_REQUEST_COUNT"}`},
+	} {
+		if isMonthlyRequestCountError(err) {
+			t.Fatalf("non-monthly-limit error was misclassified: %v", err)
+		}
+	}
+}
+
+func TestMonthlyRequestCountIsClassifiedAsQuota(t *testing.T) {
+	err := (&KiroHTTPError{
+		StatusCode: http.StatusPaymentRequired,
+		Body:       `{"reason":"MONTHLY_REQUEST_COUNT"}`,
+	}).Error()
+	if !isQuotaErrorMessage(err) {
+		t.Fatalf("MONTHLY_REQUEST_COUNT was not classified as quota: %q", err)
+	}
+}
+
+func TestMonthlyRequestCountDisablesCredentialWithoutOverageRefresh(t *testing.T) {
+	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	account := config.Account{ID: "monthly-exhausted", Enabled: true, AccessToken: "token"}
+	if err := config.AddAccount(account); err != nil {
+		t.Fatalf("config.AddAccount: %v", err)
+	}
+	p := accountpool.GetPool()
+	p.Reload()
+	h := &Handler{pool: p}
+
+	h.handleAccountFailure(&account, &KiroHTTPError{
+		StatusCode: http.StatusPaymentRequired,
+		Endpoint:   "test",
+		Body:       `{"error":{"reason":"MONTHLY_REQUEST_COUNT"}}`,
+	})
+
+	accounts := config.GetAccounts()
+	if len(accounts) != 1 || accounts[0].Enabled || accounts[0].BanStatus != "DISABLED" ||
+		!strings.Contains(accounts[0].BanReason, "MONTHLY_REQUEST_COUNT") {
+		t.Fatalf("monthly exhausted credential was not disabled: %#v", accounts)
+	}
+}
+
+func TestCallKiroWithBearerRefreshRetriesOncePerAccountAndRequest(t *testing.T) {
+	account := &config.Account{ID: "oauth-refresh", Enabled: true, AccessToken: "stale", RefreshToken: "refresh"}
+	payload := &KiroPayload{requestContext: context.Background()}
+	var calls, refreshes int
+	var forced []bool
+	h := &Handler{
+		kiroCaller: func(account *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
+			calls++
+			if calls == 1 || calls == 3 {
+				return &KiroHTTPError{StatusCode: http.StatusUnauthorized, Body: `{"message":"The bearer token included in the request is invalid."}`}
+			}
+			if account.AccessToken != "fresh" {
+				return fmt.Errorf("retry used access token %q, want fresh", account.AccessToken)
+			}
+			if callback != nil && callback.OnText != nil {
+				callback.OnText("recovered", false)
+			}
+			return nil
+		},
+		tokenRefresher: func(_ context.Context, account *config.Account, force bool) error {
+			refreshes++
+			forced = append(forced, force)
+			account.AccessToken = "fresh"
+			return nil
+		},
+	}
+	if err := h.callKiroWithBearerRefresh(account, payload, &KiroStreamCallback{}); err != nil {
+		t.Fatalf("first refreshed call: %v", err)
+	}
+	if calls != 2 || refreshes != 1 || len(forced) != 1 || !forced[0] {
+		t.Fatalf("calls=%d refreshes=%d forced=%v, want one forced refresh and two upstream calls", calls, refreshes, forced)
+	}
+	if err := h.callKiroWithBearerRefresh(account, payload, &KiroStreamCallback{}); err == nil {
+		t.Fatal("second invalid bearer response unexpectedly succeeded")
+	}
+	if calls != 3 || refreshes != 1 {
+		t.Fatalf("refresh repeated for same account/request: calls=%d refreshes=%d", calls, refreshes)
+	}
+}
+
+func TestCallKiroWithBearerRefreshSkipsAPIKeyCredential(t *testing.T) {
+	account := &config.Account{ID: "api-key", Enabled: true, AuthMethod: "api_key", KiroApiKey: "ksk_test", AccessToken: "ksk_test"}
+	var calls, refreshes int
+	h := &Handler{
+		kiroCaller: func(_ *config.Account, _ *KiroPayload, _ *KiroStreamCallback) error {
+			calls++
+			return &KiroHTTPError{StatusCode: http.StatusForbidden, Body: `{"message":"The bearer token included in the request is invalid."}`}
+		},
+		tokenRefresher: func(context.Context, *config.Account, bool) error {
+			refreshes++
+			return nil
+		},
+	}
+	if err := h.callKiroWithBearerRefresh(account, &KiroPayload{}, &KiroStreamCallback{}); err == nil {
+		t.Fatal("invalid API key unexpectedly succeeded")
+	}
+	if calls != 1 || refreshes != 0 {
+		t.Fatalf("API key used OAuth refresh path: calls=%d refreshes=%d", calls, refreshes)
+	}
+}
+
+func TestCallKiroWithBearerRefreshSkipsUnrelatedForbidden(t *testing.T) {
+	account := &config.Account{ID: "oauth-forbidden", AccessToken: "oauth", RefreshToken: "refresh"}
+	var calls, refreshes int
+	h := &Handler{
+		kiroCaller: func(_ *config.Account, _ *KiroPayload, _ *KiroStreamCallback) error {
+			calls++
+			return &KiroHTTPError{
+				StatusCode: http.StatusForbidden,
+				Body:       `{"message":"User is not entitled to use this service"}`,
+			}
+		},
+		tokenRefresher: func(_ context.Context, _ *config.Account, _ bool) error {
+			refreshes++
+			return nil
+		},
+	}
+	err := h.callKiroWithBearerRefresh(account, &KiroPayload{}, &KiroStreamCallback{})
+	if err == nil || calls != 1 || refreshes != 0 {
+		t.Fatalf("err=%v calls=%d refreshes=%d, want original error and no refresh", err, calls, refreshes)
 	}
 }
 

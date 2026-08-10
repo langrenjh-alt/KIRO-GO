@@ -2,6 +2,9 @@ package proxy
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -99,6 +102,134 @@ func TestClaudeStreamMaxTokensContinuesWithoutDuplicatingPrefix(t *testing.T) {
 	wantOutput := estimateClaudeOutputTokensWithRedacted("stream-prefix-stream-suffix", "", nil, nil)
 	if got := int(terminalUsage["output_tokens"].(float64)); got != wantOutput {
 		t.Fatalf("stream continuation output_tokens=%d, want visible output %d: usage=%#v", got, wantOutput, terminalUsage)
+	}
+}
+
+func TestClaudeStreamTransportDisconnectContinuesWithoutDuplicatingPrefix(t *testing.T) {
+	var calls int
+	h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, attempt *KiroPayload, callback *KiroStreamCallback) error {
+		calls++
+		switch calls {
+		case 1:
+			callback.OnText("disconnect-prefix-", false)
+			return io.ErrUnexpectedEOF
+		case 2:
+			if attempt.OutputContinuations != 1 {
+				t.Fatalf("continuations=%d, want 1", attempt.OutputContinuations)
+			}
+			history := attempt.ConversationState.History
+			if len(history) < 2 || history[len(history)-1].AssistantResponseMessage == nil ||
+				history[len(history)-1].AssistantResponseMessage.Content != "disconnect-prefix-" {
+				t.Fatalf("partial output was not replayed as assistant history: %+v", history)
+			}
+			if !strings.Contains(attempt.ConversationState.CurrentMessage.UserInputMessage.Content, "<output_continuation>") {
+				t.Fatalf("continuation instruction missing: %q", attempt.ConversationState.CurrentMessage.UserInputMessage.Content)
+			}
+			callback.OnText("disconnect-suffix", false)
+			callback.OnStopReason("END_TURN")
+		default:
+			t.Fatalf("unexpected call %d", calls)
+		}
+		callback.OnComplete(10, 3)
+		return nil
+	})
+	recorder := httptest.NewRecorder()
+
+	h.handleClaudeStream(recorder, emptyVisibleOutputPayload(), "claude-opus-5", "claude-opus-5", false, claudeThinkingResponseOptions{}, 5, nil, "")
+
+	body := recorder.Body.String()
+	if calls != 2 || recorder.Code != 200 || strings.Count(body, "disconnect-prefix-") != 1 ||
+		strings.Count(body, "disconnect-suffix") != 1 || !strings.Contains(body, "event: message_stop") {
+		t.Fatalf("calls=%d status=%d body=%s", calls, recorder.Code, body)
+	}
+	if strings.Contains(body, "event: error") {
+		t.Fatalf("transport recovery surfaced an SSE error: %s", body)
+	}
+}
+
+func TestClaudeNonStreamTransportDisconnectContinuesWithoutDuplicatingPrefix(t *testing.T) {
+	var calls int
+	h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, attempt *KiroPayload, callback *KiroStreamCallback) error {
+		calls++
+		if calls == 1 {
+			callback.OnText("nonstream-prefix-", false)
+			return io.ErrUnexpectedEOF
+		}
+		if attempt.OutputContinuations != 1 {
+			t.Fatalf("continuations=%d, want 1", attempt.OutputContinuations)
+		}
+		callback.OnText("nonstream-suffix", false)
+		callback.OnStopReason("END_TURN")
+		callback.OnComplete(10, 3)
+		return nil
+	})
+	recorder := httptest.NewRecorder()
+
+	h.handleClaudeNonStream(recorder, emptyVisibleOutputPayload(), "claude-opus-5", "claude-opus-5", false, claudeThinkingResponseOptions{}, 5, nil, "")
+
+	body := recorder.Body.String()
+	if calls != 2 || recorder.Code != 200 || strings.Count(body, "nonstream-prefix-") != 1 ||
+		strings.Count(body, "nonstream-suffix") != 1 || strings.Contains(body, "api_error") {
+		t.Fatalf("calls=%d status=%d body=%s", calls, recorder.Code, body)
+	}
+}
+
+func TestClaudeStreamHTTP500AfterVisiblePrefixContinues(t *testing.T) {
+	var calls int
+	h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, attempt *KiroPayload, callback *KiroStreamCallback) error {
+		calls++
+		if calls == 1 {
+			callback.OnText("http-prefix-", false)
+			return &KiroHTTPError{StatusCode: http.StatusInternalServerError, Endpoint: "test", Body: "temporary"}
+		}
+		if attempt.OutputContinuations != 1 {
+			t.Fatalf("continuations=%d, want 1", attempt.OutputContinuations)
+		}
+		callback.OnText("http-suffix", false)
+		callback.OnStopReason("END_TURN")
+		callback.OnComplete(10, 3)
+		return nil
+	})
+	recorder := httptest.NewRecorder()
+
+	h.handleClaudeStream(recorder, emptyVisibleOutputPayload(), "claude-opus-5", "claude-opus-5", false, claudeThinkingResponseOptions{}, 5, nil, "")
+
+	body := recorder.Body.String()
+	if calls != 2 || recorder.Code != http.StatusOK || strings.Count(body, "http-prefix-") != 1 ||
+		strings.Count(body, "http-suffix") != 1 || strings.Contains(body, "event: error") {
+		t.Fatalf("calls=%d status=%d body=%s", calls, recorder.Code, body)
+	}
+}
+
+func TestClaudeStreamTransportContinuationIsBounded(t *testing.T) {
+	var calls int
+	h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
+		calls++
+		callback.OnText("partial-"+string(rune('0'+calls)), false)
+		return io.ErrUnexpectedEOF
+	})
+	recorder := httptest.NewRecorder()
+
+	h.handleClaudeStream(recorder, emptyVisibleOutputPayload(), "claude-opus-5", "claude-opus-5", false, claudeThinkingResponseOptions{}, 5, nil, "")
+
+	body := recorder.Body.String()
+	if calls != maxKiroOutputContinuations+1 {
+		t.Fatalf("calls=%d, want bounded %d", calls, maxKiroOutputContinuations+1)
+	}
+	if !strings.Contains(body, "event: error") || strings.Contains(body, "event: message_stop") {
+		t.Fatalf("bounded transport failure did not retain the terminal SSE error: %s", body)
+	}
+}
+
+func TestOutputContinuationOnlyAcceptsTransientMidStreamFailures(t *testing.T) {
+	if !isKiroOutputContinuationError(errors.New("read Kiro event stream prelude: stream error: INTERNAL_ERROR; received from peer")) {
+		t.Fatal("HTTP/2 peer reset was not classified as resumable")
+	}
+	if isKiroOutputContinuationError(newUpstreamAgentMarkerMismatchError()) {
+		t.Fatal("agent completion mismatch must use semantic recovery")
+	}
+	if isKiroOutputContinuationError(&KiroStreamProtocolError{Code: "upstream_tool_json_error", Err: errors.New("unexpected EOF")}) {
+		t.Fatal("partial tool JSON must not be replayed as assistant text")
 	}
 }
 

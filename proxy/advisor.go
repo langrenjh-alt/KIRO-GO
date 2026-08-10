@@ -340,10 +340,6 @@ func (h *Handler) callClaudeBuffered(
 	if h.pool == nil {
 		return nil, errNoAdvisorAccounts
 	}
-	call := h.kiroCaller
-	if call == nil {
-		call = CallKiroAPI
-	}
 	excluded := make(map[string]bool)
 	retryCounts := make(map[string]int)
 	retrySameID := ""
@@ -379,6 +375,8 @@ func (h *Handler) callClaudeBuffered(
 		var reasoning strings.Builder
 		var suppressedReasoningObserved bool
 		callback := &KiroStreamCallback{
+			RequireClientOutput:      true,
+			AllowReasoningOnlyOutput: thinking,
 			OnText: func(text string, isThinking bool) {
 				if isThinking {
 					if thinking {
@@ -427,10 +425,10 @@ func (h *Handler) callClaudeBuffered(
 			},
 		}
 		attemptStarted := time.Now()
-		err := call(account, payload, callback)
+		err := h.callKiroWithBearerRefresh(account, payload, callback)
 		err = resolveKiroOutputTruncation(payload, err, result.UpstreamStopReason, content.String(), completedKiroToolNames(result.ToolUses))
 		if err == nil {
-			visibleContent, _ := extractThinkingFromContent(content.String())
+			visibleContent, extractedReasoning := extractThinkingFromContent(content.String())
 			visibleContent, markerSeen := filterAgentCompletionContent(payload, visibleContent, len(result.ToolUses))
 			if completionErr := agentCompletionResponseError(
 				payload,
@@ -442,6 +440,15 @@ func (h *Handler) callClaudeBuffered(
 			); completionErr != nil {
 				err = completionErr
 				prepareReasoningOnlyRetry(payload, err)
+			}
+			if err == nil {
+				clientVisibleThinking := thinking &&
+					(strings.TrimSpace(reasoning.String()) != "" || strings.TrimSpace(extractedReasoning) != "" ||
+						result.Reasoning.Signature != "" || len(result.Reasoning.Redacted) > 0)
+				if !claudeAttemptHasClientOutput(strings.TrimSpace(visibleContent) != "" || clientVisibleThinking, len(result.ToolUses)) {
+					err = newUpstreamEmptyResponseError()
+					logger.Warnf("[KiroAPI] empty buffered Claude output account_id=%s; retrying before accepting an empty turn", account.ID)
+				}
 			}
 		}
 		if err != nil {
@@ -486,6 +493,18 @@ func (h *Handler) callClaudeBuffered(
 					continue
 				}
 			}
+			if isUpstreamEmptyResponseError(err) {
+				retried, retryErr := h.retryKiroPreResponse(payload, account, &preResponseRetryCount, excluded, &retrySameID, err)
+				if retryErr != nil {
+					return nil, retryErr
+				}
+				if retried {
+					attemptLimit++
+					logger.Warnf("[KiroAPI] retrying buffered Claude call after empty upstream output account_id=%s retry=%d/%d", account.ID, preResponseRetryCount, maxKiroTransportPreResponseRetries)
+					continue
+				}
+				return nil, err
+			}
 			if _, protocolErr := kiroStreamProtocolErrorCode(err); protocolErr {
 				return nil, err
 			}
@@ -509,10 +528,16 @@ func (h *Handler) callClaudeBuffered(
 		}
 		h.releaseAccount(account)
 
-		result.Content, _ = extractThinkingFromContent(content.String())
+		resultContent, extractedReasoning := extractThinkingFromContent(content.String())
+		result.Content = resultContent
+		if thinking && result.Reasoning.Text == "" && extractedReasoning != "" {
+			result.Reasoning.Text = extractedReasoning
+		}
 		result.Content, _ = filterAgentCompletionContent(payload, result.Content, len(result.ToolUses))
 		result.Content = prependKiroOutputContinuation(payload, result.Content)
-		result.Reasoning.Text = reasoning.String()
+		if nativeReasoning := reasoning.String(); nativeReasoning != "" || !thinking {
+			result.Reasoning.Text = nativeReasoning
+		}
 		result.ContextInputTokens = currentKiroContextUsageTokens(payload, model)
 		// Upstream token counters can use the same Kiro context domain as
 		// contextUsagePercentage. Anchor public and internal accounting to the
