@@ -92,7 +92,7 @@ func (h *Handler) handleClaudeCodeBufferedStream(
 	}
 	body := buffered.body.Bytes()
 	if status == http.StatusOK {
-		body = patchClaudeCodeMessageStartUsage(body)
+		body = patchClaudeCodeUsageTotals(body)
 	}
 	if !buffered.committed {
 		w.WriteHeader(status)
@@ -103,79 +103,174 @@ func (h *Handler) handleClaudeCodeBufferedStream(
 	}
 }
 
-func patchClaudeCodeMessageStartUsage(body []byte) []byte {
-	contextInputTokens, ok := claudeCodeContextInputTokens(body)
+func patchClaudeCodeUsageTotals(body []byte) []byte {
+	usagePatch, ok := claudeCodeTerminalUsagePatch(body)
 	if !ok {
 		return body
 	}
 
 	blocks := bytes.SplitAfter(body, []byte("\n\n"))
 	for index, block := range blocks {
-		if !bytes.HasPrefix(block, []byte("event: message_start\n")) {
+		if !bytes.HasPrefix(block, []byte("event: message_start\n")) &&
+			!bytes.HasPrefix(block, []byte("event: message_delta\n")) {
 			continue
 		}
-		dataStart := bytes.Index(block, []byte("data: "))
-		if dataStart < 0 {
-			continue
-		}
-		dataStart += len("data: ")
-		dataEnd := bytes.IndexByte(block[dataStart:], '\n')
-		if dataEnd < 0 {
-			dataEnd = len(block) - dataStart
-		}
-
-		var event map[string]interface{}
-		if err := json.Unmarshal(block[dataStart:dataStart+dataEnd], &event); err != nil {
-			continue
-		}
-		message, ok := event["message"].(map[string]interface{})
+		patched, ok := patchClaudeCodeUsageBlock(block, usagePatch)
 		if !ok {
 			continue
 		}
-		usage, ok := message["usage"].(map[string]interface{})
-		if !ok {
-			continue
-		}
-		usage["input_tokens"] = contextInputTokens
-		encoded, err := json.Marshal(event)
-		if err != nil {
-			continue
-		}
-
-		patched := make([]byte, 0, len(block)+len(encoded)-dataEnd)
-		patched = append(patched, block[:dataStart]...)
-		patched = append(patched, encoded...)
-		patched = append(patched, block[dataStart+dataEnd:]...)
 		blocks[index] = patched
-		break
 	}
 	return bytes.Join(blocks, nil)
 }
 
-func claudeCodeContextInputTokens(body []byte) (int, bool) {
+type claudeCodeUsagePatch struct {
+	inputTokens         int
+	cacheCreationTokens int
+	cacheReadTokens     int
+}
+
+// Claude Code treats message_delta usage as authoritative over message_start
+// and calculates context input as input + cache_creation + cache_read. Patch the
+// same standard tuple into both events so the terminal event cannot undo the
+// buffered context correction and cached tokens are not counted twice.
+func claudeCodeTerminalUsagePatch(body []byte) (claudeCodeUsagePatch, bool) {
 	for _, block := range bytes.Split(body, []byte("\n\n")) {
 		if !bytes.HasPrefix(block, []byte("event: message_delta\n")) {
 			continue
 		}
-		dataStart := bytes.Index(block, []byte("data: "))
-		if dataStart < 0 {
+		event, _, _, ok := decodeClaudeCodeSSEBlock(block)
+		if !ok {
 			continue
 		}
-		dataStart += len("data: ")
-		dataEnd := bytes.IndexByte(block[dataStart:], '\n')
-		if dataEnd < 0 {
-			dataEnd = len(block) - dataStart
+		usage, ok := event["usage"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		contextUsage, ok := usage["kiro_context_usage"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		contextInputTokens := claudeCodeUsageInt(contextUsage["input_tokens"])
+		if contextInputTokens <= 0 {
+			continue
 		}
 
-		var event struct {
-			Usage struct {
-				KiroContextUsage *KiroContextUsage `json:"kiro_context_usage"`
-			} `json:"usage"`
+		cacheCreationTokens := claudeCodeUsageInt(usage["cache_creation_input_tokens"])
+		cacheReadTokens := claudeCodeUsageInt(usage["cache_read_input_tokens"])
+		cacheTotal := cacheCreationTokens + cacheReadTokens
+		if cacheTotal > contextInputTokens {
+			cacheReadTokens = int(float64(contextInputTokens)*float64(cacheReadTokens)/float64(cacheTotal) + 0.5)
+			if cacheReadTokens > contextInputTokens {
+				cacheReadTokens = contextInputTokens
+			}
+			cacheCreationTokens = contextInputTokens - cacheReadTokens
 		}
-		if err := json.Unmarshal(block[dataStart:dataStart+dataEnd], &event); err == nil &&
-			event.Usage.KiroContextUsage != nil {
-			return event.Usage.KiroContextUsage.InputTokens, true
-		}
+		return claudeCodeUsagePatch{
+			inputTokens:         contextInputTokens - cacheCreationTokens - cacheReadTokens,
+			cacheCreationTokens: cacheCreationTokens,
+			cacheReadTokens:     cacheReadTokens,
+		}, true
 	}
-	return 0, false
+	return claudeCodeUsagePatch{}, false
+}
+
+func patchClaudeCodeUsageBlock(block []byte, patch claudeCodeUsagePatch) ([]byte, bool) {
+	event, dataStart, dataEnd, ok := decodeClaudeCodeSSEBlock(block)
+	if !ok {
+		return block, false
+	}
+
+	var usage map[string]interface{}
+	switch event["type"] {
+	case "message_start":
+		message, ok := event["message"].(map[string]interface{})
+		if !ok {
+			return block, false
+		}
+		usage, ok = message["usage"].(map[string]interface{})
+		if !ok {
+			return block, false
+		}
+	case "message_delta":
+		usage, ok = event["usage"].(map[string]interface{})
+		if !ok {
+			return block, false
+		}
+		// Only the terminal delta carries Kiro's authoritative context event.
+		// Leave any future intermediate usage deltas untouched; Claude Code
+		// consumes the last usage-bearing delta as the completed turn total.
+		if _, ok := usage["kiro_context_usage"]; !ok {
+			return block, false
+		}
+	default:
+		return block, false
+	}
+
+	usage["input_tokens"] = patch.inputTokens
+	if _, exists := usage["cache_creation_input_tokens"]; exists || patch.cacheCreationTokens > 0 {
+		usage["cache_creation_input_tokens"] = patch.cacheCreationTokens
+	}
+	if _, exists := usage["cache_read_input_tokens"]; exists || patch.cacheReadTokens > 0 {
+		usage["cache_read_input_tokens"] = patch.cacheReadTokens
+	}
+	if cacheCreation, ok := usage["cache_creation"].(map[string]interface{}); ok {
+		fiveMinute := claudeCodeUsageInt(cacheCreation["ephemeral_5m_input_tokens"])
+		oneHour := claudeCodeUsageInt(cacheCreation["ephemeral_1h_input_tokens"])
+		fiveMinute, oneHour = scaleClaudeCodeCacheCreation(fiveMinute, oneHour, patch.cacheCreationTokens)
+		cacheCreation["ephemeral_5m_input_tokens"] = fiveMinute
+		cacheCreation["ephemeral_1h_input_tokens"] = oneHour
+	}
+
+	encoded, err := json.Marshal(event)
+	if err != nil {
+		return block, false
+	}
+	patched := make([]byte, 0, len(block)+len(encoded)-(dataEnd-dataStart))
+	patched = append(patched, block[:dataStart]...)
+	patched = append(patched, encoded...)
+	patched = append(patched, block[dataEnd:]...)
+	return patched, true
+}
+
+func decodeClaudeCodeSSEBlock(block []byte) (map[string]interface{}, int, int, bool) {
+	dataStart := bytes.Index(block, []byte("data: "))
+	if dataStart < 0 {
+		return nil, 0, 0, false
+	}
+	dataStart += len("data: ")
+	dataLength := bytes.IndexByte(block[dataStart:], '\n')
+	if dataLength < 0 {
+		dataLength = len(block) - dataStart
+	}
+	dataEnd := dataStart + dataLength
+
+	var event map[string]interface{}
+	if err := json.Unmarshal(block[dataStart:dataEnd], &event); err != nil {
+		return nil, 0, 0, false
+	}
+	return event, dataStart, dataEnd, true
+}
+
+func claudeCodeUsageInt(value interface{}) int {
+	number, ok := value.(float64)
+	if !ok || number <= 0 {
+		return 0
+	}
+	return int(number)
+}
+
+func scaleClaudeCodeCacheCreation(fiveMinute, oneHour, total int) (int, int) {
+	if total <= 0 {
+		return 0, 0
+	}
+	previousTotal := fiveMinute + oneHour
+	if previousTotal <= 0 {
+		return total, 0
+	}
+	scaledOneHour := int(float64(total)*float64(oneHour)/float64(previousTotal) + 0.5)
+	if scaledOneHour > total {
+		scaledOneHour = total
+	}
+	return total - scaledOneHour, scaledOneHour
 }
