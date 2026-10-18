@@ -38,7 +38,8 @@ func RefreshTokenContext(ctx context.Context, account *config.Account) (string, 
 	if account == nil {
 		return "", "", 0, "", fmt.Errorf("account is nil")
 	}
-	// Resolve per-account proxy: account.ProxyURL > global config
+	// Legacy fallback only. ClientForAccount resolves the pool assignment again
+	// at every outbound request, so refresh follows live failover/settings too.
 	proxyURL := account.ProxyURL
 	if proxyURL == "" {
 		proxyURL = config.GetProxyURL()

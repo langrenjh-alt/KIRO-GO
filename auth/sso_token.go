@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"kiro-go/config"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -311,15 +313,35 @@ func pollForToken(oidcBase, clientID, clientSecret, deviceCode string, interval 
 
 // GetUserInfo 获取用户信息
 func GetUserInfo(accessToken string) (email, userID string, err error) {
+	return getUserInfoWithClient(accessToken, "", httpClient())
+}
+
+// GetUserInfoForAccount keeps post-import identity requests on the same live
+// account egress policy as refresh and inference. Bootstrap login callers that
+// do not yet have a persisted account use GetUserInfo instead.
+func GetUserInfoForAccount(account *config.Account) (email, userID string, err error) {
+	if account == nil {
+		return "", "", fmt.Errorf("account is nil")
+	}
+	proxyURL := strings.TrimSpace(account.ProxyURL)
+	if proxyURL == "" {
+		proxyURL = config.GetProxyURL()
+	}
+	token := account.AccessToken
+	if account.AuthMethod == "api_key" && strings.TrimSpace(account.KiroApiKey) != "" {
+		token = account.KiroApiKey
+	}
+	return getUserInfoWithClient(token, account.MachineId, ClientForAccount(account.ID, proxyURL, account.MachineId))
+}
+
+func getUserInfoWithClient(accessToken, machineID string, client *http.Client) (email, userID string, err error) {
 	// 调用 Kiro API 获取用量信息（包含用户信息）
 	url := "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true"
 
 	req, _ := http.NewRequest("GET", url, nil)
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Accept", "application/json")
-	applyKiroRuntimeIdentity(req, "")
-
-	client := httpClient()
+	applyKiroRuntimeIdentity(req, machineID)
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", "", err

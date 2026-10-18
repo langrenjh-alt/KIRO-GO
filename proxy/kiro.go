@@ -140,15 +140,16 @@ func GetRestClientForProxy(proxyURL string) *http.Client {
 	return actual.(*http.Client)
 }
 
-// ResolveAccountProxyURL returns the proxy for this account. When s2ap binding
-// is on, the account keeps one pool proxy for the configured hold. Exits are
-// shared only after every exit already has an account. Otherwise an
-// account-specific proxy wins, then the global proxy.
+// ResolveAccountProxyURL returns the current assignment for display/logging.
+// The outbound transport resolves policy again and propagates allocation errors.
 func ResolveAccountProxyURL(account *config.Account) string {
-	if config.S2APBindEnabled() && account != nil {
-		if proxyURL := s2apProxyForAccount(account.ID); proxyURL != "" {
-			return proxyURL
+	if config.GetProxyPoolSettings().Enabled {
+		if account != nil {
+			if entry, bound, err := config.ResolveAccountProxy(account.ID); err == nil && bound {
+				return entry.URL
+			}
 		}
+		return ""
 	}
 	if account != nil && strings.TrimSpace(account.ProxyURL) != "" {
 		return account.ProxyURL

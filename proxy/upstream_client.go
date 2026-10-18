@@ -7,13 +7,14 @@ import (
 	"time"
 
 	"kiro-go/config"
+	"kiro-go/egress"
 )
 
 // accountClientPool is one IDE-shaped connection pool. Streaming and REST
 // clients share the transport so one account reuses its own TLS session, and
 // a different account never presents its bearer on that session.
 type accountClientPool struct {
-	transport *http.Transport
+	transport *egress.Transport
 	stream    *http.Client
 	rest      *http.Client
 }
@@ -42,7 +43,7 @@ func InitKiroHttpClient(proxyURL string) {
 	oldRestClient := kiroRestHttpStore.Swap(restClient)
 	defaultStreamingClient = client
 	defaultRESTClient = restClient
-	var stale []*http.Transport
+	var stale []*egress.Transport
 	accountClientPools.Range(func(key, value any) bool {
 		if pool, ok := value.(*accountClientPool); ok && pool.transport != nil {
 			stale = append(stale, pool.transport)
@@ -92,7 +93,7 @@ func kiroUpstreamClient(account *config.Account, rest bool) *http.Client {
 		overridden = current != defaultStreamingClient
 	}
 	kiroClientMu.RUnlock()
-	if overridden {
+	if overridden && !config.GetProxyPoolSettings().Enabled {
 		return current
 	}
 
@@ -100,8 +101,13 @@ func kiroUpstreamClient(account *config.Account, rest bool) *http.Client {
 	if account != nil {
 		accountID = strings.TrimSpace(account.ID)
 	}
-	proxyURL := ResolveAccountProxyURL(account)
-	if accountID == "" {
+	// This URL is only the old per-account/global fallback. Pool assignment is
+	// resolved inside egress.Transport for every request, not at cache creation.
+	proxyURL := config.GetProxyURL()
+	if account != nil && strings.TrimSpace(account.ProxyURL) != "" {
+		proxyURL = strings.TrimSpace(account.ProxyURL)
+	}
+	if accountID == "" && !config.GetProxyPoolSettings().Enabled {
 		if rest {
 			return GetRestClientForProxy(proxyURL)
 		}
@@ -113,11 +119,13 @@ func kiroUpstreamClient(account *config.Account, rest bool) *http.Client {
 		return accountClient(value.(*accountClientPool), rest)
 	}
 
-	transport := buildKiroTransport(proxyURL)
-	// The shared process pool is sized for every account at once. One IDE
-	// process only keeps a handful of idle connections.
-	transport.MaxIdleConns = 8
-	transport.MaxIdleConnsPerHost = 4
+	transport := egress.New(accountID, proxyURL, func(raw string) http.RoundTripper {
+		base := buildKiroTransport(raw)
+		// Each account retains an independent connection/TLS session pool.
+		base.MaxIdleConns = 8
+		base.MaxIdleConnsPerHost = 4
+		return base
+	})
 	pool := &accountClientPool{
 		transport: transport,
 		stream: &http.Client{

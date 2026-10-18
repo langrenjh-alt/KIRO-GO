@@ -86,19 +86,22 @@ func TestClaudeStreamRetriesTransientPreludeErrorBeforeOutput(t *testing.T) {
 	}
 }
 
-func TestClaudeStreamAutoToolsFlushesTextBeforeUpstreamCompletes(t *testing.T) {
+func TestClaudeStreamCodingAgentAutoToolsFlushesTextBeforeUpstreamCompletes(t *testing.T) {
 	rec := httptest.NewRecorder()
 	var observedDuringCall string
 	h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
 		callback.OnText("first token", false)
 		// The upstream call has not returned yet. Seeing the delta here proves
-		// that auto+tools is genuinely streamed rather than flushed at EOF.
+		// that coding-agent auto+tools is streamed rather than flushed at EOF.
 		observedDuringCall = rec.Body.String()
 		callback.OnComplete(10, 2)
 		return nil
 	})
 	payload := emptyVisibleOutputPayload()
 	payload.ToolChoiceMode = "auto"
+	// Ordinary non-agent auto turns intentionally hold pre-tool prose. This
+	// test covers the coding-agent exception without changing that behavior.
+	payload.AgentCompletionProtocolEnabled = true
 	tool := KiroToolWrapper{}
 	tool.ToolSpecification.Name = "lookup"
 	tool.ToolSpecification.Description = "lookup"

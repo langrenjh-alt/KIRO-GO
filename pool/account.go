@@ -197,6 +197,9 @@ func (p *AccountPool) AcquireForTest(account *config.Account) (*config.Account, 
 	if account == nil {
 		return nil, false
 	}
+	if !config.AccountProxyAllowed(account.ID) {
+		return nil, false
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.isConcurrencyFullLocked(account) {
@@ -305,6 +308,8 @@ type accountSelectionPolicy struct {
 	allowOverUsage      bool
 	restrictLevels      bool
 	allowedAccountLevel map[string]struct{}
+	proxyRequired       bool
+	proxyAccounts       map[string]bool
 }
 
 // loadAccountSelectionPolicy snapshots config before the pool lock is acquired.
@@ -312,6 +317,7 @@ type accountSelectionPolicy struct {
 // reduced once per request to an account-level membership check.
 func loadAccountSelectionPolicy(model string) accountSelectionPolicy {
 	selection := accountSelectionPolicy{allowOverUsage: config.GetAllowOverUsage()}
+	selection.proxyRequired, selection.proxyAccounts = config.ProxyPoolAccountPolicySnapshot()
 	model = strings.ToLower(strings.TrimSpace(model))
 	if model == "" {
 		return selection
@@ -345,6 +351,9 @@ func loadAccountSelectionPolicy(model string) accountSelectionPolicy {
 }
 
 func (selection accountSelectionPolicy) accountAllowed(account *config.Account) bool {
+	if account == nil || (selection.proxyRequired && !selection.proxyAccounts[account.ID]) {
+		return false
+	}
 	if !selection.restrictLevels {
 		return true
 	}
@@ -942,6 +951,7 @@ func (p *AccountPool) Count() int {
 
 // AvailableCount 返回可用账号数
 func (p *AccountPool) AvailableCount() int {
+	selection := loadAccountSelectionPolicy("")
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
@@ -952,7 +962,7 @@ func (p *AccountPool) AvailableCount() int {
 			continue
 		}
 		seen[acc.ID] = true
-		if p.runtimeStateLocked(&acc, now).Available {
+		if selection.accountAllowed(&acc) && p.runtimeStateLocked(&acc, now).Available {
 			count++
 		}
 	}
@@ -973,6 +983,7 @@ func (p *AccountPool) runtimeStateLocked(account *config.Account, now time.Time)
 // from the in-memory pool are not returned; callers can distinguish those
 // records from disabled or quota-blocked configuration entries.
 func (p *AccountPool) RuntimeStates() map[string]RuntimeAccountState {
+	selection := loadAccountSelectionPolicy("")
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
@@ -982,7 +993,11 @@ func (p *AccountPool) RuntimeStates() map[string]RuntimeAccountState {
 		if _, seen := states[account.ID]; seen {
 			continue
 		}
-		states[account.ID] = p.runtimeStateLocked(&account, now)
+		if !selection.accountAllowed(&account) {
+			states[account.ID] = RuntimeAccountState{Reason: "proxy_unavailable"}
+		} else {
+			states[account.ID] = p.runtimeStateLocked(&account, now)
+		}
 	}
 	return states
 }

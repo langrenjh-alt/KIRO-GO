@@ -258,7 +258,7 @@
     @media (max-width: 720px) {
       #tabBar.tabs {
         width: 100%;
-        grid-template-columns: repeat(5, minmax(0, 1fr));
+        grid-template-columns: repeat(3, minmax(0, 1fr));
         gap: 0.25rem;
       }
       #tabBar .tab {
@@ -377,6 +377,8 @@
           <div class="tabs" id="tabBar">
             <button type="button" class="tab active" data-tab="accounts"><i class="fa-solid fa-users tab-icon"></i><span
                 data-i18n="tabs.accounts"></span></button>
+            <button type="button" class="tab" data-tab="proxyPool"><i class="fa-solid fa-network-wired tab-icon" aria-hidden="true"></i><span
+                data-i18n="tabs.proxyPool"></span></button>
             <button type="button" class="tab" data-tab="traffic"><i class="fa-solid fa-chart-line tab-icon"></i><span
                 data-i18n="tabs.traffic"></span></button>
             <button type="button" class="tab" data-tab="settings"><i class="fa-solid fa-sliders tab-icon"></i><span
@@ -506,6 +508,60 @@
           </div>
 
           <div id="accountsList"></div>
+        </div>
+      </div>
+
+      <!-- Proxy pool tab -->
+      <div id="tabProxyPool" class="tab-content hidden">
+        <div class="card proxy-pool-card">
+          <div class="card-header">
+            <div><h2 class="card-title" data-i18n="proxyPool.title"></h2><p class="proxy-pool-hint" data-i18n="proxyPool.subtitle"></p></div>
+            <div class="card-actions">
+              <button class="btn btn-outline btn-sm" id="proxyPoolRefreshBtn" type="button"><i class="fa-solid fa-arrows-rotate" aria-hidden="true"></i><span data-i18n="proxyPool.refresh"></span></button>
+              <button class="btn btn-outline btn-sm" id="proxyPoolCheckAllBtn" type="button" data-proxy-mutation><i class="fa-solid fa-stethoscope" aria-hidden="true"></i><span data-i18n="proxyPool.checkAll"></span></button>
+              <button class="btn btn-primary btn-sm" id="proxyPoolImportBtn" type="button" data-proxy-mutation><i class="fa-solid fa-plus" aria-hidden="true"></i><span data-i18n="proxyPool.import"></span></button>
+            </div>
+          </div>
+          <div class="proxy-pool-controls">
+            <div class="proxy-pool-control">
+              <label class="proxy-pool-switch"><span class="switch"><input type="checkbox" id="proxyPoolEnabled" role="switch" aria-describedby="proxyPoolEnabledHint" /><span class="slider"></span></span><span data-i18n="proxyPool.enabled"></span></label>
+              <p id="proxyPoolEnabledHint" class="proxy-pool-hint" data-i18n="proxyPool.enabledHint"></p>
+            </div>
+            <div class="proxy-pool-control">
+              <label class="proxy-pool-switch"><span class="switch"><input type="checkbox" id="proxyPoolBlockWithoutProxy" role="switch" aria-describedby="proxyPoolBlockHint" /><span class="slider"></span></span><span data-i18n="proxyPool.blockWithoutProxy"></span></label>
+              <p id="proxyPoolBlockHint" class="proxy-pool-hint" data-i18n="proxyPool.blockHint"></p>
+            </div>
+          </div>
+          <div class="proxy-pool-summary" id="proxyPoolSummary"></div>
+          <div class="proxy-pool-inspection">
+            <div id="proxyPoolInspection" role="status" aria-live="polite" aria-atomic="true"></div>
+            <div class="proxy-pool-hint" id="proxyPoolUpdated"></div>
+            <progress id="proxyPoolProgress" max="1" value="0" class="hidden" data-i18n-aria-label="proxyPool.inspectionProgress"></progress>
+          </div>
+          <div class="toolbar proxy-pool-toolbar">
+            <label class="proxy-pool-select-all"><input type="checkbox" id="proxyPoolSelectAll" /><span data-i18n="proxyPool.selectAll"></span></label>
+            <span id="proxyPoolSelectionCount" class="proxy-pool-hint"></span>
+            <div id="proxyPoolBatchActions" class="proxy-pool-batch hidden">
+              <button class="btn btn-secondary btn-xs" type="button" data-proxy-batch="edit" data-proxy-mutation data-i18n="proxyPool.edit"></button>
+              <button class="btn btn-secondary btn-xs" type="button" data-proxy-batch="check" data-proxy-mutation data-i18n="proxyPool.check"></button>
+              <button class="btn btn-secondary btn-xs" type="button" data-proxy-batch="enable" data-proxy-mutation data-i18n="proxyPool.enable"></button>
+              <button class="btn btn-secondary btn-xs" type="button" data-proxy-batch="disable" data-proxy-mutation data-i18n="proxyPool.disable"></button>
+              <button class="btn btn-danger btn-xs" type="button" data-proxy-batch="delete" data-proxy-mutation data-i18n="proxyPool.delete"></button>
+            </div>
+            <div class="toolbar-spacer"></div>
+            <input type="search" id="proxyPoolSearch" data-i18n-placeholder="proxyPool.search" data-i18n-aria-label="proxyPool.search" />
+            <select id="proxyPoolFilter" data-i18n-aria-label="proxyPool.filter">
+              <option value="all" data-i18n="proxyPool.all"></option>
+              <option value="enabled" data-i18n="proxyPool.enabledFilter"></option>
+              <option value="disabled" data-i18n="proxyPool.disabledFilter"></option>
+              <option value="healthy" data-i18n="proxyPool.healthy"></option>
+              <option value="unhealthy" data-i18n="proxyPool.unhealthy"></option>
+              <option value="unbound" data-i18n="proxyPool.unboundFilter"></option>
+            </select>
+          </div>
+          <p id="proxyPoolError" class="proxy-pool-error hidden" role="alert"></p>
+          <div id="proxyPoolList" aria-busy="false"></div>
+          <p class="proxy-pool-footnote" data-i18n="proxyPool.trafficHint"></p>
         </div>
       </div>
 
@@ -878,20 +934,12 @@
         </div>
 
         <div class="card">
-          <div class="card-header"><span class="card-title" data-i18n="settings.s2apBind"></span></div>
+          <div class="card-header"><span class="card-title" data-i18n="proxyPool.title"></span></div>
           <div class="form-group">
-            <label class="flex items-center gap-2">
-              <span class="switch"><input type="checkbox" id="s2apBindEnabled" /><span class="slider"></span></span>
-              <span data-i18n="settings.s2apBindSwitch"></span>
-            </label>
-            <small data-i18n="settings.s2apBindHint"></small>
+            <label class="proxy-pool-switch"><span class="switch"><input type="checkbox" id="settingsProxyPoolEnabled" role="switch" aria-describedby="settingsProxyPoolHint" /><span class="slider"></span></span><span data-i18n="proxyPool.enabled"></span></label>
+            <small id="settingsProxyPoolHint" data-i18n="proxyPool.settingsHint"></small>
           </div>
-          <div class="form-group">
-            <label data-i18n="settings.s2apBindHours"></label>
-            <input type="number" id="s2apBindHours" min="1" max="336" value="12" />
-          </div>
-          <div id="s2apBindStatus" class="text-xs text-gray-500"></div>
-          <button class="btn btn-primary" id="saveS2APBindBtn" data-i18n="settings.saveS2APBind"></button>
+          <button class="btn btn-outline" id="settingsOpenProxyPoolBtn" type="button" data-i18n="proxyPool.open"></button>
         </div>
 
         <!-- Admin password -->
@@ -1127,6 +1175,34 @@
   </div>
 
   <!-- Modals -->
+  <div id="proxyPoolImportModal" class="modal">
+    <div class="modal-content">
+      <div class="modal-header"><span class="modal-title" data-i18n="proxyPool.import"></span><button class="modal-close" id="proxyPoolImportClose" type="button" data-i18n-aria-label="common.close">&times;</button></div>
+      <form id="proxyPoolImportForm" class="modal-body">
+        <div class="form-group"><label for="proxyPoolImportScheme" data-i18n="proxyPool.defaultScheme"></label><select id="proxyPoolImportScheme"><option value="http">HTTP</option><option value="socks5">SOCKS5</option></select></div>
+        <div class="form-group"><label for="proxyPoolImportText" data-i18n="proxyPool.importLines"></label><textarea id="proxyPoolImportText" rows="9" required spellcheck="false" aria-describedby="proxyPoolImportHint" placeholder="http://user:password@host:8080&#10;socks5://host:1080&#10;US 01|http://host:8080"></textarea><small id="proxyPoolImportHint" data-i18n="proxyPool.importHint"></small></div>
+        <p id="proxyPoolImportError" class="proxy-pool-error hidden" role="alert"></p>
+        <div class="modal-footer"><button class="btn btn-secondary" id="proxyPoolImportCancel" type="button" data-i18n="common.cancel"></button><button class="btn btn-primary" id="proxyPoolImportSubmit" type="submit" data-proxy-mutation data-i18n="proxyPool.importSubmit"></button></div>
+      </form>
+    </div>
+  </div>
+  <div id="proxyPoolEditModal" class="modal">
+    <div class="modal-content">
+      <div class="modal-header"><span class="modal-title" data-i18n="proxyPool.edit"></span><button class="modal-close" id="proxyPoolEditClose" type="button" data-i18n-aria-label="common.close">&times;</button></div>
+      <form id="proxyPoolEditForm" class="modal-body">
+        <p id="proxyPoolEditHint" class="proxy-pool-hint"></p>
+        <div class="form-group"><label for="proxyPoolEditName" data-i18n="proxyPool.name"></label><input type="text" id="proxyPoolEditName" autocomplete="off" /></div>
+        <div class="form-group"><label for="proxyPoolEditURL" data-i18n="proxyPool.url"></label><input type="text" id="proxyPoolEditURL" spellcheck="false" autocomplete="off" placeholder="http://user:password@host:8080" /><small data-i18n="proxyPool.editURLHint"></small></div>
+        <div class="form-group"><label for="proxyPoolEditScheme" data-i18n="proxyPool.scheme"></label><select id="proxyPoolEditScheme"><option value="" data-i18n="proxyPool.keepExisting"></option><option value="http">HTTP</option><option value="socks5">SOCKS5</option></select></div>
+        <div class="form-grid">
+          <div class="form-group"><label for="proxyPoolEditUsername" data-i18n="proxyPool.username"></label><input type="text" id="proxyPoolEditUsername" autocomplete="off" /></div>
+          <div class="form-group"><label for="proxyPoolEditPassword" data-i18n="proxyPool.password"></label><input type="password" id="proxyPoolEditPassword" autocomplete="new-password" /></div>
+        </div>
+        <p id="proxyPoolEditError" class="proxy-pool-error hidden" role="alert"></p>
+        <div class="modal-footer"><button class="btn btn-secondary" id="proxyPoolEditCancel" type="button" data-i18n="common.cancel"></button><button class="btn btn-primary" id="proxyPoolEditSubmit" type="submit" data-proxy-mutation data-i18n="common.save"></button></div>
+      </form>
+    </div>
+  </div>
   <div id="addModal" class="modal">
     <div class="modal-content">
       <div class="modal-header"><span class="modal-title" id="modalTitle"></span><button class="modal-close"

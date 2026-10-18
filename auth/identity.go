@@ -32,6 +32,12 @@ type identityTransport struct {
 	machineID string
 }
 
+func (t identityTransport) CloseIdleConnections() {
+	if closer, ok := t.base.(interface{ CloseIdleConnections() }); ok {
+		closer.CloseIdleConnections()
+	}
+}
+
 func (t identityTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req == nil {
 		return nil, fmt.Errorf("nil request")

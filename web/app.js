@@ -21,6 +21,14 @@
   let accountConcurrencyRefreshSeconds = 5;
   let accountConcurrencyRefreshTimer = null;
   let accountConcurrencyRefreshPending = false;
+  let proxyPoolData = null;
+  let proxyPoolUpdatedAt = null;
+  let proxyPoolLoadSequence = 0;
+  let proxyPoolPending = false;
+  let proxyPoolBusy = false;
+  let proxyPoolTimer = null;
+  let proxyPoolEditingIds = [];
+  const selectedProxies = new Set();
   let promptRules = [];
   let builderIdSession = '';
   let builderIdPollTimer = null;
@@ -151,6 +159,7 @@
     applyTranslations();
     renderVersionBadge();
     renderAccounts();
+    renderProxyPool();
     const selectedPolicyId = $('apiKeyForm_promptCachePolicyId') ? $('apiKeyForm_promptCachePolicyId').value : '';
     renderApiKeyPolicyOptions(selectedPolicyId);
     renderPromptCachePolicies();
@@ -1390,10 +1399,13 @@
       const latest = await res.json();
       if (!res.ok || !Array.isArray(latest)) return;
       const counts = new Map(latest.map(a => [String(a.id), Math.max(0, Number(a.inFlight) || 0)]));
+      const proxyAccounts = new Map(latest.map(a => [String(a.id), a]));
       const modelsByID = new Map(latest.map(a => [String(a.id), Array.isArray(a.emptyOutputModels) ? a.emptyOutputModels : []]));
       const modelTargets = [];
       accountsData.forEach(a => {
         const id = String(a.id);
+        const latestAccount = proxyAccounts.get(id);
+        if (latestAccount) ['proxyPoolEnabled', 'proxyId', 'proxyName', 'proxyExitIP', 'proxyBlocked'].forEach(key => { a[key] = latestAccount[key]; });
         if (counts.has(id)) a.inFlight = counts.get(id);
         if (!modelsByID.has(id)) return;
         const next = modelsByID.get(id);
@@ -1406,6 +1418,13 @@
         if (count === undefined) return;
         el.textContent = String(count);
         el.classList.toggle('is-active', count > 0);
+      });
+      qsa('.account-proxy-slot', $('accountsList')).forEach(element => {
+        const account = proxyAccounts.get(element.dataset.accountId);
+        if (account) {
+          const markup = renderAccountProxy(account);
+          if (element.innerHTML !== markup) element.innerHTML = markup;
+        }
       });
       if (modelTargets.length) {
         const pending = new Set(modelTargets);
@@ -1420,6 +1439,337 @@
     } finally {
       accountConcurrencyRefreshPending = false;
     }
+  }
+
+  // Proxy pool. Both switches write the same persisted settings endpoint.
+  function proxyPoolEntries() {
+    return proxyPoolData && Array.isArray(proxyPoolData.proxies) ? proxyPoolData.proxies : [];
+  }
+  function formatProxyBytes(value) {
+    const bytes = Math.max(0, Number(value) || 0);
+    const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'];
+    const index = bytes ? Math.max(0, Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)))) : 0;
+    return (bytes / Math.pow(1024, index)).toFixed(index ? 1 : 0) + ' ' + units[index];
+  }
+  function proxyEndpoint(value) {
+    try {
+      const parsed = new URL(value);
+      return parsed.protocol + '//' + parsed.host;
+    } catch (e) {
+      // Do not accidentally expose credentials from an invalid legacy URL.
+      return String(value || '').replace(/\/\/[^/]*@/, '//***@');
+    }
+  }
+  function formatProxyChecked(value) {
+    if (!value || value === '0001-01-01T00:00:00Z') return t('proxyPool.neverChecked');
+    const parsed = typeof value === 'number' ? new Date(value < 1e12 ? value * 1000 : value) : new Date(value);
+    return Number.isNaN(parsed.getTime()) ? t('proxyPool.neverChecked') : parsed.toLocaleString(currentLang === 'zh' ? 'zh-CN' : 'en-US');
+  }
+  function getFilteredProxies() {
+    const keyword = ($('proxyPoolSearch').value || '').trim().toLowerCase();
+    const filter = $('proxyPoolFilter').value;
+    return proxyPoolEntries().filter(proxy => {
+      if (filter === 'enabled' && !proxy.enabled) return false;
+      if (filter === 'disabled' && proxy.enabled) return false;
+      if ((filter === 'healthy' || filter === 'unhealthy') && proxy.health !== filter) return false;
+      if (filter === 'unbound' && Number(proxy.accountCount) > 0) return false;
+      return !keyword || [proxy.name, proxyEndpoint(proxy.url), proxy.exitIP, proxy.country, proxy.region, proxy.city]
+        .some(value => String(value || '').toLowerCase().includes(keyword));
+    });
+  }
+  function setProxyPoolError(id, message) {
+    const element = $(id);
+    element.textContent = message || '';
+    element.classList.toggle('hidden', !message);
+  }
+  function syncProxyPoolSwitches() {
+    const settings = proxyPoolData && proxyPoolData.settings || {};
+    ['proxyPoolEnabled', 'settingsProxyPoolEnabled'].forEach(id => {
+      $(id).checked = settings.enabled === true;
+      $(id).disabled = proxyPoolBusy || !proxyPoolData;
+    });
+    $('proxyPoolBlockWithoutProxy').checked = settings.blockWithoutProxy === true;
+    $('proxyPoolBlockWithoutProxy').disabled = proxyPoolBusy || !proxyPoolData;
+  }
+  function setProxyPoolBusy(busy) {
+    proxyPoolBusy = busy;
+    qsa('[data-proxy-mutation]').forEach(element => { element.disabled = busy; });
+    syncProxyPoolSwitches();
+  }
+  function acceptProxyPoolData(data) {
+    if (!data || !data.settings || !Array.isArray(data.proxies)) return;
+    proxyPoolData = data;
+    proxyPoolUpdatedAt = new Date();
+    const existing = new Set(data.proxies.map(proxy => String(proxy.id)));
+    selectedProxies.forEach(id => { if (!existing.has(id)) selectedProxies.delete(id); });
+    renderProxyPool();
+  }
+  function renderProxyPoolSelection() {
+    const rows = getFilteredProxies();
+    const selectedVisible = rows.filter(proxy => selectedProxies.has(String(proxy.id))).length;
+    $('proxyPoolSelectAll').checked = rows.length > 0 && rows.length === selectedVisible;
+    $('proxyPoolSelectAll').indeterminate = selectedVisible > 0 && selectedVisible < rows.length;
+    $('proxyPoolSelectAll').disabled = rows.length === 0;
+    $('proxyPoolSelectionCount').textContent = selectedProxies.size ? t('proxyPool.selected', selectedProxies.size) : '';
+    $('proxyPoolBatchActions').classList.toggle('hidden', selectedProxies.size === 0);
+    qsa('[data-proxy-select]', $('proxyPoolList')).forEach(element => {
+      element.checked = selectedProxies.has(element.dataset.proxySelect);
+      const row = element.closest('tr');
+      if (row) row.classList.toggle('is-selected', element.checked);
+    });
+  }
+  function renderProxyPool() {
+    if (!$('proxyPoolList')) return;
+    syncProxyPoolSwitches();
+    const entries = proxyPoolEntries();
+    const stats = [
+      ['proxyPool.totalProxies', entries.length],
+      ['proxyPool.readyProxies', entries.filter(proxy => proxy.enabled && proxy.health === 'healthy').length],
+      ['proxyPool.boundAccounts', entries.reduce((sum, proxy) => sum + (Number(proxy.accountCount) || 0), 0)],
+      ['proxyPool.concurrency', entries.reduce((sum, proxy) => sum + (Number(proxy.currentConcurrency) || 0), 0)],
+      ['proxyPool.currentTraffic', formatProxyBytes(entries.reduce((sum, proxy) => sum + (Number(proxy.currentBytesPerSecond) || 0), 0)) + '/s']
+    ];
+    $('proxyPoolSummary').innerHTML = stats.map(([label, value]) => '<div class="proxy-pool-stat"><span>' + escapeHtml(t(label)) + '</span><strong>' + escapeHtml(value) + '</strong></div>').join('');
+    const inspection = proxyPoolData && proxyPoolData.inspection || {};
+    const progress = $('proxyPoolProgress');
+    progress.classList.toggle('hidden', !inspection.running);
+    progress.max = Math.max(1, Number(inspection.total) || 1);
+    progress.value = Math.max(0, Number(inspection.completed) || 0);
+    const inspectionText = inspection.running
+      ? t('proxyPool.inspecting', inspection.completed || 0, inspection.total || 0)
+      : t('proxyPool.inspectionIdle', proxyPoolData && proxyPoolData.settings.checkIntervalSeconds || 60, proxyPoolData && proxyPoolData.settings.checkConcurrency || 16);
+    if ($('proxyPoolInspection').textContent !== inspectionText) $('proxyPoolInspection').textContent = inspectionText;
+    $('proxyPoolUpdated').textContent = proxyPoolUpdatedAt ? t('proxyPool.updated', proxyPoolUpdatedAt.toLocaleTimeString(currentLang === 'zh' ? 'zh-CN' : 'en-US')) : '';
+    const focused = document.activeElement;
+    const listHadFocus = $('proxyPoolList').contains(focused);
+    const focusedAction = focused && focused.dataset && focused.dataset.proxyAction;
+    const focusedId = focused && focused.dataset && (focused.dataset.proxyId || focused.dataset.proxySelect);
+    const rows = getFilteredProxies();
+    const list = $('proxyPoolList');
+    if (!rows.length) {
+      list.innerHTML = '<div class="empty-state"><i class="fa-solid fa-network-wired" aria-hidden="true"></i><p>' + escapeHtml(t(!proxyPoolData ? 'proxyPool.loading' : entries.length ? 'proxyPool.noMatches' : 'proxyPool.empty')) + '</p></div>';
+    } else {
+      const columns = ['proxyPool.proxy', 'proxyPool.status', 'proxyPool.exitIP', 'proxyPool.location', 'proxyPool.accountCount', 'proxyPool.concurrency', 'proxyPool.currentTraffic', 'proxyPool.totalTraffic', 'proxyPool.lastChecked', 'proxyPool.actions'];
+      list.innerHTML = '<table class="proxy-pool-table"><caption class="sr-only">' + escapeHtml(t('proxyPool.title')) + '</caption><thead><tr><th scope="col"><span class="sr-only">' + escapeHtml(t('proxyPool.select')) + '</span></th>' + columns.map(key => '<th scope="col">' + escapeHtml(t(key)) + '</th>').join('') + '</tr></thead><tbody>' + rows.map(proxy => {
+        const id = escapeAttr(proxy.id);
+        const name = proxy.name || proxyEndpoint(proxy.url);
+        const health = ['healthy', 'unhealthy'].includes(proxy.health) ? proxy.health : 'unknown';
+        const td = (label, body, cls) => '<td data-label="' + escapeAttr(t(label)) + '"' + (cls ? ' class="' + cls + '"' : '') + '>' + body + '</td>';
+        const action = (value, label, cls) => '<button class="btn btn-xs ' + (cls || 'btn-outline') + '" type="button" data-proxy-action="' + value + '" data-proxy-id="' + id + '" data-proxy-mutation' + (proxyPoolBusy ? ' disabled' : '') + '>' + escapeHtml(t(label)) + '</button>';
+        return '<tr' + (selectedProxies.has(String(proxy.id)) ? ' class="is-selected"' : '') + '><td class="proxy-pool-checkbox"><input type="checkbox" data-proxy-select="' + id + '"' + (selectedProxies.has(String(proxy.id)) ? ' checked' : '') + ' aria-label="' + escapeAttr(t('proxyPool.selectProxy', name)) + '" /></td>' +
+          td('proxyPool.proxy', '<strong>' + escapeHtml(name) + '</strong><code>' + escapeHtml(proxyEndpoint(proxy.url)) + '</code>', 'proxy-pool-endpoint') +
+          td('proxyPool.status', '<span class="badge ' + (proxy.enabled ? 'badge-info' : 'badge-warning') + '">' + escapeHtml(t(proxy.enabled ? 'proxyPool.enabledFilter' : 'proxyPool.disabledFilter')) + '</span><span class="badge ' + (health === 'healthy' ? 'badge-success' : health === 'unhealthy' ? 'badge-error' : 'badge-warning') + '">' + escapeHtml(t('proxyPool.' + health)) + '</span>') +
+          td('proxyPool.exitIP', escapeHtml(proxy.exitIP || '—'), 'proxy-pool-number') +
+          td('proxyPool.location', escapeHtml(Array.from(new Set([proxy.country, proxy.region, proxy.city].filter(Boolean))).join(' · ') || '—'), 'proxy-pool-location') +
+          td('proxyPool.accountCount', Math.max(0, Number(proxy.accountCount) || 0), 'proxy-pool-number') +
+          td('proxyPool.concurrency', Math.max(0, Number(proxy.currentConcurrency) || 0), 'proxy-pool-number') +
+          td('proxyPool.currentTraffic', escapeHtml(formatProxyBytes(proxy.currentBytesPerSecond)) + '/s', 'proxy-pool-number') +
+          td('proxyPool.totalTraffic', escapeHtml(formatProxyBytes(proxy.totalBytes)), 'proxy-pool-number') +
+          td('proxyPool.lastChecked', '<time>' + escapeHtml(formatProxyChecked(proxy.lastChecked)) + '</time>' + (Number(proxy.latencyMS) > 0 ? '<span class="proxy-pool-hint">' + escapeHtml(proxy.latencyMS) + ' ms</span>' : '') + (proxy.lastError ? '<span class="proxy-pool-row-error">' + escapeHtml(proxy.lastError) + '</span>' : ''), 'proxy-pool-checked') +
+          td('proxyPool.actions', '<div class="proxy-pool-row-actions">' + action('check', 'proxyPool.check') + action('edit', 'proxyPool.edit') + action(proxy.enabled ? 'disable' : 'enable', proxy.enabled ? 'proxyPool.disable' : 'proxyPool.enable') + action('delete', 'proxyPool.delete', 'btn-danger') + '</div>', 'proxy-pool-actions') + '</tr>';
+      }).join('') + '</tbody></table>';
+    }
+    renderProxyPoolSelection();
+    if (focusedId && listHadFocus) {
+      const replacement = qsa('[data-proxy-action], [data-proxy-select]', list).find(element => focusedAction
+        ? element.dataset.proxyAction === focusedAction && element.dataset.proxyId === focusedId
+        : element.dataset.proxySelect === focusedId);
+      if (replacement) replacement.focus({ preventScroll: true });
+    }
+  }
+  function shouldRefreshProxyPool() {
+    return document.visibilityState === 'visible' && !$('mainPage').classList.contains('hidden') &&
+      (!$('tabProxyPool').classList.contains('hidden') || !$('tabSettings').classList.contains('hidden'));
+  }
+  function scheduleProxyPoolRefresh(immediate) {
+    if (proxyPoolTimer) clearTimeout(proxyPoolTimer);
+    proxyPoolTimer = null;
+    if (!shouldRefreshProxyPool()) return;
+    const delay = immediate ? 0 : proxyPoolData && proxyPoolData.inspection && proxyPoolData.inspection.running ? 2000 : 5000;
+    proxyPoolTimer = setTimeout(async () => {
+      proxyPoolTimer = null;
+      await loadProxyPool(true);
+      scheduleProxyPoolRefresh(false);
+    }, delay);
+  }
+  async function loadProxyPool(quiet) {
+    if (proxyPoolPending || proxyPoolBusy) return;
+    proxyPoolPending = true;
+    const sequence = ++proxyPoolLoadSequence;
+    if (!quiet) $('proxyPoolList').setAttribute('aria-busy', 'true');
+    try {
+      const response = await api('/proxy-pool');
+      const data = await response.json();
+      if (!response.ok || !data.settings || !Array.isArray(data.proxies)) throw new Error(data.error || t('proxyPool.loadFailed'));
+      if (sequence !== proxyPoolLoadSequence || proxyPoolBusy) return;
+      acceptProxyPoolData(data);
+      setProxyPoolError('proxyPoolError', '');
+    } catch (error) {
+      if (sequence === proxyPoolLoadSequence && !proxyPoolBusy) setProxyPoolError('proxyPoolError', t('proxyPool.loadFailed') + ': ' + (error.message || error));
+    } finally {
+      proxyPoolPending = false;
+      $('proxyPoolList').setAttribute('aria-busy', 'false');
+    }
+  }
+  async function mutateProxyPool(path, body) {
+    ++proxyPoolLoadSequence; // A prior poll must not overwrite a just-saved switch.
+    const response = await api('/proxy-pool' + path, { method: 'POST', body: JSON.stringify(body) });
+    const data = await response.json();
+    if (!response.ok || data.success === false) throw new Error(data.error || t('common.saveFailed'));
+    acceptProxyPoolData(data);
+    return data;
+  }
+  async function saveProxyPoolSettings(patch) {
+    if (proxyPoolBusy) return;
+    setProxyPoolBusy(true);
+    // Show both copies of the single switch in the same pending state.
+    if (typeof patch.enabled === 'boolean') ['proxyPoolEnabled', 'settingsProxyPoolEnabled'].forEach(id => { $(id).checked = patch.enabled; });
+    if (typeof patch.blockWithoutProxy === 'boolean') $('proxyPoolBlockWithoutProxy').checked = patch.blockWithoutProxy;
+    try {
+      await mutateProxyPool('/settings', patch);
+      setProxyPoolError('proxyPoolError', '');
+      toast(t('proxyPool.settingsSaved'), 'success');
+      await loadAccounts();
+    } catch (error) {
+      setProxyPoolError('proxyPoolError', error.message || String(error));
+      toast(error.message || t('common.saveFailed'), 'error');
+    } finally {
+      setProxyPoolBusy(false);
+      scheduleProxyPoolRefresh(false);
+    }
+  }
+  function openProxyPoolImport() {
+    setProxyPoolError('proxyPoolImportError', '');
+    openDialog('proxyPoolImportModal');
+    $('proxyPoolImportText').focus();
+  }
+  async function submitProxyPoolImport(event) {
+    event.preventDefault();
+    if (proxyPoolBusy) return;
+    const text = $('proxyPoolImportText').value.trim();
+    if (!text) { $('proxyPoolImportText').reportValidity(); return; }
+    setProxyPoolBusy(true);
+    setProxyPoolError('proxyPoolImportError', '');
+    try {
+      const data = await mutateProxyPool('/import', { text, defaultScheme: $('proxyPoolImportScheme').value });
+      const errors = Array.isArray(data.errors) ? data.errors : [];
+      toast(t('proxyPool.imported', data.imported || 0, data.duplicates || 0, errors.length), errors.length ? 'warning' : 'success');
+      if (errors.length) {
+        setProxyPoolError('proxyPoolImportError', errors.map(error => t('proxyPool.importLineError', error.line, error.error)).join('\n'));
+      } else {
+        $('proxyPoolImportText').value = '';
+        closeDialog('proxyPoolImportModal');
+      }
+      await loadAccounts();
+    } catch (error) {
+      setProxyPoolError('proxyPoolImportError', error.message || String(error));
+    } finally {
+      setProxyPoolBusy(false);
+      scheduleProxyPoolRefresh(false);
+    }
+  }
+  function openProxyPoolEdit(ids) {
+    proxyPoolEditingIds = ids.slice();
+    const proxy = ids.length === 1 ? proxyPoolEntries().find(item => String(item.id) === ids[0]) : null;
+    $('proxyPoolEditName').value = proxy ? proxy.name || '' : '';
+    $('proxyPoolEditURL').value = proxy ? proxy.url || '' : '';
+    ['proxyPoolEditUsername', 'proxyPoolEditPassword', 'proxyPoolEditScheme'].forEach(id => { $(id).value = ''; });
+    $('proxyPoolEditHint').textContent = t('proxyPool.editHint', ids.length);
+    setProxyPoolError('proxyPoolEditError', '');
+    refreshCustomSelects();
+    openDialog('proxyPoolEditModal');
+    $('proxyPoolEditName').focus();
+  }
+  async function submitProxyPoolEdit(event) {
+    event.preventDefault();
+    if (proxyPoolBusy) return;
+    const patch = {};
+    [['name', 'proxyPoolEditName'], ['url', 'proxyPoolEditURL'], ['username', 'proxyPoolEditUsername'], ['password', 'proxyPoolEditPassword'], ['scheme', 'proxyPoolEditScheme']].forEach(([key, id]) => {
+      const value = key === 'password' ? $(id).value : $(id).value.trim();
+      if (value) patch[key] = value;
+    });
+    if (!Object.keys(patch).length) { setProxyPoolError('proxyPoolEditError', t('proxyPool.noEdit')); return; }
+    if (patch.url) {
+      try {
+        const parsed = new URL(patch.url);
+        if (!['http:', 'socks5:'].includes(parsed.protocol) || !parsed.hostname) throw new Error('format');
+      } catch (error) {
+        setProxyPoolError('proxyPoolEditError', t('proxyPool.invalidURL'));
+        $('proxyPoolEditURL').focus();
+        return;
+      }
+    }
+    setProxyPoolBusy(true);
+    setProxyPoolError('proxyPoolEditError', '');
+    try {
+      await mutateProxyPool('/batch', { action: 'edit', ids: proxyPoolEditingIds, patch });
+      closeDialog('proxyPoolEditModal');
+      toast(t('proxyPool.editSaved'), 'success');
+      await loadAccounts();
+    } catch (error) {
+      setProxyPoolError('proxyPoolEditError', error.message || String(error));
+    } finally {
+      setProxyPoolBusy(false);
+      scheduleProxyPoolRefresh(false);
+    }
+  }
+  async function runProxyPoolAction(action, ids) {
+    if (proxyPoolBusy || (action !== 'check' && !ids.length)) return;
+    if (action === 'edit') { openProxyPoolEdit(ids); return; }
+    if (action === 'delete' && !await confirmAction(t('proxyPool.deleteConfirm', ids.length), { variant: 'danger', confirmText: t('proxyPool.delete') })) return;
+    if (proxyPoolBusy) return;
+    setProxyPoolBusy(true);
+    try {
+      await mutateProxyPool(action === 'check' ? '/check' : '/batch', action === 'check' ? { ids } : { action, ids });
+      if (action === 'delete') ids.forEach(id => selectedProxies.delete(id));
+      setProxyPoolError('proxyPoolError', '');
+      renderProxyPoolSelection();
+      toast(t(action === 'check' ? 'proxyPool.checkStarted' : 'proxyPool.actionSaved'), 'success');
+      if (action !== 'check') await loadAccounts();
+    } catch (error) {
+      setProxyPoolError('proxyPoolError', error.message || String(error));
+      toast(error.message || t('common.failed'), 'error');
+    } finally {
+      setProxyPoolBusy(false);
+      await loadProxyPool(true);
+      scheduleProxyPoolRefresh(false);
+    }
+  }
+  function bindProxyPoolEvents() {
+    ['proxyPoolEnabled', 'settingsProxyPoolEnabled'].forEach(id => $(id).addEventListener('change', event => saveProxyPoolSettings({ enabled: event.target.checked })));
+    $('proxyPoolBlockWithoutProxy').addEventListener('change', event => saveProxyPoolSettings({ blockWithoutProxy: event.target.checked }));
+    $('settingsOpenProxyPoolBtn').addEventListener('click', () => switchTab('proxyPool'));
+    $('proxyPoolRefreshBtn').addEventListener('click', () => loadProxyPool());
+    $('proxyPoolCheckAllBtn').addEventListener('click', () => runProxyPoolAction('check', []));
+    $('proxyPoolImportBtn').addEventListener('click', openProxyPoolImport);
+    $('proxyPoolImportForm').addEventListener('submit', submitProxyPoolImport);
+    $('proxyPoolEditForm').addEventListener('submit', submitProxyPoolEdit);
+    ['Import', 'Edit'].forEach(kind => {
+      const close = () => { if (!proxyPoolBusy) closeDialog('proxyPool' + kind + 'Modal'); };
+      $('proxyPool' + kind + 'Close').addEventListener('click', close);
+      $('proxyPool' + kind + 'Cancel').addEventListener('click', close);
+      bindDialogBackdropClose('proxyPool' + kind + 'Modal', close);
+      $('proxyPool' + kind + 'Modal').addEventListener('keydown', event => { if (event.key === 'Escape') { event.preventDefault(); close(); } });
+    });
+    $('proxyPoolSearch').addEventListener('input', renderProxyPool);
+    $('proxyPoolFilter').addEventListener('change', renderProxyPool);
+    $('proxyPoolSelectAll').addEventListener('change', event => {
+      getFilteredProxies().forEach(proxy => { if (event.target.checked) selectedProxies.add(String(proxy.id)); else selectedProxies.delete(String(proxy.id)); });
+      renderProxyPoolSelection();
+    });
+    $('proxyPoolList').addEventListener('change', event => {
+      const id = event.target.dataset.proxySelect;
+      if (!id) return;
+      if (event.target.checked) selectedProxies.add(id); else selectedProxies.delete(id);
+      renderProxyPoolSelection();
+    });
+    $('proxyPoolList').addEventListener('click', event => {
+      const button = event.target.closest('[data-proxy-action]');
+      if (button) runProxyPoolAction(button.dataset.proxyAction, [button.dataset.proxyId]);
+    });
+    qsa('[data-proxy-batch]').forEach(button => button.addEventListener('click', () => runProxyPoolAction(button.dataset.proxyBatch, Array.from(selectedProxies))));
+    window.addEventListener('focus', () => scheduleProxyPoolRefresh(true));
+    renderProxyPool();
   }
 
   // Account list
@@ -1566,15 +1916,12 @@
     const list = Array.isArray(models) ? models : [];
     return list.map(item => (item && item.model ? item.model : '') + '@' + (item && item.until ? item.until : 0)).join('|');
   }
-  function renderAccountS2AP(a) {
-    if (!a.s2apEnabled) {
-      return '<div class="account-s2ap"><span>' + escapeHtml(t('accounts.s2apExit')) + '</span><strong>' + escapeHtml(t('accounts.s2apOff')) + '</strong></div>';
-    }
-    if (!a.s2apLeaseUntil) {
-      return '<div class="account-s2ap"><span>' + escapeHtml(t('accounts.s2apExit')) + '</span><strong>' + escapeHtml(t('accounts.s2apUnbound')) + '</strong></div>';
-    }
-    return '<div class="account-s2ap"><span>' + escapeHtml(t('accounts.s2apExit')) + '</span><strong class="account-s2ap-ip">' + escapeHtml(a.s2apExitIP || '-') + '</strong>' +
-      '<span>' + escapeHtml(t('accounts.s2apRemaining')) + '</span><strong>' + escapeHtml(formatTokenExpiry(a.s2apLeaseUntil)) + '</strong></div>';
+  function renderAccountProxy(a) {
+    if (!a.proxyPoolEnabled) return '';
+    const label = a.proxyBlocked ? t('proxyPool.accountBlocked') : a.proxyId
+      ? (a.proxyName || t('proxyPool.bound')) + (a.proxyExitIP ? ' · ' + a.proxyExitIP : '')
+      : t('proxyPool.accountUnbound');
+    return '<div class="account-proxy' + (a.proxyBlocked ? ' account-proxy-blocked' : '') + '"><span>' + escapeHtml(t('proxyPool.accountProxy')) + '</span><strong>' + escapeHtml(label) + '</strong></div>';
   }
   function renderAccounts() {
     const container = $('accountsList');
@@ -1644,7 +1991,7 @@
           '<div class="usage-bar"><div class="usage-fill ' + trialClass + '" data-usage-pct="' + escapeAttr(trialPct) + '"></div></div>' +
           '<div class="usage-text"><span>' + (a.trialUsageCurrent != null ? a.trialUsageCurrent.toFixed(1) : 0) + ' / ' + (a.trialUsageLimit != null ? a.trialUsageLimit.toFixed(0) : 0) + '</span><span>' + trialPct.toFixed(1) + '%</span></div>' +
           '</div>' : '') +
-        renderAccountS2AP(a) +
+        '<div class="account-proxy-slot" data-account-id="' + idAttr + '">' + renderAccountProxy(a) + '</div>' +
         '<div class="account-stats">' +
         '<div class="account-stat"><div class="account-stat-value">' + (a.requestCount || 0) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.requests')) + '</div></div>' +
         '<div class="account-stat"><div class="account-stat-value">' + formatNum(a.totalTokens || 0) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.tokens')) + '</div></div>' +
@@ -1883,9 +2230,9 @@
       '</div>' +
 
       '<div class="detail-section"><h4>' + escapeHtml(t('detail.proxyURL')) + '</h4><div class="machine-id-row">' +
-      '<input type="text" id="proxyURLInput" value="' + escapeAttr(a.proxyURL || '') + '" placeholder="socks5://host:port" />' +
-      '<button class="btn btn-sm btn-primary" data-detail-action="saveProxyURL" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
-      '</div><p class="help-block">' + escapeHtml(t('detail.proxyHint')) + '</p></div>' +
+      '<input type="text" id="proxyURLInput" value="' + escapeAttr(a.proxyURL || '') + '" placeholder="socks5://host:port"' + (a.proxyPoolEnabled ? ' disabled' : '') + ' />' +
+      '<button class="btn btn-sm btn-primary" data-detail-action="saveProxyURL" data-id="' + idAttr + '" type="button"' + (a.proxyPoolEnabled ? ' disabled' : '') + '>' + escapeHtml(t('detail.save')) + '</button>' +
+      '</div><p class="help-block">' + escapeHtml(t(a.proxyPoolEnabled ? 'proxyPool.individualOverrideHint' : 'detail.proxyHint')) + '</p>' + renderAccountProxy(a) + '</div>' +
 
       '<div class="detail-section"><h4>' + escapeHtml(t('detail.subscription')) + '</h4><div class="detail-grid">' +
       detailItem(t('detail.subscriptionType'), a.subscriptionTitle || (a.subscriptionType ? formatSubscriptionLabel(a.subscriptionType) : '-')) +
@@ -2275,7 +2622,7 @@
     $('functionMinTokens').value = String(functionCache.minTokens ?? 0);
     $('functionFingerprintChars').value = String(functionCache.inputFingerprintChars ?? 0);
     onCacheModeChange();
-    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadEmptyOutputCooldown(), loadOpus55Fallback(), loadS2APBind(), loadProxyConfig(), loadPromptFilter(), loadPromptCachePolicies()]);
+    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadEmptyOutputCooldown(), loadOpus55Fallback(), loadProxyPool(), loadProxyConfig(), loadPromptFilter(), loadPromptCachePolicies()]);
     await loadApiKeys();
     refreshCustomSelects();
   }
@@ -2357,38 +2704,6 @@
     const d = await res.json();
     if (d.success) toast(t('settings.opus55FallbackSaved'), 'success');
     else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
-  }
-  async function loadS2APBind() {
-    const res = await api('/s2ap-bind');
-    const d = await res.json();
-    $('s2apBindEnabled').checked = d.enabled === true;
-    $('s2apBindHours').value = String(d.hours || 12);
-    const status = $('s2apBindStatus');
-    if (!d.enabled) {
-      status.textContent = t('settings.s2apBindIdle');
-      return;
-    }
-    status.textContent = t('settings.s2apBindActive')
-      .replace('{0}', String(d.available || 0))
-      .replace('{1}', String(d.leases || 0));
-  }
-  async function saveS2APBind() {
-    const hours = Number($('s2apBindHours').value) || 12;
-    const res = await api('/s2ap-bind', {
-      method: 'POST', body: JSON.stringify({
-        enabled: $('s2apBindEnabled').checked,
-        hours
-      })
-    });
-    const d = await res.json();
-    if (d.success) {
-      toast(t('settings.s2apBindSaved'), 'success');
-      if (d.bind) {
-        $('s2apBindEnabled').checked = d.bind.enabled === true;
-        $('s2apBindHours').value = String(d.bind.hours || hours);
-      }
-      setTimeout(loadS2APBind, 1500);
-    } else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
   }
   async function loadProxyConfig() {
     const res = await api('/proxy');
@@ -4279,6 +4594,7 @@
       else requestAnimationFrame(drawTrafficChart);
     }
     if (tab === 'logs') loadLogs();
+    scheduleProxyPoolRefresh(tab === 'proxyPool' || tab === 'settings');
     if (tab === 'accounts') scheduleAccountConcurrencyRefresh(true);
     else stopAccountConcurrencyRefresh();
   }
@@ -4319,6 +4635,7 @@
     document.addEventListener('visibilitychange', () => {
       if (shouldRefreshAccountConcurrency()) scheduleAccountConcurrencyRefresh(true);
       else stopAccountConcurrencyRefresh();
+      scheduleProxyPoolRefresh(true);
     });
 
     $('loginThemeToggle').addEventListener('click', toggleTheme);
@@ -4423,7 +4740,6 @@
     $('saveEndpointBtn').addEventListener('click', saveEndpointConfig);
     $('saveEmptyOutputCooldownBtn').addEventListener('click', saveEmptyOutputCooldown);
     $('saveOpus55FallbackBtn').addEventListener('click', saveOpus55Fallback);
-    $('saveS2APBindBtn').addEventListener('click', saveS2APBind);
     $('changePasswordBtn').addEventListener('click', changePassword);
     $('proxyType').addEventListener('change', onProxyTypeChange);
     $('saveProxyBtn').addEventListener('click', saveProxyConfig);
@@ -4752,6 +5068,7 @@
     bindLoginEvents();
     bindShellEvents();
     bindAccountEvents();
+    bindProxyPoolEvents();
     bindTrafficEvents();
     bindSettingsEvents();
     bindPromptFilterEvents();

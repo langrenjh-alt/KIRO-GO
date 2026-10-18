@@ -2,6 +2,8 @@
 package auth
 
 import (
+	"kiro-go/config"
+	"kiro-go/egress"
 	"net/http"
 	"net/url"
 	"strings"
@@ -59,18 +61,29 @@ func ClientForAccount(accountID, proxyURL, machineID string) *http.Client {
 	authClientMu.RLock()
 	replaced := httpClientStore.Load() != defaultAuthClient
 	authClientMu.RUnlock()
-	if replaced && proxyURL == "" {
+	if replaced && proxyURL == "" && !config.GetProxyPoolSettings().Enabled {
 		return httpClient()
 	}
 	accountID = strings.TrimSpace(accountID)
-	if accountID == "" {
+	if accountID == "" && !config.GetProxyPoolSettings().Enabled {
 		return GetAuthClientForProxy(proxyURL)
 	}
 	key := accountID + "\n" + proxyURL
 	if value, ok := authAccountClients.Load(key); ok {
 		return value.(*http.Client)
 	}
-	client := newAuthHTTPClient(proxyURL, machineID, true)
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: identityTransport{
+			base: egress.New(accountID, proxyURL, func(raw string) http.RoundTripper {
+				base := buildAuthTransport(raw)
+				base.MaxIdleConns = 4
+				base.MaxIdleConnsPerHost = 2
+				return base
+			}),
+			machineID: strings.TrimSpace(machineID),
+		},
+	}
 	actual, loaded := authAccountClients.LoadOrStore(key, client)
 	if loaded {
 		client.CloseIdleConnections()

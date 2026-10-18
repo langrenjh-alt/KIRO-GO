@@ -48,6 +48,7 @@ const requestLogsMaxSize = 500
 
 // Handler HTTP 处理器
 type Handler struct {
+	proxyPool          *proxyPoolController
 	pool               *pool.AccountPool
 	webSearchMCPCaller webSearchMCPCaller
 	kiroCaller         kiroAPICaller
@@ -320,6 +321,7 @@ func NewHandler() *Handler {
 		defer h.backgroundWG.Done()
 		h.backgroundStatsSaver()
 	}()
+	h.startProxyPoolWorker()
 	// 清理过期的 stored responses（>30 天）
 	go purgeExpiredResponses(responsesDefaultTTL)
 	return h
@@ -332,6 +334,9 @@ func (h *Handler) Close() {
 		return
 	}
 	h.closeOnce.Do(func() {
+		if h.proxyPool != nil {
+			h.proxyPool.cancel()
+		}
 		if h.stopRefresh != nil {
 			close(h.stopRefresh)
 		}
@@ -5002,10 +5007,16 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetOpus55EmptyFallback(w, r)
 	case path == "/opus55-empty-fallback" && r.Method == "POST":
 		h.apiUpdateOpus55EmptyFallback(w, r)
-	case path == "/s2ap-bind" && r.Method == "GET":
-		h.apiGetS2APBind(w, r)
-	case path == "/s2ap-bind" && r.Method == "POST":
-		h.apiUpdateS2APBind(w, r)
+	case path == "/proxy-pool" && r.Method == "GET":
+		h.apiGetProxyPool(w, r)
+	case path == "/proxy-pool/settings" && r.Method == "POST":
+		h.apiProxyPoolSettings(w, r)
+	case path == "/proxy-pool/import" && r.Method == "POST":
+		h.apiImportProxies(w, r)
+	case path == "/proxy-pool/check" && r.Method == "POST":
+		h.apiCheckProxies(w, r)
+	case path == "/proxy-pool/batch" && r.Method == "POST":
+		h.apiBatchProxies(w, r)
 	case path == "/proxy" && r.Method == "GET":
 		h.apiGetProxy(w, r)
 	case path == "/proxy" && r.Method == "POST":
@@ -5051,13 +5062,13 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 	accounts := config.GetAccounts()
 	poolAccounts := h.pool.GetAllAccounts()
 	runtimeStates := h.pool.RuntimeStates()
-	s2apEnabled := config.S2APBindEnabled()
-	if s2apEnabled {
-		rebalanceS2APLeases()
+	proxySettings := config.GetProxyPoolSettings()
+	proxyBindings := config.GetProxyBindings()
+	proxies := map[string]config.ProxyEntry{}
+	for _, entry := range config.GetProxies() {
+		proxies[entry.ID] = entry
 	}
-	s2apLeases := config.SnapshotS2APAccountLeases()
 	now := time.Now()
-	nowUnix := now.Unix()
 	emptyModels := h.emptyOutputModelViewsNow(now)
 
 	// 合并运行时统计
@@ -5078,11 +5089,7 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 		if !inPool {
 			runtimeReason = "not_in_runtime_pool"
 		}
-		lease, hasLease := s2apLeases[a.ID]
-		exitIP, leaseUntil := accountS2APLeaseView(lease, hasLease, nowUnix)
-		if exitIP == "" && leaseUntil > 0 {
-			exitIP = s2apExitByProxyID(lease.ProxyID)
-		}
+		boundProxy := proxies[proxyBindings[a.ID]]
 		result[i] = map[string]interface{}{
 			"id":                    a.ID,
 			"email":                 a.Email,
@@ -5112,9 +5119,11 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"currentOverages":       a.CurrentOverages,
 			"overageCheckedAt":      a.OverageCheckedAt,
 			"proxyURL":              a.ProxyURL,
-			"s2apEnabled":           s2apEnabled,
-			"s2apExitIP":            exitIP,
-			"s2apLeaseUntil":        leaseUntil,
+			"proxyPoolEnabled":      proxySettings.Enabled,
+			"proxyId":               boundProxy.ID,
+			"proxyName":             boundProxy.Name,
+			"proxyExitIP":           boundProxy.ExitIP,
+			"proxyBlocked":          proxySettings.Enabled && proxySettings.BlockWithoutProxy && boundProxy.ID == "",
 			"emptyOutputModels":     emptyOutputModelsForAccount(emptyModels, a.ID),
 			"subscriptionType":      a.SubscriptionType,
 			"subscriptionTitle":     a.SubscriptionTitle,
@@ -5509,7 +5518,7 @@ func (h *Handler) apiCompleteIamSso(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 获取用户信息
-	email, _, _ := auth.GetUserInfo(accessToken)
+	email := ""
 
 	// 创建账号
 	account := config.Account{
@@ -5532,6 +5541,7 @@ func (h *Handler) apiCompleteIamSso(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	cacheImportedAccountIdentity(&account)
 	h.pool.Reload()
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
@@ -5599,7 +5609,7 @@ func (h *Handler) apiPollBuilderIdAuth(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 授权完成，获取用户信息
-	email, _, _ := auth.GetUserInfo(accessToken)
+	email := ""
 
 	// 创建账号
 	account := config.Account{
@@ -5623,6 +5633,7 @@ func (h *Handler) apiPollBuilderIdAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	cacheImportedAccountIdentity(&account)
 	h.pool.Reload()
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success":   true,
@@ -5787,6 +5798,24 @@ func (h *Handler) apiPollKiroSso(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// cacheImportedAccountIdentity runs only after persistence, when a pool binding
+// exists. Login/bootstrap exchanges themselves do not yet have an account ID.
+func cacheImportedAccountIdentity(account *config.Account) {
+	email, userID, err := auth.GetUserInfoForAccount(account)
+	if err != nil || (email == "" && userID == "") {
+		return
+	}
+	if email != "" {
+		account.Email = email
+	}
+	if userID != "" {
+		account.UserId = userID
+	}
+	if err := config.UpdateAccount(account.ID, *account); err != nil {
+		logger.Warnf("[Import] cache account identity: %v", err)
+	}
+}
+
 func (h *Handler) apiImportSsoToken(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		BearerToken string `json:"bearerToken"`
@@ -5822,7 +5851,7 @@ func (h *Handler) apiImportSsoToken(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// 获取用户信息
-		email, _, _ := auth.GetUserInfo(accessToken)
+		email := ""
 
 		// 创建账号
 		account := config.Account{
@@ -5843,6 +5872,8 @@ func (h *Handler) apiImportSsoToken(w http.ResponseWriter, r *http.Request) {
 			errors = append(errors, err.Error())
 			continue
 		}
+
+		cacheImportedAccountIdentity(&account)
 
 		imported = append(imported, map[string]interface{}{
 			"id":    account.ID,
@@ -6106,6 +6137,17 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		profileArn  string
 	)
 	email := req.Email
+	poolEnabled := config.GetProxyPoolSettings().Enabled
+	if poolEnabled {
+		// Persist imports before their first network request so even token refresh
+		// resolves the same account binding. An offline import remains refreshable.
+		accessToken = req.AccessToken
+		expiresAt = auth.ExpFromAccessTokenJWT(accessToken)
+		if expiresAt <= 0 {
+			expiresAt = 1
+		}
+		profileArn = req.ProfileArn
+	}
 	if req.AuthMethod == "external_idp" && req.AccessToken != "" {
 		if exp := auth.ExpFromAccessTokenJWT(req.AccessToken); exp > 0 {
 			accessToken = req.AccessToken
@@ -6113,7 +6155,7 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 			profileArn = req.ProfileArn
 		}
 	}
-	if accessToken == "" {
+	if accessToken == "" && !poolEnabled {
 		tempAccount := &config.Account{
 			RefreshToken:  req.RefreshToken,
 			ClientID:      req.ClientID,
@@ -7045,46 +7087,6 @@ func (h *Handler) apiUpdateOpus55EmptyFallback(w http.ResponseWriter, r *http.Re
 		return
 	}
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
-}
-
-func (h *Handler) apiGetS2APBind(w http.ResponseWriter, r *http.Request) {
-	settings := config.GetS2APBindSettings()
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"enabled":   settings.Enabled,
-		"hours":     settings.Hours,
-		"leases":    settings.Leases,
-		"available": s2apAvailableCount(),
-	})
-}
-
-func (h *Handler) apiUpdateS2APBind(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Enabled bool `json:"enabled"`
-		Hours   int  `json:"hours"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
-		return
-	}
-	if req.Hours <= 0 {
-		req.Hours = 12
-	}
-	if req.Hours > 24*14 {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "hours must be between 1 and 336"})
-		return
-	}
-	settings, err := config.UpdateS2APBind(req.Enabled, req.Hours)
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-		return
-	}
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-		"bind":    settings,
-	})
 }
 
 // applyProxyConfig 将代理配置应用到所有出站 HTTP 客户端（Kiro API + auth 模块）

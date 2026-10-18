@@ -261,13 +261,10 @@ type Config struct {
 	// stay on opus 5.5.
 	Opus55EmptyMapToOpus5 *bool `json:"opus55EmptyMapToOpus5,omitempty"`
 
-	// S2APBindEnabled assigns each account an available s2ap proxy. Exits are
-	// shared only after every exit already has an account. Nil means disabled.
-	S2APBindEnabled *bool `json:"s2apBindEnabled,omitempty"`
-	// S2APBindHours is how long an account keeps its chosen proxy. Zero means 12 hours.
-	S2APBindHours int `json:"s2apBindHours,omitempty"`
-	// S2APAccountLeases remembers which s2ap proxy each account is holding.
-	S2APAccountLeases map[string]S2APAccountLease `json:"s2apAccountLeases,omitempty"`
+	// Proxy pool storage is independent of other services and applies to every account tier.
+	ProxyPoolSettings    ProxyPoolSettings `json:"proxyPoolSettings"`
+	Proxies              []ProxyEntry      `json:"proxies,omitempty"`
+	AccountProxyBindings map[string]string `json:"accountProxyBindings,omitempty"`
 
 	// AllowOverUsage allows accounts to continue serving requests even when their
 	// usage quota has been exhausted. When enabled, the pool will not skip accounts
@@ -383,7 +380,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.1.2"
+const Version = "1.1.3"
 
 const (
 	autoQuarantineSuspicious429Reason = "auto-quarantine: suspicious 429 pattern"
@@ -506,11 +503,12 @@ func loadLocked(preserveApiKeyUsage bool) error {
 			// Create default configuration.
 			// Binds to 0.0.0.0 by default for Docker/container compatibility.
 			cfg = &Config{
-				Password:      "changeme",
-				Port:          8080,
-				Host:          "0.0.0.0",
-				RequireApiKey: false,
-				Accounts:      []Account{},
+				Password:          "changeme",
+				Port:              8080,
+				Host:              "0.0.0.0",
+				RequireApiKey:     false,
+				Accounts:          []Account{},
+				ProxyPoolSettings: defaultProxyPoolSettings(),
 			}
 			rebuildApiKeyUsageStatesLocked(preserveApiKeyUsage)
 			return saveLocked()
@@ -527,6 +525,9 @@ func loadLocked(preserveApiKeyUsage bool) error {
 	}
 	cfg = &c
 	dirty := false
+	if normalizeLoadedProxyPoolLocked(data) {
+		dirty = true
+	}
 
 	// Migration: if a legacy single ApiKey is present and the new ApiKeys list is empty,
 	// promote it into the new structure. The migrated entry inherits the legacy
@@ -828,7 +829,7 @@ func GetEnabledAccounts() []Account {
 	applyAutoRestoreLocked()
 	var accounts []Account
 	for _, a := range cfg.Accounts {
-		if a.Enabled {
+		if proxyAccountActive(a) {
 			accounts = append(accounts, a)
 		}
 	}
@@ -849,8 +850,10 @@ func AddAccount(account Account) error {
 			}
 		}
 	}
+	previousAccounts := append([]Account(nil), cfg.Accounts...)
+	previousPool := snapshotProxyPoolLocked()
 	cfg.Accounts = append(cfg.Accounts, account)
-	return Save()
+	return saveAccountMutationLocked(previousAccounts, previousPool)
 }
 
 func UpdateAccount(id string, account Account) error {
@@ -858,8 +861,11 @@ func UpdateAccount(id string, account Account) error {
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
+			previousAccounts := append([]Account(nil), cfg.Accounts...)
+			previousPool := snapshotProxyPoolLocked()
+			account.ID = id
 			cfg.Accounts[i] = account
-			return Save()
+			return saveAccountMutationLocked(previousAccounts, previousPool)
 		}
 	}
 	return nil
@@ -898,6 +904,8 @@ func SetAccountEnabled(id string, enabled bool) error {
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
+			previousAccounts := append([]Account(nil), cfg.Accounts...)
+			previousPool := snapshotProxyPoolLocked()
 			cfg.Accounts[i].Enabled = enabled
 			if enabled {
 				cfg.Accounts[i].BanStatus = "ACTIVE"
@@ -907,7 +915,7 @@ func SetAccountEnabled(id string, enabled bool) error {
 				cfg.Accounts[i].BanStatus = "DISABLED"
 				cfg.Accounts[i].BanTime = time.Now().Unix()
 			}
-			return Save()
+			return saveAccountMutationLocked(previousAccounts, previousPool)
 		}
 	}
 	return nil
@@ -920,13 +928,16 @@ func SetAccountBanStatus(id, status, reason string) error {
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
+			previousAccounts := append([]Account(nil), cfg.Accounts...)
+			previousPool := snapshotProxyPoolLocked()
+			status = strings.ToUpper(strings.TrimSpace(status))
 			cfg.Accounts[i].BanStatus = status
 			cfg.Accounts[i].BanReason = reason
 			cfg.Accounts[i].BanTime = time.Now().Unix()
-			if status == "BANNED" || status == "DISABLED" {
+			if status == "BANNED" || status == "DISABLED" || status == "SUSPENDED" {
 				cfg.Accounts[i].Enabled = false
 			}
-			return Save()
+			return saveAccountMutationLocked(previousAccounts, previousPool)
 		}
 	}
 	return nil
@@ -952,9 +963,15 @@ func applyAutoRestoreLocked() bool {
 		return false
 	}
 	now := time.Now()
+	var previousAccounts []Account
+	var previousPool proxyPoolSnapshot
 	changed := false
 	for i := range cfg.Accounts {
 		if shouldAutoRestoreSuspendedAccount(cfg.Accounts[i], now) {
+			if !changed {
+				previousAccounts = append([]Account(nil), cfg.Accounts...)
+				previousPool = snapshotProxyPoolLocked()
+			}
 			cfg.Accounts[i].Enabled = true
 			cfg.Accounts[i].BanStatus = "ACTIVE"
 			cfg.Accounts[i].BanReason = ""
@@ -963,7 +980,9 @@ func applyAutoRestoreLocked() bool {
 		}
 	}
 	if changed {
-		_ = Save()
+		if saveAccountMutationLocked(previousAccounts, previousPool) != nil {
+			return false
+		}
 	}
 	return changed
 }
@@ -982,6 +1001,8 @@ func applyAutoRestoreLocked() bool {
 func AddAccounts(accounts []Account) (added int, skipped int, err error) {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
+	previousAccounts := append([]Account(nil), cfg.Accounts...)
+	previousPool := snapshotProxyPoolLocked()
 
 	// Seed the seen-set with refresh tokens already persisted so the batch
 	// dedups against existing accounts, not just within itself.
@@ -1009,10 +1030,7 @@ func AddAccounts(accounts []Account) (added int, skipped int, err error) {
 	if added == 0 {
 		return 0, skipped, nil
 	}
-	if err := Save(); err != nil {
-		// Roll back the in-memory appends so a failed persist does not leave
-		// the running pool out of sync with what is on disk.
-		cfg.Accounts = cfg.Accounts[:len(cfg.Accounts)-added]
+	if err := saveAccountMutationLocked(previousAccounts, previousPool); err != nil {
 		return 0, skipped, err
 	}
 	return added, skipped, nil
@@ -1060,11 +1078,13 @@ func SuspendAccountTemporarily(id, reason string) error {
 	now := time.Now().Unix()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
+			previousAccounts := append([]Account(nil), cfg.Accounts...)
+			previousPool := snapshotProxyPoolLocked()
 			cfg.Accounts[i].Enabled = false
 			cfg.Accounts[i].BanStatus = "SUSPENDED"
 			cfg.Accounts[i].BanReason = reason
 			cfg.Accounts[i].BanTime = now
-			return Save()
+			return saveAccountMutationLocked(previousAccounts, previousPool)
 		}
 	}
 	return nil
@@ -1112,8 +1132,10 @@ func DeleteAccount(id string) error {
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
+			previousAccounts := append([]Account(nil), cfg.Accounts...)
+			previousPool := snapshotProxyPoolLocked()
 			cfg.Accounts = append(cfg.Accounts[:i], cfg.Accounts[i+1:]...)
-			return Save()
+			return saveAccountMutationLocked(previousAccounts, previousPool)
 		}
 	}
 	return nil
@@ -1543,118 +1565,6 @@ func UpdateEmptyOutputCooldown(enabled bool, minutes int) error {
 	defer cfgLock.Unlock()
 	cfg.EmptyOutputCooldownEnabled = &enabled
 	cfg.EmptyOutputCooldownMinutes = minutes
-	return saveLocked()
-}
-
-// S2APAccountLease is one account's hold on a single s2ap proxy.
-type S2APAccountLease struct {
-	ProxyID string `json:"proxyId"`
-	Until   int64  `json:"until"`
-	ExitIP  string `json:"exitIP,omitempty"`
-}
-
-// S2APBindSettings is the admin view of per-account s2ap assignments.
-type S2APBindSettings struct {
-	Enabled bool `json:"enabled"`
-	Hours   int  `json:"hours"`
-	Leases  int  `json:"leases"`
-}
-
-// S2APBindEnabled reports whether each account should draw an s2ap proxy.
-func S2APBindEnabled() bool {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
-	return cfg != nil && cfg.S2APBindEnabled != nil && *cfg.S2APBindEnabled
-}
-
-// S2APBindHours returns the hold time, or 12.
-func S2APBindHours() int {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
-	if cfg == nil || cfg.S2APBindHours <= 0 {
-		return 12
-	}
-	return cfg.S2APBindHours
-}
-
-// GetS2APBindSettings returns the switch without assigning proxies.
-func GetS2APBindSettings() S2APBindSettings {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
-	return s2apBindSettingsLocked(time.Now())
-}
-
-func s2apBindSettingsLocked(now time.Time) S2APBindSettings {
-	out := S2APBindSettings{Hours: 12}
-	if cfg == nil {
-		return out
-	}
-	if cfg.S2APBindHours > 0 {
-		out.Hours = cfg.S2APBindHours
-	}
-	if cfg.S2APBindEnabled != nil {
-		out.Enabled = *cfg.S2APBindEnabled
-	}
-	for _, lease := range cfg.S2APAccountLeases {
-		if lease.Until > now.Unix() && lease.ProxyID != "" {
-			out.Leases++
-		}
-	}
-	return out
-}
-
-// UpdateS2APBind stores the switch and duration. Existing account holds stay
-// until they expire.
-func UpdateS2APBind(enabled bool, hours int) (S2APBindSettings, error) {
-	if hours <= 0 {
-		hours = 12
-	}
-	cfgLock.Lock()
-	defer cfgLock.Unlock()
-	cfg.S2APBindEnabled = &enabled
-	cfg.S2APBindHours = hours
-	if err := saveLocked(); err != nil {
-		return S2APBindSettings{}, err
-	}
-	return s2apBindSettingsLocked(time.Now()), nil
-}
-
-// SnapshotS2APAccountLeases copies the current holds for the admin list.
-func SnapshotS2APAccountLeases() map[string]S2APAccountLease {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
-	if cfg == nil || len(cfg.S2APAccountLeases) == 0 {
-		return map[string]S2APAccountLease{}
-	}
-	out := make(map[string]S2APAccountLease, len(cfg.S2APAccountLeases))
-	for id, lease := range cfg.S2APAccountLeases {
-		out[id] = lease
-	}
-	return out
-}
-
-// GetS2APAccountLease returns the saved hold for an account.
-func GetS2APAccountLease(accountID string) (S2APAccountLease, bool) {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
-	if cfg == nil || cfg.S2APAccountLeases == nil {
-		return S2APAccountLease{}, false
-	}
-	lease, ok := cfg.S2APAccountLeases[accountID]
-	return lease, ok
-}
-
-// PutS2APAccountLease remembers which s2ap proxy an account is using.
-func PutS2APAccountLease(accountID string, lease S2APAccountLease) error {
-	if strings.TrimSpace(accountID) == "" {
-		return fmt.Errorf("account id is empty")
-	}
-	cfgLock.Lock()
-	defer cfgLock.Unlock()
-	if cfg.S2APAccountLeases == nil {
-		cfg.S2APAccountLeases = map[string]S2APAccountLease{}
-	}
-	cfg.S2APAccountLeases[accountID] = lease
 	return saveLocked()
 }
 
