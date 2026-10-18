@@ -20,16 +20,17 @@ var (
 // one or more API keys. The legacy global cache fields remain the fallback for
 // API keys whose PromptCachePolicyID is empty or no longer resolves.
 type PromptCachePolicy struct {
-	ID                    string              `json:"id"`
-	Name                  string              `json:"name"`
-	Revision              uint64              `json:"revision,omitempty"`
-	CacheMode             string              `json:"cacheMode"`
-	FunctionCache         FunctionCacheConfig `json:"functionCache"`
-	PromptCacheMaxRatio   float64             `json:"promptCacheMaxRatio"`
-	PromptCacheMaxEntries int                 `json:"promptCacheMaxEntries"`
-	PromptCacheTTLSeconds int                 `json:"promptCacheTTLSeconds"`
-	CreatedAt             int64               `json:"createdAt"`
-	UpdatedAt             int64               `json:"updatedAt"`
+	ID                    string                `json:"id"`
+	Name                  string                `json:"name"`
+	Revision              uint64                `json:"revision,omitempty"`
+	CacheMode             string                `json:"cacheMode"`
+	FunctionCache         FunctionCacheConfig   `json:"functionCache"`
+	FixedRatioCache       FixedRatioCacheConfig `json:"fixedRatioCache"`
+	PromptCacheMaxRatio   float64               `json:"promptCacheMaxRatio"`
+	PromptCacheMaxEntries int                   `json:"promptCacheMaxEntries"`
+	PromptCacheTTLSeconds int                   `json:"promptCacheTTLSeconds"`
+	CreatedAt             int64                 `json:"createdAt"`
+	UpdatedAt             int64                 `json:"updatedAt"`
 }
 
 // ListPromptCachePolicies returns normalized copies of all named policies.
@@ -240,10 +241,10 @@ func normalizePromptCachePolicyInput(policy PromptCachePolicy) (PromptCachePolic
 	switch mode := strings.TrimSpace(policy.CacheMode); mode {
 	case "":
 		policy.CacheMode = CacheModeNative
-	case CacheModeNative, CacheModeFunctionSimulation:
+	case CacheModeNative, CacheModeFunctionSimulation, CacheModeFixedRatio:
 		policy.CacheMode = mode
 	default:
-		return PromptCachePolicy{}, fmt.Errorf("%w: cacheMode must be native or function_simulation", ErrPromptCachePolicyInvalid)
+		return PromptCachePolicy{}, fmt.Errorf("%w: cacheMode must be native, function_simulation, or fixed_ratio", ErrPromptCachePolicyInvalid)
 	}
 
 	if policy.PromptCacheMaxRatio == 0 {
@@ -265,6 +266,7 @@ func normalizePromptCachePolicyInput(policy PromptCachePolicy) (PromptCachePolic
 		return PromptCachePolicy{}, fmt.Errorf("%w: promptCacheTTLSeconds must be either %d or %d", ErrPromptCachePolicyInvalid, DefaultPromptCacheTTLSeconds, ExtendedPromptCacheTTLSeconds)
 	}
 	policy.FunctionCache = normalizeFunctionCacheConfig(policy.FunctionCache)
+	policy.FixedRatioCache = normalizeFixedRatioCacheConfig(policy.FixedRatioCache)
 	return policy, nil
 }
 
@@ -276,6 +278,7 @@ func normalizeStoredPromptCachePolicy(policy PromptCachePolicy) PromptCachePolic
 	}
 	policy.CacheMode = normalizeCacheMode(policy.CacheMode)
 	policy.FunctionCache = normalizeFunctionCacheConfig(policy.FunctionCache)
+	policy.FixedRatioCache = normalizeFixedRatioCacheConfig(policy.FixedRatioCache)
 	policy.PromptCacheMaxRatio = effectivePromptCacheRatio(policy.PromptCacheMaxRatio)
 	policy.PromptCacheMaxEntries = effectivePromptCacheMaxEntries(policy.PromptCacheMaxEntries)
 	if !IsValidPromptCacheTTLSeconds(policy.PromptCacheTTLSeconds) {
@@ -288,6 +291,7 @@ func globalPromptCachePolicyLocked() PromptCachePolicy {
 	policy := PromptCachePolicy{
 		CacheMode:             CacheModeNative,
 		FunctionCache:         normalizeFunctionCacheConfig(FunctionCacheConfig{}),
+		FixedRatioCache:       normalizeFixedRatioCacheConfig(FixedRatioCacheConfig{}),
 		PromptCacheMaxRatio:   0.85,
 		PromptCacheMaxEntries: defaultPromptCacheMaxEntries,
 		PromptCacheTTLSeconds: DefaultPromptCacheTTLSeconds,
@@ -297,6 +301,7 @@ func globalPromptCachePolicyLocked() PromptCachePolicy {
 	}
 	policy.CacheMode = normalizeCacheMode(cfg.CacheMode)
 	policy.FunctionCache = normalizeFunctionCacheConfig(cfg.FunctionCache)
+	policy.FixedRatioCache = normalizeFixedRatioCacheConfig(cfg.FixedRatioCache)
 	policy.PromptCacheMaxRatio = effectivePromptCacheRatio(cfg.PromptCacheMaxRatio)
 	policy.PromptCacheMaxEntries = effectivePromptCacheMaxEntries(cfg.PromptCacheMaxEntries)
 	if IsValidPromptCacheTTLSeconds(cfg.PromptCacheTTLSeconds) {
@@ -333,5 +338,6 @@ func effectivePromptCacheMaxEntries(entries int) int {
 
 func clonePromptCachePolicy(policy PromptCachePolicy) PromptCachePolicy {
 	policy.FunctionCache = normalizeFunctionCacheConfig(policy.FunctionCache)
+	policy.FixedRatioCache = normalizeFixedRatioCacheConfig(policy.FixedRatioCache)
 	return policy
 }

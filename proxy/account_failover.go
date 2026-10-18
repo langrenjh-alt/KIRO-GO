@@ -20,6 +20,24 @@ import (
 const maxAccountRetryAttempts = 3
 const allAccountsConcurrencyFullMessage = "所有账号并发已满请稍后再试"
 
+func allAccountsModelCoolingMessage(model string) string {
+	return "all accounts are cooling down for model " + strings.TrimSpace(model)
+}
+
+func isAllAccountsModelCoolingError(err error) bool {
+	return err != nil && strings.HasPrefix(err.Error(), "all accounts are cooling down for model ")
+}
+
+func (h *Handler) unavailableAccountError(model string, allFull bool) error {
+	if h != nil && h.pool != nil && h.pool.AllEligibleAccountsModelCooling(model) {
+		return fmt.Errorf("%s", allAccountsModelCoolingMessage(model))
+	}
+	if allFull {
+		return fmt.Errorf("%s", allAccountsConcurrencyFullMessage)
+	}
+	return nil
+}
+
 // UpstreamRateLimitError marks HTTP 429 returned by Kiro/AWS upstream.
 type UpstreamRateLimitError struct {
 	Endpoint   string

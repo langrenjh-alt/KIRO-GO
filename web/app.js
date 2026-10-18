@@ -1390,8 +1390,16 @@
       const latest = await res.json();
       if (!res.ok || !Array.isArray(latest)) return;
       const counts = new Map(latest.map(a => [String(a.id), Math.max(0, Number(a.inFlight) || 0)]));
+      const modelsByID = new Map(latest.map(a => [String(a.id), Array.isArray(a.emptyOutputModels) ? a.emptyOutputModels : []]));
+      const modelTargets = [];
       accountsData.forEach(a => {
-        if (counts.has(String(a.id))) a.inFlight = counts.get(String(a.id));
+        const id = String(a.id);
+        if (counts.has(id)) a.inFlight = counts.get(id);
+        if (!modelsByID.has(id)) return;
+        const next = modelsByID.get(id);
+        if (emptyOutputModelsKey(a.emptyOutputModels) === emptyOutputModelsKey(next)) return;
+        a.emptyOutputModels = next;
+        modelTargets.push(id);
       });
       qsa('.account-concurrency-value', $('accountsList')).forEach(el => {
         const count = counts.get(el.dataset.accountId);
@@ -1399,6 +1407,14 @@
         el.textContent = String(count);
         el.classList.toggle('is-active', count > 0);
       });
+      if (modelTargets.length) {
+        const pending = new Set(modelTargets);
+        qsa('.account-empty-models', $('accountsList')).forEach(el => {
+          if (!pending.has(el.dataset.accountId)) return;
+          const account = accountsData.find(item => String(item.id) === el.dataset.accountId);
+          el.innerHTML = renderEmptyOutputModels(account && account.emptyOutputModels);
+        });
+      }
     } catch (e) {
       // Background status polling is best-effort; foreground actions report errors.
     } finally {
@@ -1534,6 +1550,32 @@
     });
   }
 
+  function renderEmptyOutputModels(models) {
+    const list = Array.isArray(models) ? models : [];
+    return list.map(item => {
+      const model = item && item.model ? String(item.model) : '';
+      if (!model) return '';
+      const until = Number(item.until) || 0;
+      const title = until
+        ? t('accounts.emptyOutputModelTitle').replace('{0}', formatTokenExpiry(until))
+        : t('accounts.emptyOutputModel');
+      return '<span class="badge badge-empty-model" title="' + escapeAttr(title) + '">' + escapeHtml(model) + '</span>';
+    }).join('');
+  }
+  function emptyOutputModelsKey(models) {
+    const list = Array.isArray(models) ? models : [];
+    return list.map(item => (item && item.model ? item.model : '') + '@' + (item && item.until ? item.until : 0)).join('|');
+  }
+  function renderAccountS2AP(a) {
+    if (!a.s2apEnabled) {
+      return '<div class="account-s2ap"><span>' + escapeHtml(t('accounts.s2apExit')) + '</span><strong>' + escapeHtml(t('accounts.s2apOff')) + '</strong></div>';
+    }
+    if (!a.s2apLeaseUntil) {
+      return '<div class="account-s2ap"><span>' + escapeHtml(t('accounts.s2apExit')) + '</span><strong>' + escapeHtml(t('accounts.s2apUnbound')) + '</strong></div>';
+    }
+    return '<div class="account-s2ap"><span>' + escapeHtml(t('accounts.s2apExit')) + '</span><strong class="account-s2ap-ip">' + escapeHtml(a.s2apExitIP || '-') + '</strong>' +
+      '<span>' + escapeHtml(t('accounts.s2apRemaining')) + '</span><strong>' + escapeHtml(formatTokenExpiry(a.s2apLeaseUntil)) + '</strong></div>';
+  }
   function renderAccounts() {
     const container = $('accountsList');
     if (!container) return;
@@ -1574,6 +1616,7 @@
         overageBadge +
         '<span class="badge badge-info">' + escapeHtml(formatAuthMethod(a.provider || a.authMethod)) + '</span>' +
         getStatusBadge(a) +
+        '<span class="account-empty-models" data-account-id="' + idAttr + '">' + renderEmptyOutputModels(a.emptyOutputModels) + '</span>' +
         '</div>' +
         '</div>' +
         '</div>' +
@@ -1601,6 +1644,7 @@
           '<div class="usage-bar"><div class="usage-fill ' + trialClass + '" data-usage-pct="' + escapeAttr(trialPct) + '"></div></div>' +
           '<div class="usage-text"><span>' + (a.trialUsageCurrent != null ? a.trialUsageCurrent.toFixed(1) : 0) + ' / ' + (a.trialUsageLimit != null ? a.trialUsageLimit.toFixed(0) : 0) + '</span><span>' + trialPct.toFixed(1) + '%</span></div>' +
           '</div>' : '') +
+        renderAccountS2AP(a) +
         '<div class="account-stats">' +
         '<div class="account-stat"><div class="account-stat-value">' + (a.requestCount || 0) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.requests')) + '</div></div>' +
         '<div class="account-stat"><div class="account-stat-value">' + formatNum(a.totalTokens || 0) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.tokens')) + '</div></div>' +
@@ -2177,6 +2221,11 @@
       : '131072';
     const promptCacheTTLSeconds = Number(d.promptCacheTTLSeconds);
     $('promptCacheTTLSeconds').value = promptCacheTTLSeconds === 3600 ? '3600' : '300';
+    const tokenBillingInflationPercent = Number(d.tokenBillingInflationPercent);
+    $('tokenBillingInflationPercent').value = Number.isFinite(tokenBillingInflationPercent) && tokenBillingInflationPercent >= 0 && tokenBillingInflationPercent <= 99999
+      ? String(tokenBillingInflationPercent)
+      : '0';
+    $('tokenBillingInflationPercent').removeAttribute('aria-invalid');
 
     const rate = d.rateLimit || {};
     const scheduling = d.scheduling || {};
@@ -2211,7 +2260,10 @@
     }
 
     const functionCache = d.functionCache || {};
-    $('cacheMode').value = d.cacheMode === 'function_simulation' ? 'function_simulation' : 'native';
+    const fixedRatioCache = d.fixedRatioCache || {};
+    $('cacheMode').value = d.cacheMode === 'function_simulation' || d.cacheMode === 'fixed_ratio' ? d.cacheMode : 'native';
+    $('fixedCacheReadPercent').value = String(fixedRatioCache.cacheReadPercent ?? 0);
+    $('fixedCacheCreationPercent').value = String(fixedRatioCache.cacheCreationPercent ?? 0);
     $('functionCacheEnabled').checked = functionCache.enabled === true;
     $('functionSimulatedData').value = functionCache.simulatedData || '';
     $('functionSimulatedTokens').value = String(functionCache.simulatedTokens ?? 0);
@@ -2223,7 +2275,7 @@
     $('functionMinTokens').value = String(functionCache.minTokens ?? 0);
     $('functionFingerprintChars').value = String(functionCache.inputFingerprintChars ?? 0);
     onCacheModeChange();
-    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadPromptCachePolicies()]);
+    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadEmptyOutputCooldown(), loadOpus55Fallback(), loadS2APBind(), loadProxyConfig(), loadPromptFilter(), loadPromptCachePolicies()]);
     await loadApiKeys();
     refreshCustomSelects();
   }
@@ -2262,6 +2314,81 @@
     const d = await res.json();
     if (d.success) toast(t('settings.endpointSaved'), 'success');
     else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
+  }
+  async function loadEmptyOutputCooldown() {
+    const res = await api('/empty-output-cooldown');
+    const d = await res.json();
+    $('emptyOutputCooldownEnabled').checked = d.enabled !== false;
+    $('emptyOutputCooldownMinutes').value = String(d.minutes || 30);
+    const list = $('emptyOutputCooldownList');
+    const rows = Array.isArray(d.cooldowns) ? d.cooldowns : [];
+    if (!rows.length) {
+      list.textContent = t('settings.emptyOutputCooldownNone');
+      return;
+    }
+    list.textContent = rows.map(item => {
+      const until = item.until ? new Date(item.until).toLocaleString() : '';
+      return (item.model || '') + ' · ' + (item.accountId || '').slice(-6) + ' · ' + until;
+    }).join('\n');
+  }
+  async function saveEmptyOutputCooldown() {
+    const minutes = Number($('emptyOutputCooldownMinutes').value) || 30;
+    const res = await api('/empty-output-cooldown', {
+      method: 'POST', body: JSON.stringify({
+        enabled: $('emptyOutputCooldownEnabled').checked,
+        minutes
+      })
+    });
+    const d = await res.json();
+    if (d.success) {
+      toast(t('settings.emptyOutputCooldownSaved'), 'success');
+      loadEmptyOutputCooldown();
+    } else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
+  }
+  async function loadOpus55Fallback() {
+    const res = await api('/opus55-empty-fallback');
+    const d = await res.json();
+    $('opus55EmptyFallbackEnabled').checked = d.enabled === true;
+  }
+  async function saveOpus55Fallback() {
+    const res = await api('/opus55-empty-fallback', {
+      method: 'POST', body: JSON.stringify({ enabled: $('opus55EmptyFallbackEnabled').checked })
+    });
+    const d = await res.json();
+    if (d.success) toast(t('settings.opus55FallbackSaved'), 'success');
+    else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
+  }
+  async function loadS2APBind() {
+    const res = await api('/s2ap-bind');
+    const d = await res.json();
+    $('s2apBindEnabled').checked = d.enabled === true;
+    $('s2apBindHours').value = String(d.hours || 12);
+    const status = $('s2apBindStatus');
+    if (!d.enabled) {
+      status.textContent = t('settings.s2apBindIdle');
+      return;
+    }
+    status.textContent = t('settings.s2apBindActive')
+      .replace('{0}', String(d.available || 0))
+      .replace('{1}', String(d.leases || 0));
+  }
+  async function saveS2APBind() {
+    const hours = Number($('s2apBindHours').value) || 12;
+    const res = await api('/s2ap-bind', {
+      method: 'POST', body: JSON.stringify({
+        enabled: $('s2apBindEnabled').checked,
+        hours
+      })
+    });
+    const d = await res.json();
+    if (d.success) {
+      toast(t('settings.s2apBindSaved'), 'success');
+      if (d.bind) {
+        $('s2apBindEnabled').checked = d.bind.enabled === true;
+        $('s2apBindHours').value = String(d.bind.hours || hours);
+      }
+      setTimeout(loadS2APBind, 1500);
+    } else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
   }
   async function loadProxyConfig() {
     const res = await api('/proxy');
@@ -2366,6 +2493,39 @@
       toast((e && e.message) || t('common.saveFailed'), 'error');
     }
   }
+  async function saveTokenBillingInflation() {
+    const input = $('tokenBillingInflationPercent');
+    const button = $('saveTokenBillingInflationBtn');
+    if (button.disabled) return;
+    const rawValue = input.value.trim();
+    const tokenBillingInflationPercent = Number(rawValue);
+    if (rawValue === '' || !Number.isFinite(tokenBillingInflationPercent) || tokenBillingInflationPercent < 0 || tokenBillingInflationPercent > 99999) {
+      input.setAttribute('aria-invalid', 'true');
+      toast(t('settings.tokenBillingInflationInvalid'), 'warning');
+      input.focus();
+      return;
+    }
+    input.removeAttribute('aria-invalid');
+    button.disabled = true;
+    button.setAttribute('aria-busy', 'true');
+    try {
+      const res = await api('/settings', {
+        method: 'POST', body: JSON.stringify({ tokenBillingInflationPercent })
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.success === false) throw new Error(d.error || t('common.saveFailed'));
+      const savedPercent = Number(d.tokenBillingInflationPercent ?? tokenBillingInflationPercent);
+      input.value = Number.isFinite(savedPercent) && savedPercent >= 0 && savedPercent <= 99999
+        ? String(savedPercent)
+        : String(tokenBillingInflationPercent);
+      toast(t('settings.tokenBillingInflationSaved'), 'success');
+    } catch (e) {
+      toast((e && e.message) || t('common.saveFailed'), 'error');
+    } finally {
+      button.disabled = false;
+      button.removeAttribute('aria-busy');
+    }
+  }
   async function saveDispatchLimits(id) {
     const maxConcurrency = Number($('maxConcurrencyInput').value);
     if (!Number.isInteger(maxConcurrency) || maxConcurrency < 0 || maxConcurrency > 10000) {
@@ -2396,6 +2556,9 @@
       ttl: field('promptCacheTTLSeconds'),
       nativeFields: prefix ? field('nativeFields') : $('nativeCacheFields'),
       functionFields: prefix ? field('functionFields') : $('functionCacheFields'),
+      fixedFields: prefix ? field('fixedRatioFields') : $('fixedRatioFields'),
+      fixedRead: field('fixedCacheReadPercent'),
+      fixedCreation: field('fixedCacheCreationPercent'),
       functionEnabled: field('functionCacheEnabled'),
       simulatedData: field('functionSimulatedData'),
       simulatedTokens: field('functionSimulatedTokens'),
@@ -2410,9 +2573,10 @@
   }
   function toggleCachePolicyMode(prefix) {
     const form = getCachePolicyForm(prefix);
-    const simulated = form.mode.value === 'function_simulation';
-    form.nativeFields.classList.toggle('hidden', simulated);
-    form.functionFields.classList.toggle('hidden', !simulated);
+    const mode = form.mode.value;
+    form.nativeFields.classList.toggle('hidden', mode !== 'native');
+    form.functionFields.classList.toggle('hidden', mode !== 'function_simulation');
+    form.fixedFields.classList.toggle('hidden', mode !== 'fixed_ratio');
   }
   function cachePolicyValidationError(input, key) {
     if (input) input.focus();
@@ -2440,11 +2604,18 @@
     if (promptCacheTTLSeconds !== 300 && promptCacheTTLSeconds !== 3600) {
       cachePolicyValidationError(form.ttl, 'settings.promptCacheTTLInvalid');
     }
+    const cacheMode = form.mode.value === 'function_simulation' || form.mode.value === 'fixed_ratio'
+      ? form.mode.value
+      : 'native';
     return {
-      cacheMode: form.mode.value === 'function_simulation' ? 'function_simulation' : 'native',
+      cacheMode,
       promptCacheMaxRatio,
       promptCacheMaxEntries,
       promptCacheTTLSeconds,
+      fixedRatioCache: {
+        cacheReadPercent: cachePolicyFormNumber(form.fixedRead, 0, 100),
+        cacheCreationPercent: cachePolicyFormNumber(form.fixedCreation, 0, 100)
+      },
       functionCache: {
         enabled: form.functionEnabled.checked,
         simulatedData: form.simulatedData.value,
@@ -2464,10 +2635,13 @@
     const form = getCachePolicyForm(prefix);
     const source = policy || {};
     const functionCache = source.functionCache || {};
+    const fixedRatioCache = source.fixedRatioCache || {};
     const ratio = Number(source.promptCacheMaxRatio);
     const entries = Number(source.promptCacheMaxEntries);
     const ttl = Number(source.promptCacheTTLSeconds);
-    form.mode.value = source.cacheMode === 'function_simulation' ? 'function_simulation' : 'native';
+    form.mode.value = source.cacheMode === 'function_simulation' || source.cacheMode === 'fixed_ratio' ? source.cacheMode : 'native';
+    form.fixedRead.value = String(fixedRatioCache.cacheReadPercent ?? 0);
+    form.fixedCreation.value = String(fixedRatioCache.cacheCreationPercent ?? 0);
     form.ratio.value = Number.isFinite(ratio) && ratio >= 0.01 && ratio <= 1 ? String(ratio) : '0.85';
     form.entries.value = Number.isInteger(entries) && entries >= 256 && entries <= 1048576 ? String(entries) : '131072';
     form.ttl.value = ttl === 3600 ? '3600' : '300';
@@ -2579,8 +2753,10 @@
       const id = escapeAttr(policy.id || '');
       const name = escapeHtml(policy.name || t('cachePolicies.unnamed'));
       const functionCache = policy.functionCache || {};
+      const fixedRatioCache = policy.fixedRatioCache || {};
       const isFunction = policy.cacheMode === 'function_simulation';
-      const mode = t(isFunction ? 'settings.cacheModeFunction' : 'settings.cacheModeNative');
+      const isFixed = policy.cacheMode === 'fixed_ratio';
+      const mode = t(isFunction ? 'settings.cacheModeFunction' : isFixed ? 'settings.cacheModeFixed' : 'settings.cacheModeNative');
       const ttlLabel = Number(policy.promptCacheTTLSeconds) === 3600
         ? t('settings.promptCacheTTL1h')
         : t('settings.promptCacheTTL5m');
@@ -2592,12 +2768,18 @@
             formatNumber(functionCache.ttlSeconds ?? 300),
             formatNumber(functionCache.hitRatePercent ?? 100)
           )
-        : t(
-            'cachePolicies.summaryNative',
-            formatNumber(policy.promptCacheMaxRatio ?? 0.85),
-            formatNumber(policy.promptCacheMaxEntries ?? 131072),
-            ttlLabel
-          );
+        : isFixed
+          ? t(
+              'cachePolicies.summaryFixed',
+              formatNumber(fixedRatioCache.cacheReadPercent ?? 0),
+              formatNumber(fixedRatioCache.cacheCreationPercent ?? 0)
+            )
+          : t(
+              'cachePolicies.summaryNative',
+              formatNumber(policy.promptCacheMaxRatio ?? 0.85),
+              formatNumber(policy.promptCacheMaxEntries ?? 131072),
+              ttlLabel
+            );
       const bound = promptCachePolicyBoundApiKeys(policy.id);
       const boundNames = bound.slice(0, 3).map(item => item.name || item.keyMasked || t('apiKeys.unnamed'));
       if (bound.length > boundNames.length) {
@@ -4228,9 +4410,20 @@
 	$('saveDispatchPoliciesBtn').addEventListener('click', saveDispatchPolicies);
 	$('saveReasoningCapBtn').addEventListener('click', saveReasoningCap);
     $('savePromptCacheBtn').addEventListener('click', savePromptCacheConfig);
+	$('saveTokenBillingInflationBtn').addEventListener('click', saveTokenBillingInflation);
+	$('tokenBillingInflationPercent').addEventListener('input', e => e.target.removeAttribute('aria-invalid'));
+	$('tokenBillingInflationPercent').addEventListener('keydown', e => {
+	  if (e.key === 'Enter') {
+	    e.preventDefault();
+	    saveTokenBillingInflation();
+	  }
+	});
 	$('cacheMode').addEventListener('change', onCacheModeChange);
     $('saveThinkingBtn').addEventListener('click', saveThinkingConfig);
     $('saveEndpointBtn').addEventListener('click', saveEndpointConfig);
+    $('saveEmptyOutputCooldownBtn').addEventListener('click', saveEmptyOutputCooldown);
+    $('saveOpus55FallbackBtn').addEventListener('click', saveOpus55Fallback);
+    $('saveS2APBindBtn').addEventListener('click', saveS2APBind);
     $('changePasswordBtn').addEventListener('click', changePassword);
     $('proxyType').addEventListener('change', onProxyTypeChange);
     $('saveProxyBtn').addEventListener('click', saveProxyConfig);

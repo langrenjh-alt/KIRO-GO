@@ -4,11 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-
-	"github.com/google/uuid"
 )
-
-var kiroHistoryMessageNamespace = uuid.MustParse("75462b40-3b7e-5d5a-b6e8-e469165f3144")
 
 // currentToolResultsExactlyMatchLastAssistant accepts only one complete active
 // tool round. Partial, duplicate, orphaned, and extra results fall back to the
@@ -256,7 +252,7 @@ func stableKiroAssistantMessageID(conversationID string, index int, assistant *K
 	if err != nil {
 		wire = []byte(fmt.Sprintf("%s:%d:%s", conversationID, index, assistant.Content))
 	}
-	return uuid.NewSHA1(kiroHistoryMessageNamespace, wire).String()
+	return newUUIDv4FromMaterial(wire)
 }
 
 func activeKiroHistoryRound(payload *KiroPayload) (*KiroAssistantResponseMessage, []KiroToolResult, bool) {

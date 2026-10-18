@@ -276,6 +276,31 @@ func TestGetNextForModelExcludingSkipsExcludedAccount(t *testing.T) {
 	}
 }
 
+func TestAccountHasModelAcceptsEitherVersionSeparator(t *testing.T) {
+	p := &AccountPool{
+		accounts: []config.Account{
+			{ID: "dotted", Enabled: true},
+			{ID: "dashed", Enabled: true},
+		},
+		cooldowns:    make(map[string]time.Time),
+		errorCounts:  make(map[string]int),
+		modelLists:   make(map[string]map[string]bool),
+		currentIndex: ^uint64(0),
+	}
+	p.SetModelList("dotted", []string{"claude-opus-4.8"})
+	p.SetModelList("dashed", []string{"gpt-5.6-sol"})
+
+	if got := p.GetNextForModelExcluding("claude-opus-4-8", map[string]bool{"dashed": true}); got == nil || got.ID != "dotted" {
+		t.Fatalf("dashed opus id did not match dotted catalog, got %#v", got)
+	}
+	if got := p.GetNextForModelExcluding("gpt-5-6-sol", map[string]bool{"dotted": true}); got == nil || got.ID != "dashed" {
+		t.Fatalf("dashed gpt id did not match dotted catalog, got %#v", got)
+	}
+	if got := p.GetNextForModelExcluding("claude-opus-4-8-20260101", nil); got == nil || got.ID != "dotted" {
+		t.Fatalf("dated opus snapshot did not match dotted catalog, got %#v", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Reload over-usage filtering
 // ---------------------------------------------------------------------------

@@ -12,6 +12,7 @@ import (
 	"io"
 	"kiro-go/config"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -21,8 +22,8 @@ import (
 
 // modelAliases lists model names that need an explicit redirect — dated snapshots,
 // cross-family legacy IDs (claude-3-*), and non-Anthropic fallbacks.
-// Plain dash → dot version normalization is handled by claudeVersionPattern below,
-// so new versions (e.g. claude-opus-4-8) require no code changes.
+// Plain dash -> dot version normalization is handled by claudeVersionPattern
+// below, so new versions require no code changes.
 type modelMapping struct {
 	key   string
 	value string
@@ -40,9 +41,9 @@ var modelAliases = []modelMapping{
 	{"gpt-3.5-turbo", "claude-sonnet-4.5"},
 }
 
-// claudeVersionPattern normalizes "claude-{family}-N-M" to "claude-{family}-N.M".
-// Minor is capped at 1-2 digits with a \b boundary so dated snapshots
-// (claude-sonnet-4-20250514) are not accidentally rewritten.
+// claudeVersionPattern normalizes "claude-{family}-N-M" to
+// "claude-{family}-N.M". Minor is capped at 1-2 digits with a word boundary
+// so dated snapshots are not accidentally rewritten.
 var claudeVersionPattern = regexp.MustCompile(`claude-(opus|sonnet|haiku)-(\d+)-(\d{1,2})\b`)
 
 // Thinking 模式提示
@@ -74,6 +75,14 @@ func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
 		model = model[:len(model)-len(thinkingSuffix)]
 		lower = strings.ToLower(model)
 	}
+	// Clients sometimes prefix the Anthropic vendor. The account catalog does not.
+	for _, prefix := range []string{"anthropic/", "anthropic."} {
+		if strings.HasPrefix(lower, prefix) {
+			lower = strings.TrimPrefix(lower, prefix)
+			model = lower
+			break
+		}
+	}
 
 	// 1) Explicit aliases: dated snapshots, cross-family legacy IDs, non-Anthropic fallbacks.
 	for _, m := range modelAliases {
@@ -82,17 +91,13 @@ func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
 		}
 	}
 
-	// 2) Format normalization: claude-{family}-N-M → claude-{family}-N.M.
-	//    New versions (claude-opus-4-8, etc.) flow through here without code changes.
-	if claudeVersionPattern.MatchString(lower) {
-		return claudeVersionPattern.ReplaceAllString(lower, "claude-$1-$2.$3"), thinking
+	// 2) Format normalization: claude-{family}-N-M -> claude-{family}-N.M.
+	//    New versions flow through here without code changes. Keep distinct
+	//    minor versions distinct: opus 5.5 and opus 5 have different upstream
+	//    catalog entries and rate multipliers.
+	if canonical := config.CanonicalModelID(lower); canonical != "" {
+		return canonical, thinking
 	}
-
-	// 3) Already a valid Kiro model (dot form or bare family like claude-sonnet-4): pass through.
-	if strings.HasPrefix(lower, "claude-") {
-		return model, thinking
-	}
-
 	return model, thinking
 }
 
@@ -589,10 +594,11 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	}
 	payload.ConversationState.ConversationID = conversationID
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
-		Content: finalContent,
-		ModelID: modelID,
-		Origin:  origin,
-		Images:  currentImages,
+		Content:                 finalContent,
+		ModelID:                 modelID,
+		Origin:                  origin,
+		Images:                  currentImages,
+		UserInputMessageContext: &UserInputMessageContext{},
 	}
 
 	// Only attach structured tool results when they answer the last history
@@ -613,13 +619,12 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	}
 	finalizeKiroHistoryProtocol(payload)
 
-	if req.MaxTokens > 0 || req.Temperature > 0 || req.TopP > 0 {
-		payload.InferenceConfig = &InferenceConfig{
-			MaxTokens:   req.MaxTokens,
-			Temperature: req.Temperature,
-			TopP:        req.TopP,
-		}
+	if payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext == nil {
+		payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext = &UserInputMessageContext{}
 	}
+	// Temperature and top_p are not part of the kiro2cc-proxy body. The output
+	// limit travels in additionalModelRequestFields.max_tokens.
+	payload.InferenceConfig = nil
 	payload.AdditionalModelRequestFields = buildClaudeAdditionalModelRequestFields(req, modelID, thinking)
 
 	return payload
@@ -1441,7 +1446,9 @@ func convertClaudeTools(tools []ClaudeTool) ([]KiroToolWrapper, map[string]strin
 }
 
 // ensureObjectSchema mirrors kiro.rs's top-level tool-schema normalization.
-// Valid nested JSON Schema constructs are preserved rather than stripped.
+// Nested JSON Schema constructs are preserved. oneOf, anyOf, and allOf are
+// removed only at the root: Kiro rejects those keywords on input_schema itself
+// with TOOL_SCHEMA_INVALID, while the same keywords inside a property are valid.
 func ensureObjectSchema(schema interface{}) interface{} {
 	m, ok := schema.(map[string]interface{})
 	if !ok {
@@ -1453,6 +1460,7 @@ func ensureObjectSchema(schema interface{}) interface{} {
 		}
 	}
 	cleaned := cloneSchemaMap(m)
+	flattenTopLevelSchemaCombinators(cleaned)
 	if typeName, valid := cleaned["type"].(string); !valid || strings.TrimSpace(typeName) == "" {
 		cleaned["type"] = "object"
 	}
@@ -1481,6 +1489,124 @@ func ensureObjectSchema(schema interface{}) interface{} {
 		cleaned["additionalProperties"] = true
 	}
 	return cleaned
+}
+
+// flattenTopLevelSchemaCombinators rewrites a root union into one object.
+// allOf required names are combined because every branch applies. oneOf and
+// anyOf required names stay off the root so a caller can still satisfy a
+// single variant. Property-level unions are left in place.
+func flattenTopLevelSchemaCombinators(schema map[string]interface{}) {
+	type schemaBranch struct {
+		combinator string
+		obj        map[string]interface{}
+	}
+	var branches []schemaBranch
+	removed := false
+	for _, key := range []string{"oneOf", "anyOf", "allOf"} {
+		raw, ok := schema[key]
+		if !ok {
+			continue
+		}
+		delete(schema, key)
+		removed = true
+		items, ok := raw.([]interface{})
+		if !ok {
+			continue
+		}
+		for _, item := range items {
+			obj, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			branches = append(branches, schemaBranch{combinator: key, obj: obj})
+		}
+	}
+	if !removed {
+		return
+	}
+
+	properties, _ := schema["properties"].(map[string]interface{})
+	if properties == nil {
+		properties = map[string]interface{}{}
+		schema["properties"] = properties
+	}
+	required := map[string]struct{}{}
+	for _, name := range schemaStringNames(schema["required"]) {
+		required[name] = struct{}{}
+	}
+	for _, branch := range branches {
+		if props, ok := branch.obj["properties"].(map[string]interface{}); ok {
+			for name, value := range props {
+				if _, exists := properties[name]; !exists {
+					properties[name] = value
+				}
+			}
+		}
+		if branch.combinator != "allOf" {
+			continue
+		}
+		for _, name := range schemaStringNames(branch.obj["required"]) {
+			if _, ok := properties[name]; ok {
+				required[name] = struct{}{}
+			}
+		}
+	}
+	schema["required"] = orderedSchemaNames(schema["required"], required)
+	if typeName, _ := schema["type"].(string); strings.TrimSpace(typeName) == "" {
+		schema["type"] = "object"
+	}
+}
+
+func schemaStringNames(value interface{}) []string {
+	switch values := value.(type) {
+	case []interface{}:
+		names := make([]string, 0, len(values))
+		for _, value := range values {
+			if name, ok := value.(string); ok && name != "" {
+				names = append(names, name)
+			}
+		}
+		return names
+	case []string:
+		names := make([]string, 0, len(values))
+		for _, name := range values {
+			if name != "" {
+				names = append(names, name)
+			}
+		}
+		return names
+	default:
+		return nil
+	}
+}
+
+func orderedSchemaNames(existing interface{}, want map[string]struct{}) []interface{} {
+	out := make([]interface{}, 0, len(want))
+	seen := make(map[string]struct{}, len(want))
+	add := func(name string) {
+		if _, ok := want[name]; !ok {
+			return
+		}
+		if _, ok := seen[name]; ok {
+			return
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+	for _, name := range schemaStringNames(existing) {
+		add(name)
+	}
+	extras := make([]string, 0)
+	for name := range want {
+		if _, ok := seen[name]; !ok {
+			extras = append(extras, name)
+		}
+	}
+	sort.Strings(extras)
+	for _, name := range extras {
+		out = append(out, name)
+	}
+	return out
 }
 
 func cloneSchemaMap(m map[string]interface{}) map[string]interface{} {
@@ -2070,13 +2196,10 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	}
 	finalizeKiroHistoryProtocol(payload)
 
-	if req.MaxTokens > 0 || req.Temperature > 0 || req.TopP > 0 {
-		payload.InferenceConfig = &InferenceConfig{
-			MaxTokens:   req.MaxTokens,
-			Temperature: req.Temperature,
-			TopP:        req.TopP,
-		}
+	if payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext == nil {
+		payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext = &UserInputMessageContext{}
 	}
+	payload.InferenceConfig = nil
 	payload.AdditionalModelRequestFields = buildOpenAIAdditionalModelRequestFields(req, modelID, thinking)
 
 	return payload
@@ -2693,7 +2816,7 @@ func buildConversationID(modelID, systemPrompt, anchor string) string {
 		return uuid.New().String()
 	}
 	seed := strings.Join([]string{modelID, strings.TrimSpace(systemPrompt), anchor}, "\n")
-	return uuid.NewSHA1(uuid.NameSpaceURL, []byte(seed)).String()
+	return newUUIDv4FromMaterial([]byte(seed))
 }
 
 func isSyntheticConversationAnchor(anchor string) bool {

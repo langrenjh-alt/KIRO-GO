@@ -251,6 +251,24 @@ type Config struct {
 	// Defaults to true. Set to false to only use the preferred endpoint.
 	EndpointFallback *bool `json:"endpointFallback,omitempty"`
 
+	// EmptyOutputCooldownEnabled cools the failing account and model when the
+	// upstream returns an events=none empty body. Nil means enabled.
+	EmptyOutputCooldownEnabled *bool `json:"emptyOutputCooldownEnabled,omitempty"`
+	// EmptyOutputCooldownMinutes is the cooldown length. Zero means 30 minutes.
+	EmptyOutputCooldownMinutes int `json:"emptyOutputCooldownMinutes,omitempty"`
+	// Opus55EmptyMapToOpus5 retries opus 5.5 on opus 5 after every account
+	// returns an events=none body. Nil means disabled. Downstream model ids
+	// stay on opus 5.5.
+	Opus55EmptyMapToOpus5 *bool `json:"opus55EmptyMapToOpus5,omitempty"`
+
+	// S2APBindEnabled assigns each account an available s2ap proxy. Exits are
+	// shared only after every exit already has an account. Nil means disabled.
+	S2APBindEnabled *bool `json:"s2apBindEnabled,omitempty"`
+	// S2APBindHours is how long an account keeps its chosen proxy. Zero means 12 hours.
+	S2APBindHours int `json:"s2apBindHours,omitempty"`
+	// S2APAccountLeases remembers which s2ap proxy each account is holding.
+	S2APAccountLeases map[string]S2APAccountLease `json:"s2apAccountLeases,omitempty"`
+
 	// AllowOverUsage allows accounts to continue serving requests even when their
 	// usage quota has been exhausted. When enabled, the pool will not skip accounts
 	// solely because usageCurrent >= usageLimit.
@@ -265,10 +283,16 @@ type Config struct {
 	Scheduling      SchedulingConfig      `json:"scheduling,omitempty"`
 	AccountPriority AccountPriorityConfig `json:"accountPriority,omitempty"`
 
-	// CacheMode switches between the native persistent prompt-cache accounting
-	// and the reference project's usage-only function-cache simulation.
-	CacheMode     string              `json:"cacheMode,omitempty"`
-	FunctionCache FunctionCacheConfig `json:"functionCache,omitempty"`
+	// CacheMode switches between native persistent prompt-cache accounting,
+	// usage-only function-cache simulation, and a fixed input-token split.
+	CacheMode       string                `json:"cacheMode,omitempty"`
+	FunctionCache   FunctionCacheConfig   `json:"functionCache,omitempty"`
+	FixedRatioCache FixedRatioCacheConfig `json:"fixedRatioCache,omitempty"`
+
+	// TokenBillingInflationPercent scales every billable token category after
+	// the selected cache policy has calculated its final usage. Zero preserves
+	// the original usage; a value of 100 doubles it.
+	TokenBillingInflationPercent float64 `json:"tokenBillingInflationPercent,omitempty"`
 
 	// ReasoningCap bounds pre-action reasoning so a looping agent turn cannot
 	// occupy an account slot indefinitely.
@@ -496,6 +520,9 @@ func loadLocked(preserveApiKeyUsage bool) error {
 
 	var c Config
 	if err := json.Unmarshal(data, &c); err != nil {
+		return err
+	}
+	if err := ValidateTokenBillingInflationPercent(c.TokenBillingInflationPercent); err != nil {
 		return err
 	}
 	cfg = &c
@@ -1468,6 +1495,167 @@ func UpdateEndpointFallback(enabled bool) error {
 	defer cfgLock.Unlock()
 	cfg.EndpointFallback = &enabled
 	return Save()
+}
+
+// Opus55EmptyMapToOpus5Enabled reports whether an exhausted opus 5.5 empty
+// stream may be retried upstream as opus 5. The default is off.
+func Opus55EmptyMapToOpus5Enabled() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	return cfg != nil && cfg.Opus55EmptyMapToOpus5 != nil && *cfg.Opus55EmptyMapToOpus5
+}
+
+// UpdateOpus55EmptyMapToOpus5 stores the fallback switch.
+func UpdateOpus55EmptyMapToOpus5(enabled bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.Opus55EmptyMapToOpus5 = &enabled
+	return saveLocked()
+}
+
+// EmptyOutputModelCooldownEnabled reports whether an events=none empty body
+// should cool the account and model pair. The default is enabled.
+func EmptyOutputModelCooldownEnabled() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.EmptyOutputCooldownEnabled == nil {
+		return true
+	}
+	return *cfg.EmptyOutputCooldownEnabled
+}
+
+// EmptyOutputModelCooldownMinutes returns the configured cooldown, or 30.
+func EmptyOutputModelCooldownMinutes() int {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.EmptyOutputCooldownMinutes <= 0 {
+		return 30
+	}
+	return cfg.EmptyOutputCooldownMinutes
+}
+
+// UpdateEmptyOutputCooldown stores the switch and duration.
+func UpdateEmptyOutputCooldown(enabled bool, minutes int) error {
+	if minutes <= 0 {
+		minutes = 30
+	}
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.EmptyOutputCooldownEnabled = &enabled
+	cfg.EmptyOutputCooldownMinutes = minutes
+	return saveLocked()
+}
+
+// S2APAccountLease is one account's hold on a single s2ap proxy.
+type S2APAccountLease struct {
+	ProxyID string `json:"proxyId"`
+	Until   int64  `json:"until"`
+	ExitIP  string `json:"exitIP,omitempty"`
+}
+
+// S2APBindSettings is the admin view of per-account s2ap assignments.
+type S2APBindSettings struct {
+	Enabled bool `json:"enabled"`
+	Hours   int  `json:"hours"`
+	Leases  int  `json:"leases"`
+}
+
+// S2APBindEnabled reports whether each account should draw an s2ap proxy.
+func S2APBindEnabled() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	return cfg != nil && cfg.S2APBindEnabled != nil && *cfg.S2APBindEnabled
+}
+
+// S2APBindHours returns the hold time, or 12.
+func S2APBindHours() int {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.S2APBindHours <= 0 {
+		return 12
+	}
+	return cfg.S2APBindHours
+}
+
+// GetS2APBindSettings returns the switch without assigning proxies.
+func GetS2APBindSettings() S2APBindSettings {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	return s2apBindSettingsLocked(time.Now())
+}
+
+func s2apBindSettingsLocked(now time.Time) S2APBindSettings {
+	out := S2APBindSettings{Hours: 12}
+	if cfg == nil {
+		return out
+	}
+	if cfg.S2APBindHours > 0 {
+		out.Hours = cfg.S2APBindHours
+	}
+	if cfg.S2APBindEnabled != nil {
+		out.Enabled = *cfg.S2APBindEnabled
+	}
+	for _, lease := range cfg.S2APAccountLeases {
+		if lease.Until > now.Unix() && lease.ProxyID != "" {
+			out.Leases++
+		}
+	}
+	return out
+}
+
+// UpdateS2APBind stores the switch and duration. Existing account holds stay
+// until they expire.
+func UpdateS2APBind(enabled bool, hours int) (S2APBindSettings, error) {
+	if hours <= 0 {
+		hours = 12
+	}
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.S2APBindEnabled = &enabled
+	cfg.S2APBindHours = hours
+	if err := saveLocked(); err != nil {
+		return S2APBindSettings{}, err
+	}
+	return s2apBindSettingsLocked(time.Now()), nil
+}
+
+// SnapshotS2APAccountLeases copies the current holds for the admin list.
+func SnapshotS2APAccountLeases() map[string]S2APAccountLease {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || len(cfg.S2APAccountLeases) == 0 {
+		return map[string]S2APAccountLease{}
+	}
+	out := make(map[string]S2APAccountLease, len(cfg.S2APAccountLeases))
+	for id, lease := range cfg.S2APAccountLeases {
+		out[id] = lease
+	}
+	return out
+}
+
+// GetS2APAccountLease returns the saved hold for an account.
+func GetS2APAccountLease(accountID string) (S2APAccountLease, bool) {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.S2APAccountLeases == nil {
+		return S2APAccountLease{}, false
+	}
+	lease, ok := cfg.S2APAccountLeases[accountID]
+	return lease, ok
+}
+
+// PutS2APAccountLease remembers which s2ap proxy an account is using.
+func PutS2APAccountLease(accountID string, lease S2APAccountLease) error {
+	if strings.TrimSpace(accountID) == "" {
+		return fmt.Errorf("account id is empty")
+	}
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg.S2APAccountLeases == nil {
+		cfg.S2APAccountLeases = map[string]S2APAccountLease{}
+	}
+	cfg.S2APAccountLeases[accountID] = lease
+	return saveLocked()
 }
 
 // GetProxyURL 获取出站代理地址

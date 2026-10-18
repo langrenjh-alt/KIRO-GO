@@ -23,7 +23,7 @@ func TestFunctionCacheModeSimulatesUsageWithoutNativeIsolation(t *testing.T) {
 		HitRatePercent:      &hitRate,
 		MaxCacheReadPercent: &maxRead,
 	}
-	if err := config.UpdateCachePolicy(&mode, &functionCache); err != nil {
+	if err := config.UpdateCachePolicy(&mode, &functionCache, nil); err != nil {
 		t.Fatalf("UpdateCachePolicy: %v", err)
 	}
 	tracker := newPromptCacheTrackerWithCapacity(time.Hour, 256)
@@ -52,7 +52,7 @@ func TestCacheModeSwitchesBackToNativeBehavior(t *testing.T) {
 		t.Fatalf("config.Init: %v", err)
 	}
 	mode := config.CacheModeNative
-	if err := config.UpdateCachePolicy(&mode, nil); err != nil {
+	if err := config.UpdateCachePolicy(&mode, nil, nil); err != nil {
 		t.Fatalf("UpdateCachePolicy: %v", err)
 	}
 	tracker := newPromptCacheTrackerWithCapacity(time.Hour, 256)
@@ -79,7 +79,7 @@ func TestFunctionCacheUsesRawBodyFingerprintWithoutChangingNativeIsolation(t *te
 		HitRatePercent:      &hitRate,
 		MaxCacheReadPercent: &maxRead,
 	}
-	if err := config.UpdateCachePolicy(&mode, &functionCache); err != nil {
+	if err := config.UpdateCachePolicy(&mode, &functionCache, nil); err != nil {
 		t.Fatalf("UpdateCachePolicy: %v", err)
 	}
 
@@ -104,7 +104,7 @@ func TestFunctionCacheUsesRawBodyFingerprintWithoutChangingNativeIsolation(t *te
 	}
 
 	mode = config.CacheModeNative
-	if err := config.UpdateCachePolicy(&mode, nil); err != nil {
+	if err := config.UpdateCachePolicy(&mode, nil, nil); err != nil {
 		t.Fatalf("UpdateCachePolicy(native): %v", err)
 	}
 	nativeA := tracker.BuildClaudeProfileForRequest(&req, 1000, "tenant-a", functionCacheRequestBodyFingerprint(rawA))

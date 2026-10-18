@@ -3,7 +3,73 @@ package proxy
 import (
 	"encoding/json"
 	"math"
+	"strings"
 )
+
+// omitImagePayloadForTokens removes image bytes before a token estimate.
+// Base64 length is not a model token count; leaving it in the cache prefix
+// reports a single picture as about a million tokens of cache creation.
+// Callers that hash the prompt for a cache hit must keep the original value.
+func omitImagePayloadForTokens(value interface{}) interface{} {
+	switch typed := value.(type) {
+	case map[string]interface{}:
+		if isImageInputBlock(typed) {
+			return map[string]interface{}{"type": "image"}
+		}
+		trimmed := make(map[string]interface{}, len(typed))
+		for key, item := range typed {
+			trimmed[key] = omitImagePayloadForTokens(item)
+		}
+		return trimmed
+	case []interface{}:
+		trimmed := make([]interface{}, len(typed))
+		for i, item := range typed {
+			trimmed[i] = omitImagePayloadForTokens(item)
+		}
+		return trimmed
+	case string:
+		if isInlineImageDataURL(typed) {
+			return ""
+		}
+		return typed
+	default:
+		return value
+	}
+}
+
+func isImageInputBlock(block map[string]interface{}) bool {
+	switch strings.ToLower(strings.TrimSpace(stringFromMap(block, "type"))) {
+	case "image", "image_url", "input_image":
+		return true
+	}
+	if _, ok := block["image_url"]; ok {
+		return true
+	}
+	if _, ok := block["image_base64"]; ok {
+		return true
+	}
+	source, _ := block["source"].(map[string]interface{})
+	if source == nil {
+		return false
+	}
+	media := stringFromMap(source, "media_type", "mediaType", "mime_type", "mimeType")
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(media)), "image/")
+}
+
+func stringFromMap(block map[string]interface{}, keys ...string) string {
+	for _, key := range keys {
+		if text, ok := block[key].(string); ok {
+			return text
+		}
+	}
+	return ""
+}
+
+func isInlineImageDataURL(value string) bool {
+	trimmed := strings.TrimSpace(value)
+	header, _, ok := strings.Cut(strings.ToLower(trimmed), ";base64,")
+	return ok && strings.HasPrefix(header, "data:image/")
+}
 
 func estimateApproxTokens(text string) int {
 	if text == "" {
@@ -96,6 +162,9 @@ func estimateClaudeValueTokens(v interface{}) int {
 	case nil:
 		return 0
 	case string:
+		if isInlineImageDataURL(value) {
+			return 0
+		}
 		return estimateApproxTokens(value)
 	case []interface{}:
 		total := 0
@@ -106,8 +175,13 @@ func estimateClaudeValueTokens(v interface{}) int {
 	case map[string]interface{}:
 		typeName, _ := value["type"].(string)
 		switch typeName {
+		case "image", "image_url", "input_image":
+			return 0
 		case "text":
 			if text, ok := value["text"].(string); ok {
+				if isInlineImageDataURL(text) {
+					return 0
+				}
 				return estimateApproxTokens(text)
 			}
 		case "thinking":
@@ -120,7 +194,7 @@ func estimateClaudeValueTokens(v interface{}) int {
 				total += estimateApproxTokens(name)
 			}
 			if input, ok := value["input"]; ok {
-				total += estimateJSONTokens(input)
+				total += estimateJSONTokens(omitImagePayloadForTokens(input))
 			}
 			if total > 0 {
 				return total
@@ -132,7 +206,7 @@ func estimateClaudeValueTokens(v interface{}) int {
 		}
 
 		total := 0
-		if text, ok := value["text"].(string); ok {
+		if text, ok := value["text"].(string); ok && !isInlineImageDataURL(text) {
 			total += estimateApproxTokens(text)
 		}
 		if thinking, ok := value["thinking"].(string); ok {
@@ -145,9 +219,9 @@ func estimateClaudeValueTokens(v interface{}) int {
 			return total
 		}
 
-		return estimateJSONTokens(value)
+		return estimateJSONTokens(omitImagePayloadForTokens(value))
 	default:
-		return estimateJSONTokens(value)
+		return estimateJSONTokens(omitImagePayloadForTokens(value))
 	}
 }
 
@@ -201,13 +275,18 @@ func estimateOpenAIContentTokens(content interface{}) int {
 	case nil:
 		return 0
 	case string:
+		if isInlineImageDataURL(value) {
+			return 0
+		}
 		return estimateApproxTokens(value)
 	default:
-		text := extractOpenAIMessageText(value)
-		if text != "" {
-			return estimateApproxTokens(text)
+		// Strip image bytes before the text extractor. An image-only part has
+		// no text, and the extractor otherwise JSON-encodes the whole part.
+		text := extractOpenAIMessageText(omitImagePayloadForTokens(value))
+		if text == "" || isInlineImageDataURL(text) {
+			return 0
 		}
-		return estimateJSONTokens(value)
+		return estimateApproxTokens(text)
 	}
 }
 

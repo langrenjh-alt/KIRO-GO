@@ -4,6 +4,7 @@ package auth
 import (
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,8 +13,20 @@ import (
 // 全局 HTTP 客户端存储，支持运行时代理重配置
 var httpClientStore atomic.Pointer[http.Client]
 
-// authProxyClientCache caches per-proxy auth HTTP clients.
+// defaultAuthClient is the client installed by InitHttpClient. Tests that
+// replace the store leave this pointer unchanged so account-scoped clients
+// can fall back to the stub.
+var (
+	authClientMu      sync.RWMutex
+	defaultAuthClient *http.Client
+)
+
+// authProxyClientCache caches per-proxy auth HTTP clients for callers that
+// do not yet have an account id.
 var authProxyClientCache sync.Map
+
+// authAccountClients keeps token refresh for each account on its own connection.
+var authAccountClients sync.Map
 
 // httpClient 返回当前全局 auth HTTP 客户端
 func httpClient() *http.Client {
@@ -33,11 +46,36 @@ func GetAuthClientForProxy(proxyURL string) *http.Client {
 	if cached, ok := authProxyClientCache.Load(proxyURL); ok {
 		return cached.(*http.Client)
 	}
-	client := &http.Client{
-		Timeout:   30 * time.Second,
-		Transport: buildAuthTransport(proxyURL),
-	}
+	client := newAuthHTTPClient(proxyURL, "", false)
 	authProxyClientCache.Store(proxyURL, client)
+	return client
+}
+
+// ClientForAccount returns the auth client for one account. An empty account
+// id uses the proxy-level client. A test-installed global client is returned
+// for direct connections so httptest stubs keep working.
+func ClientForAccount(accountID, proxyURL, machineID string) *http.Client {
+	proxyURL = strings.TrimSpace(proxyURL)
+	authClientMu.RLock()
+	replaced := httpClientStore.Load() != defaultAuthClient
+	authClientMu.RUnlock()
+	if replaced && proxyURL == "" {
+		return httpClient()
+	}
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return GetAuthClientForProxy(proxyURL)
+	}
+	key := accountID + "\n" + proxyURL
+	if value, ok := authAccountClients.Load(key); ok {
+		return value.(*http.Client)
+	}
+	client := newAuthHTTPClient(proxyURL, machineID, true)
+	actual, loaded := authAccountClients.LoadOrStore(key, client)
+	if loaded {
+		client.CloseIdleConnections()
+		return actual.(*http.Client)
+	}
 	return client
 }
 
@@ -61,11 +99,40 @@ func buildAuthTransport(proxyURL string) *http.Transport {
 	return t
 }
 
+func newAuthHTTPClient(proxyURL, machineID string, perAccount bool) *http.Client {
+	base := buildAuthTransport(proxyURL)
+	if perAccount {
+		base.MaxIdleConns = 4
+		base.MaxIdleConnsPerHost = 2
+	}
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: identityTransport{
+			base:      base,
+			machineID: strings.TrimSpace(machineID),
+		},
+	}
+}
+
 // InitHttpClient 初始化（或重新初始化）auth 模块的全局 HTTP 客户端
 func InitHttpClient(proxyURL string) {
-	client := &http.Client{
-		Timeout:   30 * time.Second,
-		Transport: buildAuthTransport(proxyURL),
-	}
+	client := newAuthHTTPClient(proxyURL, "", false)
+	authClientMu.Lock()
+	defaultAuthClient = client
 	httpClientStore.Store(client)
+	authClientMu.Unlock()
+	authProxyClientCache.Range(func(key, value any) bool {
+		if cached, ok := value.(*http.Client); ok {
+			cached.CloseIdleConnections()
+		}
+		authProxyClientCache.Delete(key)
+		return true
+	})
+	authAccountClients.Range(func(key, value any) bool {
+		if cached, ok := value.(*http.Client); ok {
+			cached.CloseIdleConnections()
+		}
+		authAccountClients.Delete(key)
+		return true
+	})
 }

@@ -491,6 +491,12 @@ func TestEnsureObjectSchemaMatchesKiroRSNormalization(t *testing.T) {
 					"force": map[string]interface{}{"type": "boolean"},
 				},
 			},
+			"choice": map[string]interface{}{
+				"anyOf": []interface{}{
+					map[string]interface{}{"type": "string"},
+					map[string]interface{}{"type": "number"},
+				},
+			},
 		},
 		"anyOf": []interface{}{
 			map[string]interface{}{
@@ -519,12 +525,75 @@ func TestEnsureObjectSchemaMatchesKiroRSNormalization(t *testing.T) {
 	if options["additionalProperties"] != false {
 		t.Fatalf("nested additionalProperties was not preserved: %#v", options)
 	}
-	anyOf := got["anyOf"].([]interface{})[0].(map[string]interface{})
-	if _, exists := anyOf["required"]; !exists {
-		t.Fatalf("nested required was unexpectedly removed: %#v", anyOf)
+	if _, stillThere := got["anyOf"]; stillThere {
+		t.Fatalf("top-level anyOf must be removed for Kiro: %#v", got["anyOf"])
+	}
+	if _, stillThere := got["oneOf"]; stillThere {
+		t.Fatalf("top-level oneOf must be removed for Kiro: %#v", got)
+	}
+	variant := got["properties"].(map[string]interface{})["choice"].(map[string]interface{})
+	if _, exists := variant["anyOf"]; !exists {
+		t.Fatalf("nested anyOf was removed: %#v", variant)
 	}
 	if _, stillPresent := input["additionalProperties"]; !stillPresent {
 		t.Fatalf("expected sanitizer not to mutate caller schema")
+	}
+}
+
+func TestEnsureObjectSchemaMergesTopLevelUnions(t *testing.T) {
+	anyOf := ensureObjectSchema(map[string]interface{}{
+		"anyOf": []interface{}{
+			map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"a": map[string]interface{}{"type": "string"},
+				},
+				"required": []interface{}{"a"},
+			},
+			map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"b": map[string]interface{}{"type": "string"},
+				},
+				"required": []interface{}{"b"},
+			},
+		},
+	}).(map[string]interface{})
+	props := anyOf["properties"].(map[string]interface{})
+	if _, ok := props["a"]; !ok {
+		t.Fatalf("missing merged property a: %#v", props)
+	}
+	if _, ok := props["b"]; !ok {
+		t.Fatalf("missing merged property b: %#v", props)
+	}
+	if required := anyOf["required"].([]interface{}); len(required) != 0 {
+		t.Fatalf("anyOf required leaked onto the root: %#v", required)
+	}
+	if _, ok := anyOf["anyOf"]; ok {
+		t.Fatal("top-level anyOf remained")
+	}
+
+	allOf := ensureObjectSchema(map[string]interface{}{
+		"allOf": []interface{}{
+			map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"a": map[string]interface{}{"type": "string"},
+				},
+				"required": []interface{}{"a"},
+			},
+			map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"b": map[string]interface{}{"type": "string"},
+				},
+				"required": []interface{}{"b"},
+			},
+		},
+	}).(map[string]interface{})
+	required := allOf["required"].([]interface{})
+	if len(required) != 2 || required[0] != "a" || required[1] != "b" {
+		t.Fatalf("allOf required=%#v, want [a b]", required)
 	}
 }
 
@@ -571,6 +640,16 @@ func TestParseModelAndThinking(t *testing.T) {
 		{"haiku dash form", "claude-haiku-4-5", "claude-haiku-4.5", false},
 		{"haiku dot form", "claude-haiku-4.5", "claude-haiku-4.5", false},
 		{"future major bump", "claude-sonnet-5-0", "claude-sonnet-5.0", false},
+		{"dated opus snapshot", "claude-opus-4-8-20260101", "claude-opus-4.8", false},
+		{"fable dash version", "claude-fable-4-8", "claude-fable-4.8", false},
+		{"gpt dash version", "gpt-5-6-sol", "gpt-5.6-sol", false},
+		{"gpt dot version", "gpt-5.6-sol", "gpt-5.6-sol", false},
+		{"minimax dash version", "minimax-m2-5", "minimax-m2.5", false},
+		{"vendor prefix dash", "anthropic/claude-opus-4-8", "claude-opus-4.8", false},
+		{"opus 5.5 mixed case", "Claude-opus-5.5", "claude-opus-5.5", false},
+		{"opus 5.5 dash form", "claude-opus-5-5", "claude-opus-5.5", false},
+		{"opus 5.5 dotted", "claude-opus-5.5", "claude-opus-5.5", false},
+		{"opus 5.5 thinking suffix", "Claude-opus-5.5-thinking", "claude-opus-5.5", true},
 
 		// Bare family name passes through (no minor to normalize).
 		{"bare sonnet 4", "claude-sonnet-4", "claude-sonnet-4", false},
@@ -597,7 +676,7 @@ func TestParseModelAndThinking(t *testing.T) {
 
 		// Unknown models pass through unchanged.
 		{"unknown model", "some-other-model", "some-other-model", false},
-		{"misspelled claude family", "claude-opux-4-8", "claude-opux-4-8", false},
+		{"misspelled family still folds version separator", "claude-opux-4-8", "claude-opux-4.8", false},
 	}
 
 	for _, tc := range tests {
@@ -613,10 +692,24 @@ func TestParseModelAndThinking(t *testing.T) {
 	}
 }
 
+func TestClaudeToKiroPreservesOpus55UpstreamModelID(t *testing.T) {
+	payload := ClaudeToKiro(&ClaudeRequest{
+		Model:     "claude-opus-5.5",
+		MaxTokens: 32,
+		Messages: []ClaudeMessage{{
+			Role:    "user",
+			Content: "hello",
+		}},
+	}, false)
+
+	if got := payload.ConversationState.CurrentMessage.UserInputMessage.ModelID; got != "claude-opus-5.5" {
+		t.Fatalf("upstream model id=%q, want claude-opus-5.5", got)
+	}
+}
+
 func TestParseModelAndThinkingDoesNotRewriteDatedSnapshotMinor(t *testing.T) {
-	// Guards the \b boundary in claudeVersionPattern: without it, the regex would
-	// rewrite "claude-sonnet-4-20250514" to "claude-sonnet-4.20250514" before the
-	// alias table could redirect it.
+	// The explicit alias wins over version folding. A bare YYYYMMDD suffix is
+	// removed rather than treated as a minor version.
 	got, _ := ParseModelAndThinking("claude-sonnet-4-20250514", "-thinking")
 	if got != "claude-sonnet-4" {
 		t.Fatalf("dated snapshot must alias to claude-sonnet-4, got %q", got)

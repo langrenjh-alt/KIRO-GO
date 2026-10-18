@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"kiro-go/config"
 	"net/http"
 )
 
@@ -104,10 +105,8 @@ func (h *Handler) handleClaudeCodeBufferedStream(
 }
 
 func patchClaudeCodeUsageTotals(body []byte) []byte {
-	usagePatch, ok := claudeCodeTerminalUsagePatch(body)
-	if !ok {
-		return body
-	}
+	usagePatch, patchContext := claudeCodeTerminalUsagePatch(body)
+	percent := config.GetTokenBillingInflationPercent()
 
 	blocks := bytes.SplitAfter(body, []byte("\n\n"))
 	for index, block := range blocks {
@@ -115,11 +114,15 @@ func patchClaudeCodeUsageTotals(body []byte) []byte {
 			!bytes.HasPrefix(block, []byte("event: message_delta\n")) {
 			continue
 		}
-		patched, ok := patchClaudeCodeUsageBlock(block, usagePatch)
-		if !ok {
-			continue
+		if patchContext {
+			if patched, ok := patchClaudeCodeUsageBlock(block, usagePatch); ok {
+				block = patched
+			}
 		}
-		blocks[index] = patched
+		// The buffered endpoint defers ordinary builder inflation until this
+		// correction is complete, so each final billing category rounds once.
+		block = inflateClaudeCodeUsageBlock(block, percent)
+		blocks[index] = block
 	}
 	return bytes.Join(blocks, nil)
 }
@@ -173,6 +176,70 @@ func claudeCodeTerminalUsagePatch(body []byte) (claudeCodeUsagePatch, bool) {
 		}, true
 	}
 	return claudeCodeUsagePatch{}, false
+}
+
+func inflateClaudeCodeUsageBlock(block []byte, percent float64) []byte {
+	event, dataStart, dataEnd, ok := decodeClaudeCodeSSEBlock(block)
+	if !ok {
+		return block
+	}
+	var usage map[string]interface{}
+	switch event["type"] {
+	case "message_start":
+		message, ok := event["message"].(map[string]interface{})
+		if !ok {
+			return block
+		}
+		usage, _ = message["usage"].(map[string]interface{})
+	case "message_delta":
+		usage, _ = event["usage"].(map[string]interface{})
+	}
+	if usage == nil {
+		return block
+	}
+	billedUsage := ClaudeUsage{
+		InputTokens:              claudeCodeUsageInt(usage["input_tokens"]),
+		OutputTokens:             claudeCodeUsageInt(usage["output_tokens"]),
+		CacheCreationInputTokens: claudeCodeUsageInt(usage["cache_creation_input_tokens"]),
+		CacheReadInputTokens:     claudeCodeUsageInt(usage["cache_read_input_tokens"]),
+	}
+	if percent == 0 && !billingInputExceedsLimit(&billedUsage) {
+		return block
+	}
+	inflateClaudeUsageWithPercent(&billedUsage, percent)
+	for field, value := range map[string]int{
+		"input_tokens": billedUsage.InputTokens, "output_tokens": billedUsage.OutputTokens,
+		"cache_creation_input_tokens": billedUsage.CacheCreationInputTokens,
+		"cache_read_input_tokens":     billedUsage.CacheReadInputTokens,
+	} {
+		if _, exists := usage[field]; exists {
+			usage[field] = value
+		}
+	}
+	if cacheCreation, ok := usage["cache_creation"].(map[string]interface{}); ok {
+		if creation, exists := usage["cache_creation_input_tokens"].(int); exists {
+			fiveMinute, oneHour := scaleClaudeCodeCacheCreation(
+				claudeCodeUsageInt(cacheCreation["ephemeral_5m_input_tokens"]),
+				claudeCodeUsageInt(cacheCreation["ephemeral_1h_input_tokens"]),
+				creation,
+			)
+			cacheCreation["ephemeral_5m_input_tokens"] = fiveMinute
+			cacheCreation["ephemeral_1h_input_tokens"] = oneHour
+		}
+	}
+	if details, ok := usage["output_tokens_details"].(map[string]interface{}); ok {
+		if _, exists := details["thinking_tokens"]; exists {
+			details["thinking_tokens"] = inflateBillingTokensWithPercent(claudeCodeUsageInt(details["thinking_tokens"]), percent)
+		}
+	}
+	encoded, err := json.Marshal(event)
+	if err != nil {
+		return block
+	}
+	patched := make([]byte, 0, len(block)+len(encoded)-(dataEnd-dataStart))
+	patched = append(patched, block[:dataStart]...)
+	patched = append(patched, encoded...)
+	return append(patched, block[dataEnd:]...)
 }
 
 func patchClaudeCodeUsageBlock(block []byte, patch claudeCodeUsagePatch) ([]byte, bool) {

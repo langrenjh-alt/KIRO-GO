@@ -14,6 +14,9 @@ const (
 // snake_case.
 type AdditionalModelRequestFields struct {
 	OutputConfig *KiroOutputConfig `json:"output_config,omitempty"`
+	// MaxTokens is the Kiro additionalModelRequestFields.max_tokens value.
+	// kiro2cc-proxy puts the client limit here and clamps it to at least 1024.
+	MaxTokens int `json:"max_tokens,omitempty"`
 }
 
 type KiroOutputConfig struct {
@@ -135,17 +138,34 @@ func buildClaudeAdditionalModelRequestFields(req *ClaudeRequest, modelID string,
 	if req.OutputConfig != nil {
 		explicitEffort = strings.TrimSpace(req.OutputConfig.Effort)
 	}
-	if !thinking && !isClaudeThinkingRequested(req.Thinking) && explicitEffort == "" {
-		return nil
-	}
+	// Tool calls and structured output are scored on the answer itself. A
+	// default effort=low makes those turns narrate or miss the schema when the
+	// client did not ask for thinking. Named effort and real thinking turns
+	// keep the kiro2cc low default.
+	omitDefaultEffort := !thinking && explicitEffort == "" &&
+		(claudeRequestHasClientTools(req) || claudeRequestHasStructuredOutput(req))
+	return kiroAdditionalModelRequestFields(modelID, explicitEffort, omitDefaultEffort, req.MaxTokens)
+}
 
-	if explicitEffort != "" {
-		return newReasoningFields(modelID, explicitEffort)
+// clampReferenceMaxTokens applies the Kiro additionalModelRequestFields limit
+// used by kiro2cc-proxy: at least 1024, and at most 128000 for opus 4.7, 4.8,
+// and opus 5, otherwise 64000.
+func clampReferenceMaxTokens(modelID string, tokens int) int {
+	if tokens < 1024 {
+		tokens = 1024
 	}
-	if thinkingType == "enabled" && req.Thinking.BudgetTokens > 0 {
-		return newReasoningFields(modelID, effortFromBudgetTokens(req.Thinking.BudgetTokens))
+	limit := 64000
+	model := strings.ToLower(modelID)
+	if strings.Contains(model, "opus-4.7") || strings.Contains(model, "opus-4-7") ||
+		strings.Contains(model, "opus-4.8") || strings.Contains(model, "opus-4-8") ||
+		strings.Contains(model, "opus-5") || strings.Contains(model, "opus.5") ||
+		strings.Contains(model, "opus 5") {
+		limit = 128000
 	}
-	return newReasoningFields(modelID, "high")
+	if tokens > limit {
+		return limit
+	}
+	return tokens
 }
 
 func buildOpenAIAdditionalModelRequestFields(req *OpenAIRequest, modelID string, thinking bool) *AdditionalModelRequestFields {
@@ -159,17 +179,82 @@ func buildOpenAIAdditionalModelRequestFields(req *OpenAIRequest, modelID string,
 		return nil
 	}
 
+	if strings.EqualFold(strings.TrimSpace(req.ReasoningEffort), "none") {
+		return nil
+	}
 	explicitEffort, effortRequested := normalizeOpenAIReasoningEffort(modelID, req.ReasoningEffort)
-	if !thinking && explicitEffort == "" {
+	omitDefaultEffort := !thinking && !effortRequested &&
+		(openAIRequestHasClientTools(req) || openAIRequestHasStructuredOutput(req))
+	return kiroAdditionalModelRequestFields(modelID, explicitEffort, omitDefaultEffort, req.MaxTokens)
+}
+
+// kiroAdditionalModelRequestFields applies the kiro2cc default of effort=low
+// unless omitDefaultEffort is set. The output limit still travels in
+// max_tokens when the client supplied one.
+func kiroAdditionalModelRequestFields(modelID, explicitEffort string, omitDefaultEffort bool, maxTokens int) *AdditionalModelRequestFields {
+	if explicitEffort == "" && !omitDefaultEffort {
+		explicitEffort = "low"
+	}
+	var fields *AdditionalModelRequestFields
+	if explicitEffort != "" {
+		fields = newReasoningFields(modelID, explicitEffort)
+	} else {
+		fields = &AdditionalModelRequestFields{}
+	}
+	if maxTokens > 0 {
+		fields.MaxTokens = clampReferenceMaxTokens(modelID, maxTokens)
+	}
+	if fields.OutputConfig == nil && fields.MaxTokens == 0 {
 		return nil
 	}
-	if !effortRequested && explicitEffort == "" {
-		explicitEffort = "high"
+	return fields
+}
+
+func claudeRequestHasClientTools(req *ClaudeRequest) bool {
+	if req == nil {
+		return false
 	}
-	if explicitEffort == "" {
-		return nil
+	for _, tool := range req.Tools {
+		toolType := strings.TrimSpace(tool.Type)
+		if toolType != "" && toolType != "custom" {
+			continue
+		}
+		if strings.TrimSpace(tool.Name) != "" {
+			return true
+		}
 	}
-	return newReasoningFields(modelID, explicitEffort)
+	return false
+}
+
+func claudeRequestHasStructuredOutput(req *ClaudeRequest) bool {
+	return req != nil && req.OutputConfig != nil && req.OutputConfig.Format != nil
+}
+
+func openAIRequestHasClientTools(req *OpenAIRequest) bool {
+	if req == nil {
+		return false
+	}
+	for _, tool := range req.Tools {
+		if isResponsesWebSearchTool(tool) {
+			continue
+		}
+		if strings.TrimSpace(tool.Function.Name) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func openAIRequestHasStructuredOutput(req *OpenAIRequest) bool {
+	if req == nil || req.ResponseFormat == nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(req.ResponseFormat.Type)) {
+	case "json_object", "json_schema":
+		return true
+	default:
+		return false
+	}
 }
 
 func normalizeOpenAIReasoningEffort(modelID, rawEffort string) (string, bool) {

@@ -105,11 +105,36 @@ func preflightKiroPayload(payload *KiroPayload) (kiroPayloadPreflightResult, err
 	if err != nil {
 		return result, err
 	}
+	originalTotalBytes := before.TotalBytes
+	originalEstimatedTokens := before.EstimatedInputTokens
 	result.Before = before
 	result.After = before
 	setKiroPayloadAttemptSize(payload, before)
 	if kiroPayloadFitsPreflight(before, result.RawBodyLimitBytes, result.InputTokenBudget) {
 		return result, nil
+	}
+	// Images are not part of history trimming. Shrink them before dropping
+	// conversation turns so a pair of screenshots can fit the raw body limit
+	// without discarding the rest of the request.
+	if result.RawBodyLimitBytes > 0 && before.TotalBytes > result.RawBodyLimitBytes {
+		if _, shrinkErr := compressKiroPayloadImages(payload, result.RawBodyLimitBytes); shrinkErr != nil {
+			return result, shrinkErr
+		}
+		before, err = measureKiroPayloadTotals(payload)
+		if err != nil {
+			return result, err
+		}
+		result.Before = before
+		result.After = before
+		setKiroPayloadAttemptSize(payload, before)
+		if kiroPayloadFitsPreflight(before, result.RawBodyLimitBytes, result.InputTokenBudget) {
+			after, measureErr := measureKiroPayloadBreakdown(payload)
+			if measureErr != nil {
+				return result, measureErr
+			}
+			result.After = after
+			return result, nil
+		}
 	}
 	before, err = measureKiroPayloadBreakdown(payload)
 	if err != nil {
@@ -191,8 +216,8 @@ func preflightKiroPayload(payload *KiroPayload) (kiroPayloadPreflightResult, err
 	result.DroppedHistoryEntries = minimalDrop
 	setKiroPayloadAttemptSize(payload, minimalBreakdown)
 	preflightErr := &KiroPayloadPreflightError{
-		OriginalTotalBytes:           before.TotalBytes,
-		OriginalEstimatedInputTokens: before.EstimatedInputTokens,
+		OriginalTotalBytes:           originalTotalBytes,
+		OriginalEstimatedInputTokens: originalEstimatedTokens,
 		RawBodyLimitBytes:            result.RawBodyLimitBytes,
 		ModelInputLimitTokens:        result.ModelInputLimitTokens,
 		InputTokenBudget:             result.InputTokenBudget,

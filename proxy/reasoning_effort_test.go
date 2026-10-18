@@ -83,6 +83,9 @@ func TestModelSupportsNativeReasoningAllowlist(t *testing.T) {
 		"claude-mythos-5.1",
 		"claude-sonnet-5",
 		"claude-opus-5",
+		"Claude-opus-5.5",
+		"claude-opus-5-5",
+		"claude-sonnet-5.5",
 		"claude-5",
 	} {
 		if !modelSupportsNativeReasoning(model) {
@@ -122,12 +125,12 @@ func TestClaudeToKiroReasoningEffort(t *testing.T) {
 		assertPayloadEffort(t, payload, "low")
 	})
 
-	t.Run("budget derives effort", func(t *testing.T) {
+	t.Run("budget does not change the upstream effort", func(t *testing.T) {
 		req := base("claude-opus-4.8")
 		req.Thinking = &ClaudeThinkingConfig{Type: "enabled", BudgetTokens: 16_001}
 
 		payload := ClaudeToKiro(req, true)
-		assertPayloadEffort(t, payload, "high")
+		assertPayloadEffort(t, payload, "low")
 	})
 
 	t.Run("adaptive opus 4.6 permits normalized effort", func(t *testing.T) {
@@ -282,7 +285,7 @@ func TestOpus46ThinkingSuffixSynthesizesAdaptiveMode(t *testing.T) {
 	if prompt := claudeThinkingPrompt(req, thinking); !strings.Contains(prompt, "<thinking_mode>adaptive</thinking_mode>") {
 		t.Fatalf("suffix prompt = %q", prompt)
 	}
-	assertPayloadEffort(t, ClaudeToKiro(req, thinking), "high")
+	assertPayloadEffort(t, ClaudeToKiro(req, thinking), "low")
 }
 
 func TestOpenAIToKiroReasoningEffort(t *testing.T) {
@@ -384,6 +387,107 @@ func TestResponsesReasoningEffortNestedPrecedesTopLevelAlias(t *testing.T) {
 	req.Reasoning.Effort = "   "
 	if got := req.effectiveReasoningEffort(); got != "low" {
 		t.Fatalf("blank nested effort should fall back to alias, got %q", got)
+	}
+}
+
+func TestToolAndStructuredOutputOmitDefaultEffort(t *testing.T) {
+	toolReq := &ClaudeRequest{
+		Model:     "claude-opus-4.8",
+		MaxTokens: 256,
+		Messages:  []ClaudeMessage{{Role: "user", Content: "weather in Paris"}},
+		Tools:     []ClaudeTool{{Name: "get_weather", InputSchema: map[string]interface{}{"type": "object"}}},
+	}
+	toolFields := ClaudeToKiro(toolReq, false).AdditionalModelRequestFields
+	if toolFields == nil || toolFields.OutputConfig != nil || toolFields.MaxTokens != 1024 {
+		t.Fatalf("tool turn fields = %#v, want max_tokens without effort", toolFields)
+	}
+	thinkingTool := ClaudeToKiro(&ClaudeRequest{
+		Model:     "claude-opus-4.8",
+		MaxTokens: 256,
+		Messages:  []ClaudeMessage{{Role: "user", Content: "weather in Paris"}},
+		Thinking:  &ClaudeThinkingConfig{Type: "enabled", BudgetTokens: 2000},
+		Tools:     []ClaudeTool{{Name: "get_weather", InputSchema: map[string]interface{}{"type": "object"}}},
+	}, true)
+	assertPayloadEffort(t, thinkingTool, "low")
+
+	schema := json.RawMessage(`{"type":"object","properties":{"answer":{"type":"integer"}},"additionalProperties":false}`)
+	structured := ClaudeToKiro(&ClaudeRequest{
+		Model:     "claude-opus-4.8",
+		MaxTokens: 128,
+		Messages:  []ClaudeMessage{{Role: "user", Content: "answer"}},
+		OutputConfig: &ClaudeOutputConfig{Format: &ClaudeOutputFormat{
+			Type:   "json_schema",
+			Schema: schema,
+		}},
+	}, false)
+	if structured.AdditionalModelRequestFields == nil || structured.AdditionalModelRequestFields.OutputConfig != nil {
+		t.Fatalf("structured output fields = %#v, want no default effort", structured.AdditionalModelRequestFields)
+	}
+	named := ClaudeToKiro(&ClaudeRequest{
+		Model:    "claude-opus-4.8",
+		Messages: []ClaudeMessage{{Role: "user", Content: "answer"}},
+		OutputConfig: &ClaudeOutputConfig{
+			Effort: "high",
+			Format: &ClaudeOutputFormat{Type: "json_schema", Schema: schema},
+		},
+	}, false)
+	assertPayloadEffort(t, named, "high")
+
+	webSearch := ClaudeToKiro(&ClaudeRequest{
+		Model:    "claude-opus-4.8",
+		Messages: []ClaudeMessage{{Role: "user", Content: "search"}},
+		Tools:    []ClaudeTool{{Type: "web_search_20250305", Name: "web_search"}},
+	}, false)
+	assertPayloadEffort(t, webSearch, "low")
+
+	var openAIFunction OpenAITool
+	openAIFunction.Type = "function"
+	openAIFunction.Function.Name = "get_weather"
+	openAIFunction.Function.Parameters = map[string]interface{}{"type": "object"}
+	openAITool := OpenAIToKiro(&OpenAIRequest{
+		Model:     "claude-opus-4.8",
+		MaxTokens: 200,
+		Messages:  []OpenAIMessage{{Role: "user", Content: "weather"}},
+		Tools:     []OpenAITool{openAIFunction},
+	}, false)
+	if openAITool.AdditionalModelRequestFields == nil || openAITool.AdditionalModelRequestFields.OutputConfig != nil {
+		t.Fatalf("OpenAI tool fields = %#v, want no default effort", openAITool.AdditionalModelRequestFields)
+	}
+	openAIStructured := OpenAIToKiro(&OpenAIRequest{
+		Model:    "claude-opus-4.8",
+		Messages: []OpenAIMessage{{Role: "user", Content: "answer"}},
+		ResponseFormat: &OpenAIResponseFormat{
+			Type:       "json_schema",
+			JSONSchema: &OpenAIJSONSchema{Name: "answer", Schema: schema},
+		},
+	}, false)
+	if openAIStructured.AdditionalModelRequestFields != nil && openAIStructured.AdditionalModelRequestFields.OutputConfig != nil {
+		t.Fatalf("OpenAI structured output kept default effort: %#v", openAIStructured.AdditionalModelRequestFields)
+	}
+}
+
+func TestPlainOpusBodyMatchesReferenceShape(t *testing.T) {
+	payload := ClaudeToKiro(&ClaudeRequest{
+		Model:     "claude-opus-5.5",
+		MaxTokens: 16,
+		Messages:  []ClaudeMessage{{Role: "user", Content: "ping"}},
+	}, false)
+	if payload.InferenceConfig != nil {
+		t.Fatalf("inferenceConfig = %#v", payload.InferenceConfig)
+	}
+	if payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext == nil {
+		t.Fatal("current userInputMessageContext was omitted")
+	}
+	fields := payload.AdditionalModelRequestFields
+	if fields == nil || fields.OutputConfig == nil || fields.OutputConfig.Effort != "low" || fields.MaxTokens != 1024 {
+		t.Fatalf("fields = %#v", fields)
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "inferenceConfig") || !strings.Contains(string(raw), `"userInputMessageContext":{}`) {
+		t.Fatalf("wire = %s", raw)
 	}
 }
 

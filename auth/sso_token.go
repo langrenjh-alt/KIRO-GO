@@ -317,8 +317,7 @@ func GetUserInfo(accessToken string) (email, userID string, err error) {
 	req, _ := http.NewRequest("GET", url, nil)
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "aws-sdk-js/1.0.18 KiroAPIProxy")
-	req.Header.Set("x-amz-user-agent", "aws-sdk-js/1.0.18 KiroAPIProxy")
+	applyKiroRuntimeIdentity(req, "")
 
 	client := httpClient()
 	resp, err := client.Do(req)

@@ -2,13 +2,16 @@ package proxy
 
 import (
 	"fmt"
-	"kiro-go/config"
 	"net/http"
+
+	"github.com/google/uuid"
+
+	"kiro-go/config"
 )
 
 const (
-	kiroStreamingSDKVersion = "1.0.34"
-	kiroRuntimeSDKVersion   = "1.0.0"
+	kiroStreamingSDKVersion = config.KiroStreamingSDKVersion
+	kiroRuntimeSDKVersion   = config.KiroRuntimeSDKVersion
 )
 
 type kiroHeaderValues struct {
@@ -26,27 +29,12 @@ func buildRuntimeHeaderValues(account *config.Account, host string) kiroHeaderVa
 }
 
 func buildKiroHeaderValues(account *config.Account, host, apiName, sdkVersion, mode string) kiroHeaderValues {
-	clientCfg := config.GetKiroClientConfig()
 	machineID := ""
 	if account != nil {
 		machineID = account.MachineId
 	}
 
-	userAgent := fmt.Sprintf(
-		"aws-sdk-js/%s ua/2.1 os/%s lang/js md/nodejs#%s api/%s#%s %s KiroIDE-%s",
-		sdkVersion,
-		clientCfg.SystemVersion,
-		clientCfg.NodeVersion,
-		apiName,
-		sdkVersion,
-		mode,
-		clientCfg.KiroVersion,
-	)
-	amzUserAgent := fmt.Sprintf("aws-sdk-js/%s KiroIDE-%s", sdkVersion, clientCfg.KiroVersion)
-	if machineID != "" {
-		userAgent += "-" + machineID
-		amzUserAgent += "-" + machineID
-	}
+	userAgent, amzUserAgent := config.KiroIdentityHeaders(machineID, apiName, sdkVersion, mode)
 
 	return kiroHeaderValues{
 		UserAgent:    userAgent,
@@ -79,4 +67,20 @@ func applyKiroBaseHeaders(req *http.Request, account *config.Account, values kir
 	if values.Host != "" {
 		req.Host = values.Host
 	}
+}
+
+// applyKiroSDKCallHeaders mirrors the AWS SDK for JavaScript attempt counter.
+// attempt is capped at max=3 because that is the counter the IDE SDK advertises.
+func applyKiroSDKCallHeaders(req *http.Request, attempt int) {
+	if req == nil {
+		return
+	}
+	if attempt < 1 {
+		attempt = 1
+	}
+	if attempt > 3 {
+		attempt = 3
+	}
+	req.Header.Set("Amz-Sdk-Request", fmt.Sprintf("attempt=%d; max=3", attempt))
+	req.Header.Set("Amz-Sdk-Invocation-Id", uuid.NewString())
 }

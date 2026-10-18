@@ -25,6 +25,7 @@ const (
 
 	CacheModeNative             = "native"
 	CacheModeFunctionSimulation = "function_simulation"
+	CacheModeFixedRatio         = "fixed_ratio"
 
 	FunctionCacheScopeBodyFingerprint = "body_fingerprint"
 
@@ -86,6 +87,16 @@ type FunctionCacheConfig struct {
 	MaxCacheReadPercent   *int   `json:"maxCacheReadPercent,omitempty"`
 	MinTokens             int    `json:"minTokens,omitempty"`
 	InputFingerprintChars int    `json:"inputFingerprintChars,omitempty"`
+}
+
+// FixedRatioCacheConfig splits every request's input tokens by fixed
+// percentages. Output tokens stay the real generated count. The two
+// percentages are shares of the input; when they sum past 100 they are
+// scaled down together so input + cache read + cache creation stays equal
+// to the input token count.
+type FixedRatioCacheConfig struct {
+	CacheReadPercent     int `json:"cacheReadPercent"`
+	CacheCreationPercent int `json:"cacheCreationPercent"`
 }
 
 func normalizeRateLimitConfig(c RateLimitConfig) RateLimitConfig {
@@ -250,9 +261,32 @@ func normalizeCacheMode(mode string) string {
 	switch strings.TrimSpace(mode) {
 	case CacheModeFunctionSimulation:
 		return CacheModeFunctionSimulation
+	case CacheModeFixedRatio:
+		return CacheModeFixedRatio
 	default:
 		return CacheModeNative
 	}
+}
+
+// IsKnownCacheMode reports whether mode is one of the selectable cache strategies.
+func IsKnownCacheMode(mode string) bool {
+	switch strings.TrimSpace(mode) {
+	case CacheModeNative, CacheModeFunctionSimulation, CacheModeFixedRatio:
+		return true
+	default:
+		return false
+	}
+}
+
+// NormalizeFixedRatioCacheConfig clamps both percentages to 0-100.
+func NormalizeFixedRatioCacheConfig(c FixedRatioCacheConfig) FixedRatioCacheConfig {
+	return normalizeFixedRatioCacheConfig(c)
+}
+
+func normalizeFixedRatioCacheConfig(c FixedRatioCacheConfig) FixedRatioCacheConfig {
+	c.CacheReadPercent = clampPolicyInt(c.CacheReadPercent, 0, 100)
+	c.CacheCreationPercent = clampPolicyInt(c.CacheCreationPercent, 0, 100)
+	return c
 }
 
 func normalizeFunctionCacheConfig(c FunctionCacheConfig) FunctionCacheConfig {
@@ -389,6 +423,15 @@ func GetFunctionCacheConfig() FunctionCacheConfig {
 	return normalizeFunctionCacheConfig(cfg.FunctionCache)
 }
 
+func GetFixedRatioCacheConfig() FixedRatioCacheConfig {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return normalizeFixedRatioCacheConfig(FixedRatioCacheConfig{})
+	}
+	return normalizeFixedRatioCacheConfig(cfg.FixedRatioCache)
+}
+
 // UpdateDispatchPolicies validates and persists all low-coupling policy fields
 // as one atomic config update, rolling memory back if persistence fails.
 func UpdateDispatchPolicies(rate *RateLimitConfig, scheduling *SchedulingConfig, priority *AccountPriorityConfig) error {
@@ -431,21 +474,24 @@ func UpdateReasoningCapConfig(value ReasoningCapConfig) error {
 
 // UpdateCachePolicy switches cache modes and updates simulation settings in one
 // atomic operation. Nil fields preserve existing values.
-func UpdateCachePolicy(mode *string, functionCache *FunctionCacheConfig) error {
+func UpdateCachePolicy(mode *string, functionCache *FunctionCacheConfig, fixedRatio *FixedRatioCacheConfig) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	if cfg == nil {
 		return fmt.Errorf("config is not initialized")
 	}
-	previousMode, previousFunctionCache := cfg.CacheMode, cfg.FunctionCache
+	previousMode, previousFunctionCache, previousFixedRatio := cfg.CacheMode, cfg.FunctionCache, cfg.FixedRatioCache
 	if mode != nil {
 		cfg.CacheMode = normalizeCacheMode(*mode)
 	}
 	if functionCache != nil {
 		cfg.FunctionCache = normalizeFunctionCacheConfig(*functionCache)
 	}
+	if fixedRatio != nil {
+		cfg.FixedRatioCache = normalizeFixedRatioCacheConfig(*fixedRatio)
+	}
 	if err := Save(); err != nil {
-		cfg.CacheMode, cfg.FunctionCache = previousMode, previousFunctionCache
+		cfg.CacheMode, cfg.FunctionCache, cfg.FixedRatioCache = previousMode, previousFunctionCache, previousFixedRatio
 		return err
 	}
 	return nil

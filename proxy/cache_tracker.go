@@ -59,6 +59,9 @@ type promptCacheProfile struct {
 	SimulatedHitRatePercent    int
 	SimulatedMaxReadPercent    int
 	SimulatedMinCacheableToken int
+	FixedRatioCache            bool
+	FixedCacheReadPercent      int
+	FixedCacheCreationPercent  int
 	runtimeTracker             *promptCacheTracker
 	requestTiming              *requestTiming
 }
@@ -426,6 +429,11 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 // BuildClaudeProfileWithPolicy snapshots all request-scoped cache controls into
 // the profile so a concurrent policy edit cannot mix old and new settings.
 func (t *promptCacheTracker) BuildClaudeProfileWithPolicy(req *ClaudeRequest, totalInputTokens int, policy config.PromptCachePolicy, isolationSeeds ...string) *promptCacheProfile {
+	if policy.CacheMode == config.CacheModeFixedRatio {
+		profile := buildFixedRatioCacheProfile(req, totalInputTokens, policy.FixedRatioCache)
+		profile.runtimeTracker = t
+		return profile
+	}
 	if policy.CacheMode == config.CacheModeFunctionSimulation {
 		profile := buildSimulatedFunctionCacheProfile(req, totalInputTokens, policy.FunctionCache)
 		if profile != nil {
@@ -549,6 +557,11 @@ func (t *promptCacheTracker) BuildClaudeProfileForRequest(req *ClaudeRequest, to
 // BuildClaudeProfileForRequestWithPolicy is the request-body-aware variant used
 // by the handler after resolving the calling API key's named policy.
 func (t *promptCacheTracker) BuildClaudeProfileForRequestWithPolicy(req *ClaudeRequest, totalInputTokens int, isolationSeed, requestBodyFingerprint string, policy config.PromptCachePolicy) *promptCacheProfile {
+	if policy.CacheMode == config.CacheModeFixedRatio {
+		profile := buildFixedRatioCacheProfile(req, totalInputTokens, policy.FixedRatioCache)
+		profile.runtimeTracker = t
+		return profile
+	}
 	if policy.CacheMode == config.CacheModeFunctionSimulation {
 		profile := buildSimulatedFunctionCacheProfile(req, totalInputTokens, policy.FunctionCache, requestBodyFingerprint)
 		if profile != nil {
@@ -703,6 +716,9 @@ func simulatedFunctionCacheHitAllowed(profile *promptCacheProfile, now time.Time
 }
 
 func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfile) (u promptCacheUsage) {
+	if profile != nil && profile.FixedRatioCache {
+		return fixedRatioCacheUsage(profile.TotalInputTokens, profile.FixedCacheReadPercent, profile.FixedCacheCreationPercent)
+	}
 	if t == nil || profile == nil || len(profile.Breakpoints) == 0 || accountID == "" {
 		return promptCacheUsage{}
 	}
@@ -861,6 +877,9 @@ func (t *promptCacheTracker) updateSimulatedFunctionCache(profile *promptCachePr
 }
 
 func (t *promptCacheTracker) Update(accountID string, profile *promptCacheProfile) {
+	if profile != nil && profile.FixedRatioCache {
+		return
+	}
 	if t == nil || profile == nil || len(profile.Breakpoints) == 0 || accountID == "" {
 		return
 	}
@@ -1398,8 +1417,10 @@ func appendPromptBlock(blocks *[]cacheablePromptBlock, wrapper map[string]interf
 	tokenValue["block"] = normalizeToolLinkageForCacheFingerprint(wrapper["block"], nil)
 	kind, _ := wrapper["kind"].(string)
 	*blocks = append(*blocks, cacheablePromptBlock{
-		Value:           fingerprintValue,
-		Tokens:          estimateApproxTokens(canonicalizeCacheValue(tokenValue)),
+		Value: fingerprintValue,
+		// Token weight ignores image bytes. The fingerprint above still
+		// contains them, so a different picture does not reuse this prefix.
+		Tokens:          estimateApproxTokens(canonicalizeCacheValue(omitImagePayloadForTokens(tokenValue))),
 		TTL:             ttl,
 		HasCacheControl: hasCacheControl,
 		Kind:            kind,
@@ -1649,32 +1670,54 @@ func billedClaudeInputTokens(inputTokens int, usage promptCacheUsage) int {
 	return maxInt(inputTokens-usage.CacheCreationInputTokens-usage.CacheReadInputTokens, 0)
 }
 
-func buildClaudeUsageMap(inputTokens, outputTokens int, usage promptCacheUsage, includeCache bool) map[string]interface{} {
+func buildClaudeUsageMap(inputTokens, outputTokens int, usage promptCacheUsage, includeCache bool, deferInflation ...bool) map[string]interface{} {
+	billedUsage := ClaudeUsage{
+		InputTokens:              billedClaudeInputTokens(inputTokens, usage),
+		OutputTokens:             outputTokens,
+		CacheCreationInputTokens: usage.CacheCreationInputTokens,
+		CacheReadInputTokens:     usage.CacheReadInputTokens,
+		CacheCreation: &ClaudeCacheCreationUsage{
+			Ephemeral5mInputTokens: usage.CacheCreation5mInputTokens,
+			Ephemeral1hInputTokens: usage.CacheCreation1hInputTokens,
+		},
+	}
+	if len(deferInflation) == 0 || !deferInflation[0] {
+		inflateClaudeUsage(&billedUsage)
+	}
 	result := map[string]interface{}{
-		"input_tokens":  billedClaudeInputTokens(inputTokens, usage),
-		"output_tokens": outputTokens,
+		"input_tokens":  billedUsage.InputTokens,
+		"output_tokens": billedUsage.OutputTokens,
 		"service_tier":  "standard",
 		"inference_geo": "not_available",
 	}
 	if !includeCache {
 		return result
 	}
-	result["cache_creation_input_tokens"] = usage.CacheCreationInputTokens
-	result["cache_read_input_tokens"] = usage.CacheReadInputTokens
+	result["cache_creation_input_tokens"] = billedUsage.CacheCreationInputTokens
+	result["cache_read_input_tokens"] = billedUsage.CacheReadInputTokens
 	result["cache_creation"] = map[string]int{
-		"ephemeral_5m_input_tokens": usage.CacheCreation5mInputTokens,
-		"ephemeral_1h_input_tokens": usage.CacheCreation1hInputTokens,
+		"ephemeral_5m_input_tokens": billedUsage.CacheCreation.Ephemeral5mInputTokens,
+		"ephemeral_1h_input_tokens": billedUsage.CacheCreation.Ephemeral1hInputTokens,
 	}
 	return result
 }
 
-func buildClaudeTerminalUsageMap(inputTokens, outputTokens int, usage promptCacheUsage) map[string]interface{} {
+func buildClaudeTerminalUsageMap(inputTokens, outputTokens int, usage promptCacheUsage, deferInflation ...bool) map[string]interface{} {
+	billedUsage := ClaudeUsage{
+		InputTokens:              billedClaudeInputTokens(inputTokens, usage),
+		OutputTokens:             outputTokens,
+		CacheCreationInputTokens: usage.CacheCreationInputTokens,
+		CacheReadInputTokens:     usage.CacheReadInputTokens,
+	}
+	if len(deferInflation) == 0 || !deferInflation[0] {
+		inflateClaudeUsage(&billedUsage)
+	}
 	return map[string]interface{}{
-		"input_tokens":                billedClaudeInputTokens(inputTokens, usage),
-		"output_tokens":               outputTokens,
+		"input_tokens":                billedUsage.InputTokens,
+		"output_tokens":               billedUsage.OutputTokens,
 		"output_tokens_details":       map[string]int{"thinking_tokens": 0},
-		"cache_creation_input_tokens": usage.CacheCreationInputTokens,
-		"cache_read_input_tokens":     usage.CacheReadInputTokens,
+		"cache_creation_input_tokens": billedUsage.CacheCreationInputTokens,
+		"cache_read_input_tokens":     billedUsage.CacheReadInputTokens,
 	}
 }
 

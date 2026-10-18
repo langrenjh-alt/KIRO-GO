@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -49,10 +50,16 @@ const (
 
 // Kiro streaming endpoint. Hosts containing us-east-1 are rewritten to the
 // account's effective API region immediately before each request.
+//
+// These are the AWS data-plane routes used by kiro2cc-proxy. The default, and
+// the "kiro" WebUI choice, is the IDE route on q.{region}.amazonaws.com with
+// no x-amz-target. CodeWhisperer and Amazon Q are the other two AWS routes.
 type kiroEndpoint struct {
-	URL    string
-	Origin string
-	Name   string
+	URL       string
+	Origin    string
+	AmzTarget string
+	Name      string
+	Key       string
 }
 
 var kiroEndpoints = []kiroEndpoint{
@@ -60,6 +67,21 @@ var kiroEndpoints = []kiroEndpoint{
 		URL:    "https://q.us-east-1.amazonaws.com/generateAssistantResponse",
 		Origin: "AI_EDITOR",
 		Name:   "Kiro IDE",
+		Key:    "kiro",
+	},
+	{
+		URL:       "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse",
+		Origin:    "AI_EDITOR",
+		AmzTarget: "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+		Name:      "CodeWhisperer",
+		Key:       "codewhisperer",
+	},
+	{
+		URL:       "https://q.us-east-1.amazonaws.com/generateAssistantResponse",
+		Origin:    "AI_EDITOR",
+		AmzTarget: "AmazonQDeveloperStreamingService.SendMessage",
+		Name:      "AmazonQ",
+		Key:       "amazonq",
 	},
 }
 
@@ -118,10 +140,17 @@ func GetRestClientForProxy(proxyURL string) *http.Client {
 	return actual.(*http.Client)
 }
 
-// ResolveAccountProxyURL returns the effective proxy URL for an account.
-// Falls back to global config.GetProxyURL() if the account has no per-account proxy.
+// ResolveAccountProxyURL returns the proxy for this account. When s2ap binding
+// is on, the account keeps one pool proxy for the configured hold. Exits are
+// shared only after every exit already has an account. Otherwise an
+// account-specific proxy wins, then the global proxy.
 func ResolveAccountProxyURL(account *config.Account) string {
-	if account != nil && account.ProxyURL != "" {
+	if config.S2APBindEnabled() && account != nil {
+		if proxyURL := s2apProxyForAccount(account.ID); proxyURL != "" {
+			return proxyURL
+		}
+	}
+	if account != nil && strings.TrimSpace(account.ProxyURL) != "" {
 		return account.ProxyURL
 	}
 	return config.GetProxyURL()
@@ -215,38 +244,6 @@ func proxyBypassed(host, noProxy string) bool {
 	return false
 }
 
-// InitKiroHttpClient initializes (or reinitializes) the HTTP clients used for Kiro API requests.
-func InitKiroHttpClient(proxyURL string) {
-	client := &http.Client{
-		// http.Client.Timeout includes reading the response body, so a fixed
-		// value here truncates otherwise healthy SSE streams mid-response.
-		Timeout:   0,
-		Transport: buildKiroTransport(proxyURL),
-	}
-	oldClient := kiroHttpStore.Swap(client)
-
-	restClient := &http.Client{
-		Timeout:   30 * time.Second,
-		Transport: buildKiroTransport(proxyURL),
-	}
-	oldRestClient := kiroRestHttpStore.Swap(restClient)
-	closeHTTPClientIdleConnections(oldClient)
-	closeHTTPClientIdleConnections(oldRestClient)
-}
-
-// CloseKiroIdleConnections closes only idle upstream connections. Active
-// requests continue; subsequent calls establish fresh direct/proxy tunnels.
-func CloseKiroIdleConnections() {
-	closeHTTPClientIdleConnections(kiroHttpStore.Load())
-	closeHTTPClientIdleConnections(kiroRestHttpStore.Load())
-	proxyClientCache.Range(func(_, value interface{}) bool {
-		if client, ok := value.(*http.Client); ok {
-			closeHTTPClientIdleConnections(client)
-		}
-		return true
-	})
-}
-
 func closeHTTPClientIdleConnections(client *http.Client) {
 	if client == nil || client.Transport == nil {
 		return
@@ -326,6 +323,9 @@ type KiroPayload struct {
 	// ReasoningSignatureRetry records the one same-account retry allowed after
 	// Kiro rejects a replayed native reasoning signature.
 	ReasoningSignatureRetry bool `json:"-"`
+	// ModelIDAlternateRetry records the one same-account retry that swaps a
+	// dotted model version for the catalog's dashed spelling (or vice versa).
+	ModelIDAlternateRetry bool `json:"-"`
 
 	// AgentCompletionMarker is the optional private final-answer prefix for a
 	// recognized tool-enabled coding harness. It is stripped from final output
@@ -396,6 +396,10 @@ type KiroPayload struct {
 	// Enabled after an unmarked END_TURN starts its bounded continuation chain.
 	// Streaming adapters may already have forwarded its visible text.
 	agentActionContinuationTimeout bool
+	// eventsNoneAccounts records accounts that returned an events=none body for
+	// this request. opus55EmptyFallbackUsed prevents a second remap to opus 5.
+	eventsNoneAccounts      map[string]struct{}
+	opus55EmptyFallbackUsed bool
 	// requestContext links the upstream request lifetime to the downstream
 	// client. It is intentionally unexported and never serialized.
 	requestContext context.Context
@@ -404,6 +408,16 @@ type KiroPayload struct {
 	timeoutPolicy     kiroTimeoutPolicy
 	recoveryStartedAt time.Time
 	recoveryDeadline  time.Time
+	// sdkAttempt is the AWS SDK retry counter written to Amz-Sdk-Request.
+	// It stays off the JSON body. Semantic clones start again at attempt 1.
+	sdkAttempt int
+	// conversationIDBase is the downstream conversation id before it is scoped
+	// to one account. Scoping stops the same id from being replayed on every
+	// pooled credential. conversationIDScoped remembers the value last written
+	// so a handler-chosen replacement is not mistaken for that scoped value.
+	conversationIDBase         string
+	conversationIDScoped       string
+	conversationIDScopeAccount string
 	// requestID and the last-attempt measurements make every upstream failure
 	// correlatable even when Kiro omits its own request identifier.
 	requestID                       string
@@ -413,6 +427,28 @@ type KiroPayload struct {
 	// forcedBearerRefreshAccounts limits upstream-invalid bearer recovery to one
 	// forced refresh per credential for this logical downstream request.
 	forcedBearerRefreshAccounts map[string]bool
+}
+
+func (payload *KiroPayload) sdkRequestAttempt() int {
+	if payload == nil || payload.sdkAttempt < 1 {
+		return 1
+	}
+	if payload.sdkAttempt > 3 {
+		return 3
+	}
+	return payload.sdkAttempt
+}
+
+func (payload *KiroPayload) noteSDKRetry() {
+	if payload == nil {
+		return
+	}
+	if payload.sdkAttempt < 1 {
+		payload.sdkAttempt = 1
+	}
+	if payload.sdkAttempt < 3 {
+		payload.sdkAttempt++
+	}
 }
 
 func bindKiroPayloadContext(payload *KiroPayload, ctx context.Context) *KiroPayload {
@@ -504,10 +540,15 @@ func isDownstreamRequestCanceled(payload *KiroPayload, err error) bool {
 }
 
 type KiroUserInputMessage struct {
-	Content                 string                   `json:"content"`
-	ModelID                 string                   `json:"modelId,omitempty"`
-	Origin                  string                   `json:"origin"`
-	Images                  []KiroImage              `json:"images,omitempty"`
+	Content string      `json:"content"`
+	ModelID string      `json:"modelId,omitempty"`
+	Origin  string      `json:"origin"`
+	Images  []KiroImage `json:"images,omitempty"`
+	// Kiro's IDE client always serializes this object, even when it is empty.
+	// Newer model routes can return a successful but empty stream when the
+	// context member is omitted, so keep the wire shape identical to the IDE.
+	// Omit a nil context on history turns. The current turn always sets an
+	// object, including {}, because the IDE serializes that member.
 	UserInputMessageContext *UserInputMessageContext `json:"userInputMessageContext,omitempty"`
 }
 
@@ -683,6 +724,7 @@ const (
 	upstreamRecoveryTimeoutCode          = "upstream_recovery_timeout"
 	upstreamAgentContinuationTimeoutCode = "upstream_agent_continuation_timeout"
 	upstreamEmptyResponseCode            = "upstream_empty_response"
+	upstreamContentFilteredCode          = "upstream_content_filtered"
 )
 
 var errUpstreamIncompleteResponse = errors.New("upstream did not complete the agent turn")
@@ -692,15 +734,109 @@ var errUpstreamAgentToolChoiceMismatch = errors.New("upstream did not satisfy th
 var errUpstreamOutputTruncated = errors.New("upstream output reached the token limit")
 var errUpstreamEmptyResponse = errors.New("upstream returned no client-visible output")
 
+type upstreamContentFilteredError struct {
+	Explanation string
+}
+
+func (e *upstreamContentFilteredError) Error() string {
+	if e == nil || strings.TrimSpace(e.Explanation) == "" {
+		return "upstream content filtered"
+	}
+	return "upstream content filtered: " + strings.TrimSpace(e.Explanation)
+}
+
+func newUpstreamContentFilteredError(explanation string) error {
+	return &KiroStreamProtocolError{
+		Code: upstreamContentFilteredCode,
+		Err: &upstreamContentFilteredError{
+			Explanation: trimLogText(explanation, 500),
+		},
+	}
+}
+
+func isUpstreamContentFilteredError(err error) bool {
+	var filtered *upstreamContentFilteredError
+	return errors.As(err, &filtered)
+}
+
 func newUpstreamEmptyResponseError() error {
+	return newUpstreamEmptyResponseWithDetail("")
+}
+
+func newUpstreamEmptyResponseWithDetail(detail string) error {
+	err := error(errUpstreamEmptyResponse)
+	detail = strings.TrimSpace(detail)
+	if detail != "" {
+		// Counts and event names only. The detail must not include response text.
+		err = fmt.Errorf("%w (%s)", errUpstreamEmptyResponse, detail)
+	}
 	return &KiroStreamProtocolError{
 		Code: upstreamEmptyResponseCode,
-		Err:  errUpstreamEmptyResponse,
+		Err:  err,
 	}
+}
+
+type upstreamInvalidStateError struct {
+	Reason  string
+	Message string
+}
+
+func (e *upstreamInvalidStateError) Error() string {
+	if e == nil {
+		return "upstream invalid state"
+	}
+	reason := strings.TrimSpace(e.Reason)
+	message := strings.TrimSpace(e.Message)
+	switch {
+	case reason == "" && message == "":
+		return "upstream invalid state"
+	case reason == "" || reason == message:
+		return "upstream invalid state: " + message
+	case message == "":
+		return "upstream invalid state: " + reason
+	default:
+		return "upstream invalid state: " + reason + ": " + message
+	}
+}
+
+func newUpstreamInvalidStateError(reason, message string) error {
+	return &KiroStreamProtocolError{
+		Code: "upstream_invalid_state",
+		Err: &upstreamInvalidStateError{
+			Reason:  trimLogText(reason, 160),
+			Message: trimLogText(message, 500),
+		},
+	}
+}
+
+func isSchemaInvalidStateError(err error) bool {
+	var state *upstreamInvalidStateError
+	if !errors.As(err, &state) {
+		return false
+	}
+	text := strings.ToLower(state.Reason + " " + state.Message)
+	return strings.Contains(text, "tool_schema") ||
+		strings.Contains(text, "input_schema") ||
+		strings.Contains(text, "oneof") ||
+		strings.Contains(text, "anyof") ||
+		strings.Contains(text, "allof")
 }
 
 func isUpstreamEmptyResponseError(err error) bool {
 	return errors.Is(err, errUpstreamEmptyResponse)
+}
+
+// isUpstreamEventsNoneEmptyError matches the empty body that carries no event
+// frames at all: events=none, no assistant or reasoning bytes, and no stop.
+func isUpstreamEventsNoneEmptyError(err error) bool {
+	if !isUpstreamEmptyResponseError(err) || err == nil {
+		return false
+	}
+	text := err.Error()
+	return strings.Contains(text, "events=none") &&
+		strings.Contains(text, "assistant_bytes=0") &&
+		strings.Contains(text, "reasoning_bytes=0") &&
+		strings.Contains(text, "stop=-")
 }
 
 type KiroHTTPError struct {
@@ -905,6 +1041,22 @@ func kiroPayloadHasTools(payload *KiroPayload) bool {
 		len(payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.Tools) > 0
 }
 
+// claudeStreamHoldsPreToolText buffers assistant prose until a tool call
+// arrives, then drops it so the first public content block is tool_use.
+// Recognized coding-agent auto turns keep reasoning, text, then the tool call.
+// Required and specific choices stay pure tool turns for every client.
+func claudeStreamHoldsPreToolText(payload *KiroPayload) bool {
+	if !kiroPayloadHasTools(payload) || payload.ToolChoiceMode == "none" {
+		return false
+	}
+	if payload.ToolChoiceMode == "required" || payload.ToolChoiceMode == "specific" {
+		return true
+	}
+	return payload.AgentCompletionMarker == "" &&
+		!payload.AgentCompletionProtocolEnabled &&
+		!payload.AgentReasoningCapEnabled
+}
+
 func initialAgentThinkingTimeout(payload *KiroPayload) time.Duration {
 	if !kiroPayloadHasTools(payload) || !agentCompletionProtocolEnabled(payload) || payload.AgentCompletionRetries != 0 {
 		return 0
@@ -1054,6 +1206,9 @@ func isKiroTransportError(err error) bool {
 }
 
 func isKiroClientRequestError(err error) bool {
+	if isSchemaInvalidStateError(err) {
+		return true
+	}
 	var preflightErr *KiroPayloadPreflightError
 	if errors.As(err, &preflightErr) {
 		return true
@@ -1222,8 +1377,75 @@ func logKiroUpstreamAttemptError(payload *KiroPayload, account *config.Account, 
 	)
 }
 
-// CallKiroAPI calls only the account's regional Q streaming endpoint. Retry
-// and account-switching decisions remain the caller's job.
+// sortedKiroEndpoints applies the WebUI preferred-endpoint setting. A test
+// that installs one fake endpoint keeps that endpoint. "auto" and "kiro" both
+// start at q.{region}.amazonaws.com/generateAssistantResponse with no
+// x-amz-target, which is the AWS route kiro2cc-proxy uses first.
+func sortedKiroEndpoints() []kiroEndpoint {
+	if len(kiroEndpoints) <= 1 {
+		out := make([]kiroEndpoint, len(kiroEndpoints))
+		copy(out, kiroEndpoints)
+		return out
+	}
+	preferred := config.GetPreferredEndpoint()
+	fallback := config.GetEndpointFallback()
+	primary := 0
+	switch preferred {
+	case "codewhisperer":
+		primary = endpointIndex("codewhisperer")
+	case "amazonq":
+		primary = endpointIndex("amazonq")
+	default:
+		primary = endpointIndex("kiro")
+	}
+	if primary < 0 || primary >= len(kiroEndpoints) {
+		primary = 0
+	}
+	if !fallback {
+		return []kiroEndpoint{kiroEndpoints[primary]}
+	}
+	out := []kiroEndpoint{kiroEndpoints[primary]}
+	for i, ep := range kiroEndpoints {
+		if i != primary {
+			out = append(out, ep)
+		}
+	}
+	return out
+}
+
+func endpointIndex(key string) int {
+	for i, ep := range kiroEndpoints {
+		if ep.Key == key {
+			return i
+		}
+	}
+	return 0
+}
+
+// endpointErrorShouldFallback reports whether another configured AWS endpoint
+// can be tried. A completed HTTP 200, including an empty event stream, stays
+// on the endpoint that accepted it.
+func endpointErrorShouldFallback(err error) bool {
+	if err == nil {
+		return false
+	}
+	var httpErr *KiroHTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.StatusCode == http.StatusRequestTimeout || httpErr.StatusCode >= http.StatusInternalServerError
+	}
+	if isResponseHeaderTimeoutError(err) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	return false
+}
+
+// CallKiroAPI calls the AWS streaming endpoint selected in the WebUI. When
+// endpoint fallback is on, a transport or 5xx failure tries the remaining
+// AWS routes. Account switching stays with the caller.
 func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) (returnErr error) {
 	attemptStarted := time.Now()
 	if payload != nil {
@@ -1242,17 +1464,20 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 	if payload == nil {
 		return fmt.Errorf("Kiro request payload is nil")
 	}
-	if len(kiroEndpoints) == 0 {
+	bindUpstreamConversation(payload, account)
+	endpoints := sortedKiroEndpoints()
+	if len(endpoints) == 0 {
 		return fmt.Errorf("no Kiro upstream endpoints configured")
 	}
-	ep := kiroEndpoints[0]
 	originalProfileArn := ""
 	originalProfileArn = payload.ProfileArn
 	defer func() {
 		payload.ProfileArn = originalProfileArn
 	}()
 	setPayloadProfileArnForAccount(payload, account)
-	payload.ConversationState.CurrentMessage.UserInputMessage.Origin = ep.Origin
+	if payload.ConversationState.CurrentMessage.UserInputMessage.Origin == "" {
+		payload.ConversationState.CurrentMessage.UserInputMessage.Origin = endpoints[0].Origin
+	}
 	if _, err := preflightKiroPayload(payload); err != nil {
 		return err
 	}
@@ -1326,87 +1551,103 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			return err
 		}
 	}
-	reqBody, marshalErr := json.Marshal(payload)
-	if marshalErr != nil {
-		return marshalErr
-	}
-	if payload != nil {
+
+	var lastErr error
+	for i, ep := range endpoints {
+		payload.ConversationState.CurrentMessage.UserInputMessage.Origin = ep.Origin
+		reqBody, marshalErr := marshalUpstreamJSON(payload)
+		if marshalErr != nil {
+			return marshalErr
+		}
 		payload.lastAttemptPayloadBytes = len(reqBody)
 		_, payload.lastAttemptEstimatedInputTokens = agentRecoveryPayloadEstimate(payload, "")
-	}
-	logger.Debugf("[KiroAPI] Request payload: %s", reqBody)
+		logger.Debugf("[KiroAPI] Request payload endpoint=%s: %s", ep.Name, reqBody)
 
-	epURL := regionalizeURLForProfile(ep.URL, account, payload.ProfileArn)
-	if timing != nil {
-		requestContext = httptrace.WithClientTrace(requestContext, timing.clientTrace())
-	}
-	req, requestErr := http.NewRequestWithContext(requestContext, http.MethodPost, epURL, bytes.NewReader(reqBody))
-	if requestErr != nil {
-		return requestErr
-	}
-
-	headerValues := buildStreamingHeaderValues(account, req.URL.Host)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "*/*")
-	applyKiroBaseHeaders(req, account, headerValues)
-	req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
-	req.Header.Set("x-amzn-codewhisperer-optout", "true")
-	req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
-	req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
-
-	if timing != nil {
-		timing.beginUpstream(time.Now())
-	}
-	resp, doErr := GetClientForProxy(ResolveAccountProxyURL(account)).Do(req)
-	if timing != nil && resp != nil {
-		timing.markUpstreamHeader(time.Now())
-	}
-	if doErr != nil {
-		logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, doErr)
-		return normalizeKiroCallError(requestContext, doErr, timeoutPolicy)
-	}
-
-	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
-		if callback.OnStreamReady != nil {
-			callback.OnStreamReady()
+		epURL := regionalizeURLForProfile(ep.URL, account, payload.ProfileArn)
+		if timing != nil {
+			requestContext = httptrace.WithClientTrace(requestContext, timing.clientTrace())
 		}
-		streamErr := parseEventStream(resp.Body, callback)
+		req, requestErr := http.NewRequestWithContext(requestContext, http.MethodPost, epURL, bytes.NewReader(reqBody))
+		if requestErr != nil {
+			return requestErr
+		}
+
+		headerValues := buildStreamingHeaderValues(account, req.URL.Host)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "*/*")
+		if ep.AmzTarget != "" {
+			req.Header.Set("X-Amz-Target", ep.AmzTarget)
+		}
+		applyKiroBaseHeaders(req, account, headerValues)
+		req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
+		req.Header.Set("x-amzn-codewhisperer-optout", "true")
+		applyKiroSDKCallHeaders(req, payload.sdkRequestAttempt())
+
+		if timing != nil {
+			timing.beginUpstream(time.Now())
+		}
+		resp, doErr := kiroUpstreamClient(account, false).Do(req)
+		if timing != nil && resp != nil {
+			timing.markUpstreamHeader(time.Now())
+		}
+		if doErr != nil {
+			lastErr = normalizeKiroCallError(requestContext, doErr, timeoutPolicy)
+			logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, lastErr)
+			if i+1 < len(endpoints) && endpointErrorShouldFallback(lastErr) {
+				continue
+			}
+			return lastErr
+		}
+
+		if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+			if callback.OnStreamReady != nil {
+				callback.OnStreamReady()
+			}
+			streamErr := parseEventStream(resp.Body, callback)
+			resp.Body.Close()
+			streamErr = normalizeKiroCallError(requestContext, streamErr, timeoutPolicy)
+			if isUpstreamIncompleteResponseError(streamErr) {
+				prepareReasoningOnlyRetry(payload, streamErr)
+			}
+			return streamErr
+		}
+
+		errBody, readErr := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		streamErr = normalizeKiroCallError(requestContext, streamErr, timeoutPolicy)
-		if isUpstreamIncompleteResponseError(streamErr) {
-			prepareReasoningOnlyRetry(payload, streamErr)
+		if readErr != nil || requestContext.Err() != nil {
+			return normalizeKiroCallError(requestContext, readErr, timeoutPolicy)
 		}
-		return streamErr
+		err := kiroEndpointError(ep, resp.StatusCode, errBody, resp.Header.Get("Retry-After"))
+		logger.Warnf("[KiroAPI] Endpoint %s error: %v", ep.Name, err)
+		if payload.HistoryMode == kiroHistoryModeNativeActive &&
+			!payload.ReasoningSignatureRetry && isKiroThinkingSignatureInvalidError(err) &&
+			stripKiroHistoryReasoning(payload) {
+			payload.ReasoningSignatureRetry = true
+			payload.noteSDKRetry()
+			logger.Warnf(
+				"[KiroAPI] retrying once without replayed reasoning after signature rejection request_id=%s account=%s",
+				kiroPayloadRequestID(payload), accountEmailForLog(account),
+			)
+			return CallKiroAPI(account, payload, callback)
+		}
+		if payload.HistoryMode == kiroHistoryModeNativeActive && isKiroNativeHistoryValidationError(err) {
+			fallbackKiroHistoryToLegacy(payload)
+			payload.noteSDKRetry()
+			logger.Warnf(
+				"[KiroAPI] retrying once with legacy history after native history validation rejection request_id=%s account=%s",
+				kiroPayloadRequestID(payload), accountEmailForLog(account),
+			)
+			// fallbackKiroHistoryToLegacy changes HistoryMode to legacy before the
+			// recursive call, which makes this retry intrinsically single-shot.
+			return CallKiroAPI(account, payload, callback)
+		}
+		lastErr = err
+		if i+1 < len(endpoints) && endpointErrorShouldFallback(err) {
+			continue
+		}
+		return err
 	}
-
-	errBody, readErr := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if readErr != nil || requestContext.Err() != nil {
-		return normalizeKiroCallError(requestContext, readErr, timeoutPolicy)
-	}
-	err := kiroEndpointError(ep, resp.StatusCode, errBody, resp.Header.Get("Retry-After"))
-	logger.Warnf("[KiroAPI] Endpoint %s error: %v", ep.Name, err)
-	if payload.HistoryMode == kiroHistoryModeNativeActive &&
-		!payload.ReasoningSignatureRetry && isKiroThinkingSignatureInvalidError(err) &&
-		stripKiroHistoryReasoning(payload) {
-		payload.ReasoningSignatureRetry = true
-		logger.Warnf(
-			"[KiroAPI] retrying once without replayed reasoning after signature rejection request_id=%s account=%s",
-			kiroPayloadRequestID(payload), accountEmailForLog(account),
-		)
-		return CallKiroAPI(account, payload, callback)
-	}
-	if payload.HistoryMode == kiroHistoryModeNativeActive && isKiroNativeHistoryValidationError(err) {
-		fallbackKiroHistoryToLegacy(payload)
-		logger.Warnf(
-			"[KiroAPI] retrying once with legacy history after native history validation rejection request_id=%s account=%s",
-			kiroPayloadRequestID(payload), accountEmailForLog(account),
-		)
-		// fallbackKiroHistoryToLegacy changes HistoryMode to legacy before the
-		// recursive call, which makes this retry intrinsically single-shot.
-		return CallKiroAPI(account, payload, callback)
-	}
-	return err
+	return lastErr
 }
 
 func kiroContextError(ctx context.Context, fallback error) error {
@@ -1474,7 +1715,7 @@ func kiroClientVisibleAssistantText(content, marker string, allowThinking bool) 
 func isKnownKiroEventType(eventType string) bool {
 	switch eventType {
 	case "assistantResponseEvent", "reasoningContentEvent", "toolUseEvent",
-		"meteringEvent", "metadataEvent", "contextUsageEvent":
+		"meteringEvent", "metadataEvent", "contextUsageEvent", "invalidStateEvent":
 		return true
 	default:
 		return false
@@ -1640,6 +1881,11 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 	var upstreamStopReason string
 	firstEventReported := false
 	toolUses := newToolUseAccumulator()
+	eventCounts := make(map[string]int)
+	var unknownEventTypes []string
+	assistantBytes := 0
+	reasoningBytes := 0
+	assistantKeys := ""
 	reportFrameError := func(err error) error {
 		if agentCompletionRequired && agentOutputObserved &&
 			markerState != agentCompletionPrefixComplete && !toolObserved {
@@ -1748,6 +1994,10 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 			continue
 		}
 		if !isKnownKiroEventType(eventType) {
+			eventCounts[eventType]++
+			if len(unknownEventTypes) < 6 && !stringSliceContains(unknownEventTypes, eventType) {
+				unknownEventTypes = append(unknownEventTypes, eventType)
+			}
 			continue
 		}
 
@@ -1768,10 +2018,23 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 		}
 
 		inputTokens, outputTokens = updateTokensFromEvent(event, inputTokens, outputTokens)
+		eventCounts[eventType]++
 
 		// Dispatch by event type.
 		switch eventType {
+		case "invalidStateEvent":
+			// A 200 stream can carry the real rejection here. Ignoring it made
+			// the attempt look like an empty answer and hid TOOL_SCHEMA_INVALID.
+			reason := firstStringField(event, "reason", "Reason")
+			message := firstStringField(event, "message", "errorMessage", "error")
+			return reportKiroStreamError(callback, newUpstreamInvalidStateError(reason, message))
 		case "assistantResponseEvent":
+			content, contentIsString := event["content"].(string)
+			if contentIsString && content != "" {
+				assistantBytes += len(content)
+			} else if assistantKeys == "" {
+				assistantKeys = eventFieldNames(event)
+			}
 			if agentCompletionFinalized {
 				continue
 			}
@@ -1782,7 +2045,7 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 				// automatic tool-result continuation.
 				continue
 			}
-			if content, ok := event["content"].(string); ok && content != "" {
+			if contentIsString && content != "" {
 				agentOutputObserved = true
 				assistantTextObserved = true
 				clientAssistantText.WriteString(content)
@@ -1823,6 +2086,7 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 			}
 			if text, ok := event["text"].(string); ok && text != "" {
 				reasoning.Text = text
+				reasoningBytes += len(text)
 			}
 			if reasoning.Text != "" || reasoning.Signature != "" || reasoning.RedactedContent != "" {
 				agentOutputObserved = true
@@ -1875,7 +2139,14 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 				totalCredits += usage
 			}
 		case "metadataEvent":
-			if reason := firstStringField(event, "stopReason", "stop_reason"); reason != "" {
+			stopReason := firstStringField(event, "stopReason", "stop_reason")
+			if strings.EqualFold(stopReason, "CONTENT_FILTERED") {
+				stopDetails := nestedMapField(event, "stopDetails", "stop_details")
+				refusal := nestedMapField(stopDetails, "refusal")
+				explanation := firstStringField(refusal, "explanation", "message", "reason")
+				return reportKiroStreamError(callback, newUpstreamContentFilteredError(explanation))
+			}
+			if reason := stopReason; reason != "" {
 				if agentCompletionFinalized {
 					continue
 				}
@@ -1939,7 +2210,9 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 		callback.OnComplete(inputTokens, outputTokens)
 	}
 	if callback.RequireClientOutput && !clientOutputObserved {
-		return reportKiroStreamError(callback, newUpstreamEmptyResponseError())
+		return reportKiroStreamError(callback, newUpstreamEmptyResponseWithDetail(kiroEmptyOutputSummary(
+			eventCounts, unknownEventTypes, assistantBytes, reasoningBytes, upstreamStopReason, assistantKeys,
+		)))
 	}
 	if upstreamStopReason == "max_tokens" {
 		return reportKiroStreamError(callback, newUpstreamOutputTruncatedError())
@@ -1951,6 +2224,65 @@ func parseEventStreamWithKeepAlive(body io.Reader, callback *KiroStreamCallback,
 	}
 
 	return nil
+}
+
+func trimLogText(value string, max int) string {
+	value = strings.Join(strings.Fields(value), " ")
+	if max <= 0 || len(value) <= max {
+		return value
+	}
+	return value[:utf8SafePrefix(value, max)]
+}
+
+func stringSliceContains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func eventFieldNames(event map[string]interface{}) string {
+	if len(event) == 0 {
+		return "-"
+	}
+	names := make([]string, 0, len(event))
+	for name := range event {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	if len(names) > 12 {
+		names = names[:12]
+	}
+	return strings.Join(names, ",")
+}
+
+func kiroEmptyOutputSummary(counts map[string]int, unknown []string, assistantBytes, reasoningBytes int, stopReason, assistantKeys string) string {
+	names := make([]string, 0, len(counts))
+	for name := range counts {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	parts := make([]string, 0, len(names))
+	for _, name := range names {
+		parts = append(parts, fmt.Sprintf("%s=%d", name, counts[name]))
+	}
+	events := "none"
+	if len(parts) > 0 {
+		events = strings.Join(parts, ",")
+	}
+	if strings.TrimSpace(stopReason) == "" {
+		stopReason = "-"
+	}
+	summary := fmt.Sprintf("events=%s assistant_bytes=%d reasoning_bytes=%d stop=%s", events, assistantBytes, reasoningBytes, stopReason)
+	if len(unknown) > 0 {
+		summary += " unknown=" + strings.Join(unknown, ",")
+	}
+	if assistantKeys != "" {
+		summary += " assistant_keys=" + assistantKeys
+	}
+	return summary
 }
 
 func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, currentOutputTokens int) (int, int) {
@@ -2047,6 +2379,29 @@ func isLargeContextModel(model string) bool {
 		}
 	}
 	return false
+}
+
+// opusHasExtendedOutputLimit reports opus releases whose fallback output
+// limit is 128k. Opus 4.7, 4.8, and every opus 5 minor (including 5.5) share
+// that limit; opus 4.6 stays on the generic 64k large-context fallback.
+func opusHasExtendedOutputLimit(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if model == "claude-opus-5" || strings.HasPrefix(model, "claude-opus-5.") || strings.HasPrefix(model, "claude-opus-5-") {
+		return true
+	}
+	match := claudeVersionExtractor.FindStringSubmatch(model)
+	if match == nil || !strings.Contains(model, "claude-opus-") {
+		return false
+	}
+	major, errMajor := strconv.Atoi(match[1])
+	minor, errMinor := strconv.Atoi(match[2])
+	if errMajor != nil || errMinor != nil {
+		return false
+	}
+	if major > 4 {
+		return true
+	}
+	return major == 4 && minor >= 7
 }
 
 func collectUsageMaps(v interface{}, out *[]map[string]interface{}) {
@@ -2369,12 +2724,27 @@ func finishToolUse(state *toolUseState, callback *KiroStreamCallback) {
 }
 
 func firstStringField(m map[string]interface{}, keys ...string) string {
+	if m == nil {
+		return ""
+	}
 	for _, key := range keys {
 		if v, ok := m[key].(string); ok && v != "" {
 			return v
 		}
 	}
 	return ""
+}
+
+func nestedMapField(m map[string]interface{}, keys ...string) map[string]interface{} {
+	if m == nil {
+		return nil
+	}
+	for _, key := range keys {
+		if value, ok := m[key].(map[string]interface{}); ok {
+			return value
+		}
+	}
+	return nil
 }
 
 func firstBoolField(m map[string]interface{}, keys ...string) bool {

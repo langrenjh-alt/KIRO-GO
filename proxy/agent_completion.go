@@ -1891,6 +1891,9 @@ func cloneKiroPayload(payload *KiroPayload) *KiroPayload {
 	clone.recoveryStartedAt = payload.recoveryStartedAt
 	clone.recoveryDeadline = payload.recoveryDeadline
 	clone.requestID = payload.requestID
+	clone.conversationIDBase = payload.conversationIDBase
+	clone.conversationIDScoped = payload.conversationIDScoped
+	clone.conversationIDScopeAccount = payload.conversationIDScopeAccount
 	clone.lastAttemptPayloadBytes = payload.lastAttemptPayloadBytes
 	clone.lastAttemptEstimatedInputTokens = payload.lastAttemptEstimatedInputTokens
 	clone.lastAttemptStartedAt = payload.lastAttemptStartedAt

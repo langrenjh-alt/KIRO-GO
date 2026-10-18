@@ -129,7 +129,8 @@ func (u retryBillingUsage) recordForAPIKey(apiKeyID string) {
 		return
 	}
 	for _, attempt := range u.attempts {
-		if err := config.RecordApiKeyUsage(apiKeyID, int64(attempt.totalTokens()), attempt.Credits); err != nil {
+		usage := inflatedBillingUsage(attempt.InputTokens, attempt.OutputTokens, promptCacheUsage{})
+		if err := config.RecordApiKeyUsage(apiKeyID, int64(billingUsageTotal(usage)), attempt.Credits); err != nil {
 			logger.Warnf("[ApiKey] failed to record discarded attempt for key %s: %v", apiKeyID, err)
 		}
 	}

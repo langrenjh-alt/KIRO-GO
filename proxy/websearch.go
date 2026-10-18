@@ -30,13 +30,16 @@ const (
 	webSearchRPCAccountRetries = 2
 	webSearchSummaryChunkRunes = 100
 	webSearchMaxQueryRunes     = 2048
-	webSearchMaxUpstreamRunes  = 2048
-	webSearchMaxDomains        = 20
-	webSearchMaxDomainRunes    = 253
-	webSearchMaxResults        = 20
-	webSearchMaxTitleRunes     = 512
-	webSearchMaxSnippetRunes   = 2048
-	webSearchMaxURLBytes       = 4096
+	// Kiro's web_search MCP tool rejects a longer query with JSON-RPC -32602
+	// "Invalid tool parameters provided". Live check on 2026-09-26: 200
+	// characters succeed and 201 fail.
+	webSearchMaxUpstreamRunes = 200
+	webSearchMaxDomains       = 20
+	webSearchMaxDomainRunes   = 253
+	webSearchMaxResults       = 20
+	webSearchMaxTitleRunes    = 512
+	webSearchMaxSnippetRunes  = 2048
+	webSearchMaxURLBytes      = 4096
 )
 
 var supportedWebSearchToolTypes = map[string]struct{}{
@@ -821,7 +824,7 @@ func fitWebSearchMCPQuery(candidate, fallback string) string {
 	}
 	// Domain clauses are advisory because the returned URLs are filtered again
 	// locally. Preserve the user's query when the combined MCP argument would
-	// exceed Kiro's 2048-character limit.
+	// exceed Kiro's 200-character tool limit.
 	return truncateWebSearchQuery(fallback, webSearchMaxUpstreamRunes)
 }
 
@@ -947,10 +950,14 @@ func callMCPWebSearchWithOptions(
 	options webSearchMCPCallOptions,
 ) (*webSearchResultSet, error) {
 	originalQuery := strings.TrimSpace(query)
-	result, err := callMCPWebSearchWithOptionsInternal(ctx, account, originalQuery, options, true)
+	upstreamQuery := compactWebSearchQueryForMCPRetry(originalQuery)
+	if upstreamQuery == "" {
+		return nil, fmt.Errorf("web search query is empty")
+	}
+	result, err := callMCPWebSearchWithOptionsInternal(ctx, account, upstreamQuery, options, true)
 	if result != nil {
-		// A compatibility retry may compact only the upstream query. The
-		// client-visible server_tool_use must continue to echo the original query.
+		// Compaction applies only to the upstream query. The client-visible
+		// server_tool_use must continue to echo the original query.
 		result.Query = originalQuery
 	}
 	return result, err
@@ -977,7 +984,7 @@ func callMCPWebSearchWithOptionsInternal(
 	}
 	client := options.Client
 	if client == nil {
-		client = GetRestClientForProxy(ResolveAccountProxyURL(account))
+		client = kiroUpstreamClient(account, true)
 	}
 	maxResponseBytes := options.MaxResponseBytes
 	if maxResponseBytes <= 0 {
@@ -985,7 +992,7 @@ func callMCPWebSearchWithOptionsInternal(
 	}
 
 	toolUseID, payload := newWebSearchMCPRequest(query)
-	body, err := json.Marshal(payload)
+	body, err := marshalUpstreamJSON(payload)
 	if err != nil {
 		return nil, fmt.Errorf("encode web search MCP request: %w", err)
 	}
@@ -997,8 +1004,7 @@ func callMCPWebSearchWithOptionsInternal(
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "*/*")
 	applyKiroBaseHeaders(req, account, buildStreamingHeaderValues(account, req.URL.Host))
-	req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
-	req.Header.Set("Amz-Sdk-Invocation-Id", uuid.NewString())
+	applyKiroSDKCallHeaders(req, 1)
 	if account != nil && strings.TrimSpace(account.ProfileArn) != "" {
 		req.Header.Set("x-amzn-kiro-profile-arn", strings.TrimSpace(account.ProfileArn))
 	}
@@ -1056,6 +1062,12 @@ func callMCPWebSearchWithOptionsInternal(
 		}
 	}
 	if mcpResponse.Error != nil {
+		if isWebSearchNoResultsRPC(mcpResponse.Error) {
+			// Kiro reports an empty result set with JSON-RPC -32602. That is not
+			// an invalid request; surfacing it as a rejection made every miss
+			// look like a broken web search.
+			return &webSearchResultSet{ToolUseID: toolUseID, Query: query}, nil
+		}
 		if allowQueryCompatibilityRetry && mcpResponse.Error.Code != nil && *mcpResponse.Error.Code == jsonRPCInvalidParams {
 			compatQuery := compactWebSearchQueryForMCPRetry(query)
 			if compatQuery != "" && compatQuery != query {
@@ -1091,9 +1103,17 @@ func callMCPWebSearchWithOptionsInternal(
 	return result, nil
 }
 
+func isWebSearchNoResultsRPC(rpcErr *webSearchMCPResponseError) bool {
+	if rpcErr == nil || rpcErr.Code == nil || *rpcErr.Code != jsonRPCInvalidParams {
+		return false
+	}
+	message := strings.ToLower(strings.TrimSpace(rpcErr.Message))
+	return strings.Contains(message, "no results")
+}
+
 func compactWebSearchQueryForMCPRetry(query string) string {
 	var builder strings.Builder
-	builder.Grow(minInt(len(query), webSearchMCPRetryMaxBytes))
+	builder.Grow(minInt(len(query), webSearchMaxUpstreamRunes*utf8.UTFMax))
 	lastWasSpace := false
 	for _, char := range strings.TrimSpace(query) {
 		if unicode.IsControl(char) || unicode.IsSpace(char) {
@@ -1106,16 +1126,7 @@ func compactWebSearchQueryForMCPRetry(query string) string {
 		builder.WriteRune(char)
 		lastWasSpace = false
 	}
-
-	compacted := strings.TrimSpace(builder.String())
-	if len(compacted) <= webSearchMCPRetryMaxBytes {
-		return compacted
-	}
-	start := len(compacted) - webSearchMCPRetryMaxBytes
-	for start < len(compacted) && !utf8.RuneStart(compacted[start]) {
-		start++
-	}
-	return strings.TrimSpace(compacted[start:])
+	return truncateWebSearchQuery(strings.TrimSpace(builder.String()), webSearchMaxUpstreamRunes)
 }
 
 func readWebSearchMCPBody(reader io.Reader, maxBytes int64) ([]byte, error) {

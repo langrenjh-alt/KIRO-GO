@@ -130,13 +130,16 @@ func claudeReasoningUsageDetails(reasoning ClaudeReasoningResult, includeEmptyTh
 	return details
 }
 
-func addClaudeReasoningUsageDetails(usage map[string]interface{}, reasoning ClaudeReasoningResult, includeEmptyThinkingBlock bool) {
+func addClaudeReasoningUsageDetails(usage map[string]interface{}, reasoning ClaudeReasoningResult, includeEmptyThinkingBlock bool, deferInflation ...bool) {
 	if usage == nil {
 		return
 	}
 	details := claudeReasoningUsageDetails(reasoning, includeEmptyThinkingBlock)
 	if details == nil {
 		return
+	}
+	if len(deferInflation) == 0 || !deferInflation[0] {
+		details.ThinkingTokens = inflateBillingTokens(details.ThinkingTokens)
 	}
 	usage["output_tokens_details"] = map[string]int{"thinking_tokens": details.ThinkingTokens}
 }

@@ -209,13 +209,19 @@ func (h *Handler) handleResponsesNonStream(
 
 	attemptLimit := h.maxAccountAttempts()
 	for attempt := 0; attempt < attemptLimit; attempt++ {
-		account, allFull := h.acquireAccountForModel(model, excluded, retrySameID, kiroPayloadContext(payload))
+		attemptModel := accountModelForAttempt(model, payload)
+		account, allFull := h.acquireAccountForModel(attemptModel, excluded, retrySameID, kiroPayloadContext(payload))
 		retrySameID = ""
 		if account == nil {
-			if h.startExpiredAccountRefreshes(model, excluded) {
+			if h.promoteOpus55EmptyToOpus5(payload, excluded) {
+				retrySameID = ""
+				attemptLimit++
+				continue
+			}
+			if h.startExpiredAccountRefreshes(attemptModel, excluded) {
 				lastErr = errAccountRefreshInProgress
-			} else if allFull {
-				lastErr = fmt.Errorf(allAccountsConcurrencyFullMessage)
+			} else if err := h.unavailableAccountError(attemptModel, allFull); err != nil {
+				lastErr = err
 			}
 			break
 		}
@@ -449,6 +455,10 @@ func (h *Handler) handleResponsesNonStream(
 		h.sendOpenAIError(w, accountRefreshInProgressStatus, "account_refreshing", accountRefreshInProgressMessage)
 		return
 	}
+	if isAllAccountsModelCoolingError(lastErr) {
+		h.sendOpenAIError(w, http.StatusServiceUnavailable, "server_error", lastErr.Error())
+		return
+	}
 	if isAllAccountsConcurrencyFullError(lastErr) {
 		h.sendOpenAIError(w, http.StatusServiceUnavailable, "server_error", allAccountsConcurrencyFullMessage)
 		return
@@ -639,13 +649,19 @@ func (h *Handler) handleResponsesStream(
 
 	attemptLimit := h.maxAccountAttempts()
 	for attempt := 0; attempt < attemptLimit; attempt++ {
-		account, allFull := h.acquireAccountForModel(model, excluded, retrySameID, kiroPayloadContext(payload))
+		attemptModel := accountModelForAttempt(model, payload)
+		account, allFull := h.acquireAccountForModel(attemptModel, excluded, retrySameID, kiroPayloadContext(payload))
 		retrySameID = ""
 		if account == nil {
-			if h.startExpiredAccountRefreshes(model, excluded) {
+			if h.promoteOpus55EmptyToOpus5(payload, excluded) {
+				retrySameID = ""
+				attemptLimit++
+				continue
+			}
+			if h.startExpiredAccountRefreshes(attemptModel, excluded) {
 				lastErr = errAccountRefreshInProgress
-			} else if allFull {
-				lastErr = fmt.Errorf(allAccountsConcurrencyFullMessage)
+			} else if err := h.unavailableAccountError(attemptModel, allFull); err != nil {
+				lastErr = err
 			}
 			break
 		}
@@ -1416,6 +1432,8 @@ func (h *Handler) handleResponsesStream(
 	if isAccountRefreshInProgressError(lastErr) {
 		errType = "account_refreshing"
 		errMessage = accountRefreshInProgressMessage
+	} else if isAllAccountsModelCoolingError(lastErr) {
+		errMessage = lastErr.Error()
 	} else if isAllAccountsConcurrencyFullError(lastErr) {
 		errMessage = allAccountsConcurrencyFullMessage
 	} else if isRateLimitError(lastErr) {

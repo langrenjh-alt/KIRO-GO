@@ -63,7 +63,7 @@ func TestCacheModeAndFunctionPolicy(t *testing.T) {
 		MinTokens:             -1,
 		InputFingerprintChars: 99_999,
 	}
-	if err := UpdateCachePolicy(&mode, &functionCache); err != nil {
+	if err := UpdateCachePolicy(&mode, &functionCache, nil); err != nil {
 		t.Fatalf("UpdateCachePolicy: %v", err)
 	}
 	if got := GetCacheMode(); got != CacheModeFunctionSimulation {
@@ -72,6 +72,41 @@ func TestCacheModeAndFunctionPolicy(t *testing.T) {
 	got := GetFunctionCacheConfig()
 	if !got.Enabled || got.SimulatedTokens != 1_000_000 || got.TTLSeconds != 86_400 || got.TTLJitterPercent != 100 || got.TokenJitterPercent != 0 || *got.HitRatePercent != 0 || *got.MaxCacheReadPercent != 100 || got.MinTokens != 0 || got.InputFingerprintChars != 12_000 {
 		t.Fatalf("unexpected normalized function cache: %+v", got)
+	}
+}
+
+func TestFixedRatioCachePolicyPersistsAndClamps(t *testing.T) {
+	if err := Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	mode := CacheModeFixedRatio
+	ratio := FixedRatioCacheConfig{CacheReadPercent: 180, CacheCreationPercent: -3}
+	if err := UpdateCachePolicy(&mode, nil, &ratio); err != nil {
+		t.Fatalf("UpdateCachePolicy: %v", err)
+	}
+	if got := GetCacheMode(); got != CacheModeFixedRatio {
+		t.Fatalf("cache mode = %q", got)
+	}
+	got := GetFixedRatioCacheConfig()
+	if got.CacheReadPercent != 100 || got.CacheCreationPercent != 0 {
+		t.Fatalf("fixed ratio = %+v", got)
+	}
+	if err := Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if GetCacheMode() != CacheModeFixedRatio || GetFixedRatioCacheConfig().CacheReadPercent != 100 {
+		t.Fatal("fixed ratio did not persist")
+	}
+	created, err := AddPromptCachePolicy(PromptCachePolicy{
+		Name:            "fixed",
+		CacheMode:       CacheModeFixedRatio,
+		FixedRatioCache: FixedRatioCacheConfig{CacheReadPercent: 80, CacheCreationPercent: 15},
+	})
+	if err != nil {
+		t.Fatalf("AddPromptCachePolicy: %v", err)
+	}
+	if created.CacheMode != CacheModeFixedRatio || created.FixedRatioCache.CacheReadPercent != 80 || created.FixedRatioCache.CacheCreationPercent != 15 {
+		t.Fatalf("policy = %+v", created)
 	}
 }
 

@@ -374,28 +374,17 @@ func TestCallMCPWebSearchClassifiesJSONRPCFailures(t *testing.T) {
 	}
 }
 
-func TestCallMCPWebSearchRetriesInvalidParamsWithCompactedQuery(t *testing.T) {
+func TestCallMCPWebSearchCapsQueryBeforeInvalidParams(t *testing.T) {
 	originalQuery := strings.Repeat("\u6d4b", 1800) + "\x00\n latest release"
 	var calls int
+	var sent string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		var request webSearchMCPRequest
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			t.Fatalf("decode request: %v", err)
 		}
-		if calls == 1 {
-			if request.Params.Arguments.Query != strings.TrimSpace(originalQuery) {
-				t.Fatalf("first query was changed before rejection")
-			}
-			_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":"x","error":{"code":-32602,"message":"sensitive invalid params detail"}}`)
-			return
-		}
-		if got := len(request.Params.Arguments.Query); got > webSearchMCPRetryMaxBytes {
-			t.Fatalf("compatibility query bytes = %d, want <= %d", got, webSearchMCPRetryMaxBytes)
-		}
-		if strings.ContainsRune(request.Params.Arguments.Query, '\x00') {
-			t.Fatal("compatibility query retained a control character")
-		}
+		sent = request.Params.Arguments.Query
 		_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":"x","result":{"isError":false,"content":[{"type":"text","text":"{\"results\":[{\"title\":\"Release\",\"url\":\"https://example.com/release\"}]}"}]}}`)
 	}))
 	defer server.Close()
@@ -407,11 +396,35 @@ func TestCallMCPWebSearchRetriesInvalidParamsWithCompactedQuery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("callMCPWebSearchWithOptions returned an error: %v", err)
 	}
-	if calls != 2 {
-		t.Fatalf("MCP calls = %d, want 2", calls)
+	if calls != 1 {
+		t.Fatalf("MCP calls = %d, want 1", calls)
+	}
+	if got := utf8.RuneCountInString(sent); got > webSearchMaxUpstreamRunes {
+		t.Fatalf("upstream query runes = %d, want <= %d", got, webSearchMaxUpstreamRunes)
+	}
+	if strings.ContainsRune(sent, '\x00') || !strings.HasSuffix(sent, "latest release") {
+		t.Fatalf("upstream query = %q", sent)
 	}
 	if result.Query != strings.TrimSpace(originalQuery) {
 		t.Fatal("client-visible query did not preserve the original value")
+	}
+}
+
+func TestCallMCPWebSearchTreatsNoResultsAsEmptySuccess(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":"x","error":{"code":-32602,"message":"Tool returned no results"}}`)
+	}))
+	defer server.Close()
+
+	result, err := callMCPWebSearchWithOptions(context.Background(), nil, "missing topic", webSearchMCPCallOptions{
+		Endpoint: server.URL,
+		Client:   server.Client(),
+	})
+	if err != nil {
+		t.Fatalf("empty search was rejected: %v", err)
+	}
+	if result == nil || len(result.Results) != 0 || result.Query != "missing topic" {
+		t.Fatalf("empty search result = %#v", result)
 	}
 }
 
@@ -656,8 +669,8 @@ func TestCombinedWebSearchQueryHasOutboundLimit(t *testing.T) {
 	if strings.Contains(query, "site:") {
 		t.Fatalf("oversized domain clauses must be dropped before MCP call: %q", query)
 	}
-	if query != strings.Repeat("q", webSearchMaxQueryRunes) {
-		t.Fatalf("user query was not preserved: length=%d", utf8.RuneCountInString(query))
+	if query != strings.Repeat("q", webSearchMaxUpstreamRunes) {
+		t.Fatalf("user query tail was not preserved: length=%d query=%q", utf8.RuneCountInString(query), query)
 	}
 }
 

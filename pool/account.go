@@ -44,6 +44,7 @@ type AccountPool struct {
 	totalAccounts  int
 	currentIndex   uint64
 	cooldowns      map[string]time.Time       // 账号冷却时间
+	modelCooldowns map[string]time.Time       // accountID + model → 空流冷却到期
 	errorCounts    map[string]int             // 连续错误计数
 	modelLists     map[string]map[string]bool // accountID → set of modelIDs (from ListAvailableModels)
 	inFlight       map[string]int             // accountID → 当前并发占用数
@@ -58,10 +59,11 @@ var (
 func GetPool() *AccountPool {
 	poolOnce.Do(func() {
 		pool = &AccountPool{
-			cooldowns:   make(map[string]time.Time),
-			errorCounts: make(map[string]int),
-			modelLists:  make(map[string]map[string]bool),
-			inFlight:    make(map[string]int),
+			cooldowns:      make(map[string]time.Time),
+			modelCooldowns: make(map[string]time.Time),
+			errorCounts:    make(map[string]int),
+			modelLists:     make(map[string]map[string]bool),
+			inFlight:       make(map[string]int),
 		}
 		pool.Reload()
 	})
@@ -277,6 +279,9 @@ func (p *AccountPool) InspectAvailability(model string, excluded map[string]bool
 			continue
 		}
 		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
+			continue
+		}
+		if p.modelCoolingLocked(acc.ID, model, now) {
 			continue
 		}
 		if isQuotaBlocked(*acc, selection.allowOverUsage) {
@@ -515,6 +520,9 @@ func (p *AccountPool) isSelectableLocked(acc *config.Account, model string, excl
 	if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
 		return false
 	}
+	if p.modelCoolingLocked(acc.ID, model, now) {
+		return false
+	}
 	if tokenNeedsRefresh(acc, now) {
 		return false
 	}
@@ -587,7 +595,25 @@ func (p *AccountPool) accountHasModel(accountID, model string) bool {
 	if !ok || len(list) == 0 {
 		return true // 冷启动：列表未就绪，乐观放行
 	}
-	return list[strings.ToLower(strings.TrimSpace(model))]
+	model = strings.ToLower(strings.TrimSpace(model))
+	if list[model] {
+		return true
+	}
+	// Catalog ids and client ids disagree on '-' vs '.' ("4-8" vs "4.8").
+	// Compare the folded spelling so either inbound form can lease the account.
+	want := config.CanonicalModelID(model)
+	if want == "" {
+		return false
+	}
+	if list[want] {
+		return true
+	}
+	for id := range list {
+		if config.CanonicalModelID(id) == want {
+			return true
+		}
+	}
+	return false
 }
 
 // GetNextForModel 获取下一个支持指定模型的可用账号（不占用并发）。
@@ -647,6 +673,133 @@ func (p *AccountPool) RecordError(id string, isQuotaError bool) {
 		// 连续 3 次错误，冷却 1 分钟
 		p.cooldowns[id] = time.Now().Add(time.Minute)
 	}
+}
+
+// ModelCooldown is one account and model pair kept out of scheduling.
+type ModelCooldown struct {
+	AccountID string    `json:"accountId"`
+	Model     string    `json:"model"`
+	Until     time.Time `json:"until"`
+}
+
+func modelCooldownKey(id, model string) string {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if canonical := config.CanonicalModelID(model); canonical != "" {
+		model = canonical
+	}
+	return id + "\x00" + model
+}
+
+func (p *AccountPool) modelCoolingLocked(id, model string, now time.Time) bool {
+	// The admin switch gates enforcement, not only new records. Turning it
+	// off must release pairs that were cooled earlier in this process.
+	if !config.EmptyOutputModelCooldownEnabled() {
+		return false
+	}
+	if p == nil || p.modelCooldowns == nil || id == "" || strings.TrimSpace(model) == "" {
+		return false
+	}
+	until, ok := p.modelCooldowns[modelCooldownKey(id, model)]
+	return ok && now.Before(until)
+}
+
+// CooldownAccountModel keeps this account from being chosen for model until duration elapses.
+func (p *AccountPool) CooldownAccountModel(id, model string, duration time.Duration) {
+	if p == nil || id == "" || strings.TrimSpace(model) == "" || duration <= 0 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.modelCooldowns == nil {
+		p.modelCooldowns = make(map[string]time.Time)
+	}
+	p.modelCooldowns[modelCooldownKey(id, model)] = time.Now().Add(duration)
+}
+
+// ClearModelCooldowns drops every account-model cooldown. Used when the
+// empty-output switch is turned off so the admin list matches selection.
+func (p *AccountPool) ClearModelCooldowns() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.modelCooldowns = nil
+	p.mu.Unlock()
+}
+
+// ListModelCooldowns returns pairs that are still cooling.
+func (p *AccountPool) ListModelCooldowns(now time.Time) []ModelCooldown {
+	if p == nil {
+		return nil
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make([]ModelCooldown, 0)
+	for key, until := range p.modelCooldowns {
+		if !now.Before(until) {
+			continue
+		}
+		id, model, _ := strings.Cut(key, "\x00")
+		out = append(out, ModelCooldown{AccountID: id, Model: model, Until: until})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Model == out[j].Model {
+			return out[i].AccountID < out[j].AccountID
+		}
+		return out[i].Model < out[j].Model
+	})
+	return out
+}
+
+// AllEnabledModelAccountsNoted reports whether every enabled account that can
+// serve model appears in noted. An empty pool is not a complete rejection.
+func (p *AccountPool) AllEnabledModelAccountsNoted(model string, noted map[string]struct{}) bool {
+	if p == nil || strings.TrimSpace(model) == "" || len(noted) == 0 {
+		return false
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	saw := false
+	for _, accountIndex := range p.uniqueAccountIndexesLocked() {
+		acc := &p.accounts[accountIndex]
+		if acc == nil || !acc.Enabled || acc.ID == "" {
+			continue
+		}
+		if !p.accountHasModel(acc.ID, model) {
+			continue
+		}
+		saw = true
+		if _, ok := noted[acc.ID]; !ok {
+			return false
+		}
+	}
+	return saw
+}
+
+// AllEligibleAccountsModelCooling reports whether every enabled account that
+// can serve model is inside this cooldown. An empty pool is not cooling.
+func (p *AccountPool) AllEligibleAccountsModelCooling(model string) bool {
+	if p == nil || strings.TrimSpace(model) == "" {
+		return false
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	saw := false
+	for _, accountIndex := range p.uniqueAccountIndexesLocked() {
+		acc := &p.accounts[accountIndex]
+		if acc == nil || !acc.Enabled {
+			continue
+		}
+		if !p.accountHasModel(acc.ID, model) {
+			continue
+		}
+		saw = true
+		if !p.modelCoolingLocked(acc.ID, model, now) {
+			return false
+		}
+	}
+	return saw
 }
 
 // CooldownAccount temporarily removes an account from scheduling for duration.

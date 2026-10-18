@@ -265,6 +265,7 @@ func (h *Handler) handleAdvisorRequest(
 		Ephemeral1hInputTokens: responseCacheUsage.CacheCreation1hInputTokens,
 	}
 	resp.Usage.OutputTokensDetails = claudeReasoningUsageDetails(reasoning, includeEmptyThinkingBlock)
+	inflateClaudeUsage(&resp.Usage)
 
 	totalCredits := advisorResult.Credits + executorResult.Credits
 	h.recordSuccessForApiKeyWithCache(apiKeyID, totalInputTokens, accountedOutputTokens, totalCredits, cacheUsage)
@@ -349,13 +350,19 @@ func (h *Handler) callClaudeBuffered(
 
 	attemptLimit := h.maxAccountAttempts()
 	for attempt := 0; attempt < attemptLimit; attempt++ {
-		account, allFull := h.acquireAccountForModel(model, excluded, retrySameID, kiroPayloadContext(payload))
+		attemptModel := accountModelForAttempt(model, payload)
+		account, allFull := h.acquireAccountForModel(attemptModel, excluded, retrySameID, kiroPayloadContext(payload))
 		retrySameID = ""
 		if account == nil {
-			if h.startExpiredAccountRefreshes(model, excluded) {
+			if h.promoteOpus55EmptyToOpus5(payload, excluded) {
+				retrySameID = ""
+				attemptLimit++
+				continue
+			}
+			if h.startExpiredAccountRefreshes(attemptModel, excluded) {
 				lastErr = errAccountRefreshInProgress
-			} else if allFull {
-				lastErr = fmt.Errorf(allAccountsConcurrencyFullMessage)
+			} else if err := h.unavailableAccountError(attemptModel, allFull); err != nil {
+				lastErr = err
 			}
 			break
 		}

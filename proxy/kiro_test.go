@@ -1558,17 +1558,64 @@ func TestCallKiroAPIRebuildsRegionForApiKeyAccount(t *testing.T) {
 	}
 }
 
-func TestKiroUsesOnlyRegionalQEndpoint(t *testing.T) {
-	if len(kiroEndpoints) != 1 {
-		t.Fatalf("streaming endpoint count: want 1, got %d", len(kiroEndpoints))
+func TestKiroAWSEndpointsMatchReference(t *testing.T) {
+	if len(kiroEndpoints) != 3 {
+		t.Fatalf("streaming endpoint count: want 3, got %d", len(kiroEndpoints))
 	}
-
-	ep := kiroEndpoints[0]
-	if ep.URL != "https://q.us-east-1.amazonaws.com/generateAssistantResponse" {
-		t.Fatalf("unexpected streaming endpoint: %q", ep.URL)
+	want := []struct {
+		key    string
+		url    string
+		target string
+	}{
+		{"kiro", "https://q.us-east-1.amazonaws.com/generateAssistantResponse", ""},
+		{"codewhisperer", "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse", "AmazonCodeWhispererStreamingService.GenerateAssistantResponse"},
+		{"amazonq", "https://q.us-east-1.amazonaws.com/generateAssistantResponse", "AmazonQDeveloperStreamingService.SendMessage"},
 	}
-	if got := regionalizeURLForRegion(ep.URL, "eu-central-1"); got != "https://q.eu-central-1.amazonaws.com/generateAssistantResponse" {
+	for i, item := range want {
+		ep := kiroEndpoints[i]
+		if ep.Key != item.key || ep.URL != item.url || ep.AmzTarget != item.target {
+			t.Fatalf("endpoint %d = %+v, want %+v", i, ep, item)
+		}
+	}
+	if got := regionalizeURLForRegion(kiroEndpoints[0].URL, "eu-central-1"); got != "https://q.eu-central-1.amazonaws.com/generateAssistantResponse" {
 		t.Fatalf("regional endpoint: got %q", got)
+	}
+}
+
+func TestPreferredCodeWhispererEndpointIsUsed(t *testing.T) {
+	if err := config.Init(t.TempDir() + "/config.json"); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.UpdatePreferredEndpoint("codewhisperer"); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.UpdateEndpointFallback(false); err != nil {
+		t.Fatal(err)
+	}
+	var gotURL, gotTarget string
+	kiroHttpStore.Store(&http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			gotURL = req.URL.String()
+			gotTarget = req.Header.Get("X-Amz-Target")
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader("")),
+				Header:     make(http.Header),
+			}, nil
+		}),
+	})
+	t.Cleanup(func() { InitKiroHttpClient("") })
+
+	payload := &KiroPayload{}
+	payload.ConversationState.ConversationID = "conversation-123"
+	if err := CallKiroAPI(&config.Account{ApiRegion: "us-east-1", AccessToken: "token"}, payload, nil); err != nil {
+		t.Fatal(err)
+	}
+	if gotURL != "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse" {
+		t.Fatalf("url = %s", gotURL)
+	}
+	if gotTarget != "AmazonCodeWhispererStreamingService.GenerateAssistantResponse" {
+		t.Fatalf("target = %s", gotTarget)
 	}
 }
 
@@ -1609,6 +1656,12 @@ func TestCallKiroAPIApiKeyUsesSingleRegionalQRequest(t *testing.T) {
 	})
 	t.Cleanup(func() { InitKiroHttpClient("") })
 
+	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.UpdateEndpointFallback(false); err != nil {
+		t.Fatal(err)
+	}
 	account := &config.Account{
 		ID:          "api-key-regional-q",
 		AuthMethod:  "api_key",

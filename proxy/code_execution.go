@@ -179,6 +179,7 @@ func (h *Handler) handleCodeExecutionRequest(
 		},
 		ContextManagement: ClaudeContextManagement{AppliedEdits: []interface{}{}},
 	}
+	inflateClaudeUsage(&response.Usage)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	if err := json.NewEncoder(w).Encode(response); err != nil {
 		h.recordFailureWithDetails("claude", req.Model, accountID, err)

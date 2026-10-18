@@ -43,7 +43,7 @@ func RefreshTokenContext(ctx context.Context, account *config.Account) (string, 
 	if proxyURL == "" {
 		proxyURL = config.GetProxyURL()
 	}
-	client := GetAuthClientForProxy(proxyURL)
+	client := ClientForAccount(account.ID, proxyURL, account.MachineId)
 
 	// External IdP (enterprise SSO, e.g. Azure AD) tokens are refreshed against the
 	// IdP token endpoint (refresh_token grant, public client), NOT the AWS SSO OIDC

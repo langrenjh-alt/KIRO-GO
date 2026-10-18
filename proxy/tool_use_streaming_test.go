@@ -11,6 +11,83 @@ import (
 	"kiro-go/config"
 )
 
+func TestClaudeAutoToolStreamStartsWithToolUse(t *testing.T) {
+	weatherTool := func() *KiroPayload {
+		payload := emptyVisibleOutputPayload()
+		payload.ToolChoiceMode = "auto"
+		tool := KiroToolWrapper{}
+		tool.ToolSpecification.Name = "get_weather"
+		tool.ToolSpecification.InputSchema.JSON = map[string]interface{}{"type": "object"}
+		payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext = &UserInputMessageContext{
+			Tools: []KiroToolWrapper{tool},
+		}
+		return payload
+	}
+	emitTool := func(callback *KiroStreamCallback) {
+		callback.OnText("I'll check the weather.", false)
+		callback.OnToolUseStart("toolu_weather", "get_weather")
+		callback.OnToolUseInputDelta("toolu_weather", `{"city":"Paris"}`)
+		callback.OnToolUse(KiroToolUse{
+			ToolUseID: "toolu_weather",
+			Name:      "get_weather",
+			Input:     map[string]interface{}{"city": "Paris"},
+		})
+		callback.OnStopReason("TOOL_USE")
+		callback.OnComplete(8, 4)
+	}
+
+	t.Run("plain auto drops narration before the tool", func(t *testing.T) {
+		h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
+			emitTool(callback)
+			return nil
+		})
+		rec := httptest.NewRecorder()
+		h.handleClaudeStream(rec, weatherTool(), "claude-opus-4.8", "claude-opus-4.8", false, claudeThinkingResponseOptions{}, 5, nil, "")
+		body := rec.Body.String()
+		if rec.Code != http.StatusOK || strings.Contains(body, "I'll check") {
+			t.Fatalf("status=%d body=%s", rec.Code, body)
+		}
+		toolAt := strings.Index(body, `"type":"tool_use"`)
+		textAt := strings.Index(body, `"type":"text"`)
+		if toolAt < 0 || (textAt >= 0 && textAt < toolAt) {
+			t.Fatalf("first content block was not tool_use: tool=%d text=%d body=%s", toolAt, textAt, body)
+		}
+	})
+
+	t.Run("text-only auto answer is released", func(t *testing.T) {
+		h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
+			callback.OnText("No tool needed.", false)
+			callback.OnStopReason("END_TURN")
+			callback.OnComplete(8, 3)
+			return nil
+		})
+		rec := httptest.NewRecorder()
+		h.handleClaudeStream(rec, weatherTool(), "claude-opus-4.8", "claude-opus-4.8", false, claudeThinkingResponseOptions{}, 5, nil, "")
+		body := rec.Body.String()
+		if rec.Code != http.StatusOK || !strings.Contains(body, "No tool needed.") {
+			t.Fatalf("status=%d body=%s", rec.Code, body)
+		}
+	})
+
+	t.Run("coding agent keeps narration ahead of the tool", func(t *testing.T) {
+		h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
+			emitTool(callback)
+			return nil
+		})
+		payload := weatherTool()
+		payload.AgentCompletionMarker = "<agent_final_0123456789abcdef>"
+		payload.AgentReasoningCapEnabled = true
+		rec := httptest.NewRecorder()
+		h.handleClaudeStream(rec, payload, "claude-opus-4.8", "claude-opus-4.8", false, claudeThinkingResponseOptions{}, 5, nil, "")
+		body := rec.Body.String()
+		textAt := strings.Index(body, "I'll check the weather.")
+		toolAt := strings.Index(body, `"type":"tool_use"`)
+		if rec.Code != http.StatusOK || textAt < 0 || toolAt < textAt {
+			t.Fatalf("coding-agent order text=%d tool=%d status=%d body=%s", textAt, toolAt, rec.Code, body)
+		}
+	})
+}
+
 func TestParseEventStreamEmitsToolFragmentsBeforeValidatedCompletion(t *testing.T) {
 	stream := bytes.NewReader(bytes.Join([][]byte{
 		awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{

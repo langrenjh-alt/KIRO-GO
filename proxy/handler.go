@@ -379,14 +379,67 @@ func (h *Handler) backgroundRefresh() {
 	}
 }
 
+// refreshAccountSpacing spreads a full refresh across part of the 30 minute
+// cycle so enabled accounts do not all call the usage endpoint in the same second.
+func refreshAccountSpacing(enabledAccounts int) time.Duration {
+	if enabledAccounts <= 1 {
+		return 0
+	}
+	spacing := (20 * time.Minute) / time.Duration(enabledAccounts)
+	if spacing > 15*time.Second {
+		spacing = 15 * time.Second
+	}
+	if spacing < 200*time.Millisecond {
+		spacing = 200 * time.Millisecond
+	}
+	return spacing
+}
+
+func waitBetweenAccountRefreshes(stop <-chan struct{}, delay time.Duration) bool {
+	if delay <= 0 || stop == nil {
+		return true
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-stop:
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
 // refreshAllAccounts 刷新所有账户信息
 func (h *Handler) refreshAllAccounts() {
 	accounts := config.GetAccounts()
+	enabled := 0
 	for i := range accounts {
+		if accounts[i].Enabled && accounts[i].AccessToken != "" {
+			enabled++
+		}
+	}
+	spacing := refreshAccountSpacing(enabled)
+	seen := 0
+	for i := range accounts {
+		select {
+		case <-h.stopRefresh:
+			if seen > 0 && h.pool != nil {
+				h.pool.Reload()
+			}
+			return
+		default:
+		}
 		account := &accounts[i]
 		if !account.Enabled || account.AccessToken == "" {
 			continue
 		}
+		if seen > 0 && !waitBetweenAccountRefreshes(h.stopRefresh, spacing) {
+			if h.pool != nil {
+				h.pool.Reload()
+			}
+			return
+		}
+		seen++
 
 		// 刷新 token（去重 + 持久化由 refreshAccountToken 统一处理）
 		if err := h.refreshAccountToken(account, false); err != nil {
@@ -600,11 +653,9 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		h.modelsCacheMu.RUnlock()
 	}
 
-	thinkingSuffix := config.GetThinkingConfig().Suffix
-
-	models := buildAnthropicModelsResponse(cached, thinkingSuffix)
+	models := buildAnthropicModelsResponse(cached)
 	if len(models) == 0 {
-		models = fallbackAnthropicModels(thinkingSuffix)
+		models = fallbackAnthropicModels()
 	}
 
 	// 添加别名模型
@@ -613,6 +664,7 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		buildModelInfo("gpt-4o", "kiro-proxy", true),
 		buildModelInfo("gpt-4", "kiro-proxy", true),
 	)
+	models = normalizePublicModels(models)
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -622,43 +674,88 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 	return
 }
 
-func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string) []map[string]interface{} {
+func buildAnthropicModelsResponse(cached []ModelInfo) []map[string]interface{} {
 	if len(cached) == 0 {
 		return nil
 	}
 
-	models := make([]map[string]interface{}, 0, len(cached)*2)
-	if len(cached) > 0 {
-		for _, m := range cached {
-			supportsImage := modelSupportsImage(m.InputTypes)
-			limits := lookupModelTokenLimits(m.ModelId)
-			models = append(models, buildModelInfoWithTokenLimits(m.ModelId, "anthropic", supportsImage, limits))
-			// 自动生成 thinking 变体
-			models = append(models, buildModelInfoWithTokenLimits(m.ModelId+thinkingSuffix, "anthropic", supportsImage, limits))
-		}
+	models := make([]map[string]interface{}, 0, len(cached))
+	for _, m := range cached {
+		supportsImage := modelSupportsImage(m.InputTypes)
+		limits := lookupModelTokenLimits(m.ModelId)
+		models = append(models, buildModelInfoWithTokenLimits(m.ModelId, "anthropic", supportsImage, limits))
 	}
 	return models
 }
 
-func fallbackAnthropicModels(thinkingSuffix string) []map[string]interface{} {
+func fallbackAnthropicModels() []map[string]interface{} {
 	return []map[string]interface{}{
-		buildModelInfo("claude-opus-4.8", "anthropic", true),
-		buildThinkingModelInfo("claude-opus-4.8", thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-sonnet-4.6", "anthropic", true),
-		buildThinkingModelInfo("claude-sonnet-4.6", thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-opus-4.6", "anthropic", true),
-		buildThinkingModelInfo("claude-opus-4.6", thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-opus-4.7", "anthropic", true),
-		buildThinkingModelInfo("claude-opus-4.7", thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-sonnet-4.5", "anthropic", true),
-		buildThinkingModelInfo("claude-sonnet-4.5", thinkingSuffix, "anthropic", true),
+		buildModelInfo("claude-opus-4-8", "anthropic", true),
+		buildModelInfo("claude-sonnet-4-6", "anthropic", true),
+		buildModelInfo("claude-opus-4-6", "anthropic", true),
+		buildModelInfo("claude-opus-4-7", "anthropic", true),
+		buildModelInfo("claude-sonnet-4-5", "anthropic", true),
 		buildModelInfo("claude-sonnet-4", "anthropic", true),
-		buildThinkingModelInfo("claude-sonnet-4", thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-haiku-4.5", "anthropic", true),
-		buildThinkingModelInfo("claude-haiku-4.5", thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-opus-4.5", "anthropic", true),
-		buildThinkingModelInfo("claude-opus-4.5", thinkingSuffix, "anthropic", true),
+		buildModelInfo("claude-haiku-4-5", "anthropic", true),
+		buildModelInfo("claude-opus-4-5", "anthropic", true),
 	}
+}
+
+// normalizePublicModels publishes one hyphenated id per model. Dotted and
+// dashed catalog spellings collapse, and a trailing thinking suffix is not a
+// separate model. Requests may still send either spelling or the suffix.
+func normalizePublicModels(models []map[string]interface{}) []map[string]interface{} {
+	if len(models) == 0 {
+		return models
+	}
+	suffix := config.GetThinkingConfig().Suffix
+	out := make([]map[string]interface{}, 0, len(models))
+	index := make(map[string]int, len(models))
+	for _, model := range models {
+		raw, _ := model["id"].(string)
+		if publicModelOmitted(raw, suffix) {
+			continue
+		}
+		id := config.PublicModelID(raw)
+		if id == "" {
+			continue
+		}
+		if existing, ok := index[id]; ok {
+			if publicModelSupportsImage(model) && !publicModelSupportsImage(out[existing]) {
+				out[existing] = publicModelCopy(model, id)
+			}
+			continue
+		}
+		index[id] = len(out)
+		out = append(out, publicModelCopy(model, id))
+	}
+	return out
+}
+
+func publicModelOmitted(id, thinkingSuffix string) bool {
+	lower := strings.ToLower(strings.TrimSpace(id))
+	if lower == "" {
+		return true
+	}
+	if strings.HasSuffix(lower, "-thinking") {
+		return true
+	}
+	suffix := strings.ToLower(strings.TrimSpace(thinkingSuffix))
+	return suffix != "" && strings.HasSuffix(lower, suffix)
+}
+
+func publicModelSupportsImage(model map[string]interface{}) bool {
+	supports, _ := model["supports_image"].(bool)
+	return supports
+}
+
+func publicModelCopy(model map[string]interface{}, id string) map[string]interface{} {
+	copied := make(map[string]interface{}, len(model))
+	for key, value := range model {
+		copied[key] = value
+	}
+	copied["id"] = id
+	return copied
 }
 
 func modelSupportsImage(inputTypes []string) bool {
@@ -1151,6 +1248,24 @@ func (h *Handler) retryKiroPreResponse(payload *KiroPayload, account *config.Acc
 	if isKiroRecoveryTimeoutError(cause) {
 		return false, nil
 	}
+	if isUpstreamEventsNoneEmptyError(cause) && h.pool != nil {
+		noteEventsNoneAccount(payload, account.ID)
+		model := ""
+		if payload != nil {
+			model = payload.ConversationState.CurrentMessage.UserInputMessage.ModelID
+		}
+		if model != "" && config.EmptyOutputModelCooldownEnabled() {
+			h.pool.CooldownAccountModel(account.ID, model, time.Duration(config.EmptyOutputModelCooldownMinutes())*time.Minute)
+			logger.Warnf("[KiroAPI] cooling account %s for model %s after events=none empty output", account.ID, model)
+		} else {
+			logger.Warnf("[KiroAPI] retrying events=none empty output on another account without cooldown account_id=%s", account.ID)
+		}
+		if excluded != nil {
+			excluded[account.ID] = true
+		}
+		*retrySameID = ""
+		return true, nil
+	}
 	if isUpstreamAgentMarkerMismatchError(cause) {
 		if !agentCompletionRetryAllowed(payload, cause) {
 			return false, nil
@@ -1168,6 +1283,14 @@ func (h *Handler) retryKiroPreResponse(payload *KiroPayload, account *config.Acc
 		return false, nil
 	}
 
+	// Opus 5.5 is exposed by the upstream catalog only under its dotted ID.
+	// Do not turn an empty response into claude-opus-5-5: that spelling is
+	// rejected by the data plane and hides the original failure.
+	if isUpstreamEmptyResponseError(cause) && !isOpus55Model(payload) && tryAlternateKiroModelID(payload) {
+		*retrySameID = account.ID
+		return true, nil
+	}
+
 	delay := 100 * time.Millisecond
 	if !waitForRateLimitRetry(kiroPayloadContext(payload), rateLimitDecision{Delay: delay}) {
 		return false, kiroPayloadContext(payload).Err()
@@ -1175,6 +1298,33 @@ func (h *Handler) retryKiroPreResponse(payload *KiroPayload, account *config.Acc
 	*retryCount++
 	*retrySameID = account.ID
 	return true, nil
+}
+
+func isOpus55Model(payload *KiroPayload) bool {
+	if payload == nil {
+		return false
+	}
+	model := strings.ToLower(strings.TrimSpace(payload.ConversationState.CurrentMessage.UserInputMessage.ModelID))
+	return model == "claude-opus-5.5" || model == "claude-opus-5-5"
+}
+
+func tryAlternateKiroModelID(payload *KiroPayload) bool {
+	if payload == nil || payload.ModelIDAlternateRetry {
+		return false
+	}
+	current := strings.TrimSpace(payload.ConversationState.CurrentMessage.UserInputMessage.ModelID)
+	alternate := config.AlternateModelID(current)
+	if alternate == "" || strings.EqualFold(current, alternate) {
+		return false
+	}
+	payload.ConversationState.CurrentMessage.UserInputMessage.ModelID = alternate
+	for i := range payload.ConversationState.History {
+		if payload.ConversationState.History[i].UserInputMessage != nil {
+			payload.ConversationState.History[i].UserInputMessage.ModelID = alternate
+		}
+	}
+	payload.ModelIDAlternateRetry = true
+	return true
 }
 
 // claudeAttemptHasClientOutput accepts only content that the Claude adapter can
@@ -1326,6 +1476,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 }
 
 func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *KiroPayload, model, responseModel string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, prelude *claudeStreamPrelude) {
+	_, deferBillingInflation := w.(*claudeCodeBufferedResponseWriter)
 	payload = cloneKiroPayload(payload)
 	configureSSEHeaders(w)
 
@@ -1381,7 +1532,7 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 				"stop_reason":   nil,
 				"stop_sequence": nil,
 				"stop_details":  nil,
-				"usage":         buildClaudeUsageMap(startInputTokens, 1, messageStartUsage, true),
+				"usage":         buildClaudeUsageMap(startInputTokens, 1, messageStartUsage, true, deferBillingInflation),
 			},
 		})
 		preludeSent = true
@@ -1421,13 +1572,19 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 
 	attemptLimit := h.maxAccountAttempts()
 	for attempt := 0; attempt < attemptLimit; attempt++ {
-		account, allFull := h.acquireAccountForModel(model, excluded, retrySameID, kiroPayloadContext(payload))
+		attemptModel := accountModelForAttempt(model, payload)
+		account, allFull := h.acquireAccountForModel(attemptModel, excluded, retrySameID, kiroPayloadContext(payload))
 		retrySameID = ""
 		if account == nil {
-			if h.startExpiredAccountRefreshes(model, excluded) {
+			if h.promoteOpus55EmptyToOpus5(payload, excluded) {
+				retrySameID = ""
+				attemptLimit++
+				continue
+			}
+			if h.startExpiredAccountRefreshes(attemptModel, excluded) {
 				lastErr = errAccountRefreshInProgress
-			} else if allFull {
-				lastErr = fmt.Errorf(allAccountsConcurrencyFullMessage)
+			} else if err := h.unavailableAccountError(attemptModel, allFull); err != nil {
+				lastErr = err
 			}
 			break
 		}
@@ -1615,12 +1772,11 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 		var eventThinkingOpen bool
 		structuredOutput := payload.StructuredOutput
 		structuredJSON := &incrementalJSONStream{}
-		// Auto tool choice permits a normal text answer, so stream it immediately.
-		// Required/specific choices must remain pure tool turns: suppress Kiro's
-		// common "I will call..." narration until the toolUse event arrives.
-		holdToolText := (payload.ToolChoiceMode == "required" || payload.ToolChoiceMode == "specific") &&
-			payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext != nil &&
-			len(payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.Tools) > 0
+		// Hold prose that would otherwise become the first content block of a
+		// tool turn. A later tool event discards it. A text-only answer is
+		// released at the end. Coding-agent auto turns are the exception and
+		// keep their narration ahead of the tool call.
+		holdToolText := claudeStreamHoldsPreToolText(payload)
 
 		emitRedactedThinking := func(data string) {
 			if suppressRecoveryOutput || stopFilter.Matched() != "" || !thinking || thinkingFormat != "thinking" || data == "" {
@@ -2216,6 +2372,11 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 				return
 			}
 			lastErr = err
+			if isUpstreamContentFilteredError(err) {
+				h.recordFailureWithDetails("claude", model, account.ID, err)
+				sendClaudeStreamFailure(http.StatusForbidden, "permission_error", err.Error())
+				return
+			}
 			if prelude == nil && visibleOutputProduced && !holdToolText && activeToolUseID == "" &&
 				len(deferredCompletedToolUses) == 0 && len(deferredToolOutput) == 0 &&
 				prepareKiroOutputContinuationAfterError(payload, err, rawContentBuilder.String(), completedKiroToolNames(toolUses)) {
@@ -2391,7 +2552,7 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 		}
 		outputContent, matchedStopSequence := truncateAtStopSequence(outputContent, payload.StopSequences)
 		if len(toolUses) > 0 && len(payload.StopSequences) == 0 &&
-			(payload.ToolChoiceMode == "required" || payload.ToolChoiceMode == "specific") {
+			(holdToolText || payload.ToolChoiceMode == "required" || payload.ToolChoiceMode == "specific") {
 			outputContent = ""
 		}
 		thinkingOutput := rawThinkingBuilder.String()
@@ -2448,13 +2609,13 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 		terminalCacheUsage := claudeTerminalCacheUsage(cacheProfile, payload, model, inputTokens, cacheUsage)
 		publicInputTokens, terminalCacheUsage = retryUsage.apply(publicInputTokens, terminalCacheUsage)
 		publicOutputTokens := retryUsage.applyOutput(outputTokens)
-		finalUsage := buildClaudeTerminalUsageMap(publicInputTokens, publicOutputTokens, terminalCacheUsage)
+		finalUsage := buildClaudeTerminalUsageMap(publicInputTokens, publicOutputTokens, terminalCacheUsage, deferBillingInflation)
 		addKiroContextUsage(finalUsage, payload, model)
 		addClaudeReasoningUsageDetails(finalUsage, ClaudeReasoningResult{
 			Text:      thinkingOutput,
 			Signature: reasoningSignature,
 			Redacted:  redactedThinking,
-		}, thinking && thinkingBlockEmitted)
+		}, thinking && thinkingBlockEmitted, deferBillingInflation)
 		h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
 			"type": "message_delta",
 			"delta": map[string]interface{}{
@@ -2484,6 +2645,10 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 	if isAccountRefreshInProgressError(lastErr) {
 		w.Header().Set("Retry-After", fmt.Sprintf("%d", int(expiredAccountRefreshWait.Seconds())))
 		sendClaudeStreamFailure(accountRefreshInProgressStatus, "account_refreshing", accountRefreshInProgressMessage)
+		return
+	}
+	if isAllAccountsModelCoolingError(lastErr) {
+		sendClaudeStreamFailure(http.StatusServiceUnavailable, "api_error", lastErr.Error())
 		return
 	}
 	if isAllAccountsConcurrencyFullError(lastErr) {
@@ -2597,26 +2762,31 @@ func (h *Handler) settleDiscardedAttempt(endpoint, model, accountID, apiKeyID st
 }
 
 func (h *Handler) recordSuccessForApiKeyWithCache(apiKeyID string, inputTokens, outputTokens int, credits float64, cacheUsage promptCacheUsage) {
+	billedUsage := inflatedBillingUsage(inputTokens, outputTokens, cacheUsage)
+	billedInputTokens := billedUsage.InputTokens + billedUsage.CacheCreationInputTokens + billedUsage.CacheReadInputTokens
 	h.statsMu.Lock()
-	h.recordSuccess(inputTokens, outputTokens, credits)
+	h.recordSuccess(billedInputTokens, billedUsage.OutputTokens, credits)
 	if h.traffic != nil {
 		h.traffic.Record(TrafficObservation{
-			InputTokens:         int64(billedClaudeInputTokens(inputTokens, cacheUsage)),
-			OutputTokens:        int64(outputTokens),
-			CacheCreationTokens: int64(cacheUsage.CacheCreationInputTokens),
-			CacheReadTokens:     int64(cacheUsage.CacheReadInputTokens),
+			InputTokens:         int64(billedUsage.InputTokens),
+			OutputTokens:        int64(billedUsage.OutputTokens),
+			CacheCreationTokens: int64(billedUsage.CacheCreationInputTokens),
+			CacheReadTokens:     int64(billedUsage.CacheReadInputTokens),
 		})
 	}
 	h.statsMu.Unlock()
 
 	if apiKeyID != "" {
-		if err := config.RecordApiKeyUsage(apiKeyID, int64(inputTokens+outputTokens), credits); err != nil {
+		if err := config.RecordApiKeyUsage(apiKeyID, int64(billingUsageTotal(billedUsage)), credits); err != nil {
 			logger.Warnf("[ApiKey] failed to record usage for key %s: %v", apiKeyID, err)
 		}
 	}
 }
 
 func reanchorClaudeCacheUsage(profile *promptCacheProfile, usage promptCacheUsage, finalInputTokens int) promptCacheUsage {
+	if profile != nil && profile.FixedRatioCache {
+		return fixedRatioCacheUsage(finalInputTokens, profile.FixedCacheReadPercent, profile.FixedCacheCreationPercent)
+	}
 	if profile == nil || finalInputTokens <= 0 {
 		return usage
 	}
@@ -2745,13 +2915,19 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 
 	attemptLimit := h.maxAccountAttempts()
 	for attempt := 0; attempt < attemptLimit; attempt++ {
-		account, allFull := h.acquireAccountForModel(model, excluded, retrySameID, kiroPayloadContext(payload))
+		attemptModel := accountModelForAttempt(model, payload)
+		account, allFull := h.acquireAccountForModel(attemptModel, excluded, retrySameID, kiroPayloadContext(payload))
 		retrySameID = ""
 		if account == nil {
-			if h.startExpiredAccountRefreshes(model, excluded) {
+			if h.promoteOpus55EmptyToOpus5(payload, excluded) {
+				retrySameID = ""
+				attemptLimit++
+				continue
+			}
+			if h.startExpiredAccountRefreshes(attemptModel, excluded) {
 				lastErr = errAccountRefreshInProgress
-			} else if allFull {
-				lastErr = fmt.Errorf(allAccountsConcurrencyFullMessage)
+			} else if err := h.unavailableAccountError(attemptModel, allFull); err != nil {
+				lastErr = err
 			}
 			break
 		}
@@ -2889,6 +3065,11 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 				return
 			}
 			lastErr = err
+			if isUpstreamContentFilteredError(err) {
+				h.recordFailureWithDetails("claude", model, account.ID, err)
+				h.sendClaudeError(w, http.StatusForbidden, "permission_error", err.Error())
+				return
+			}
 			if strings.TrimSpace(content) != "" && len(toolUses) == 0 &&
 				prepareKiroOutputContinuationAfterError(payload, err, content, nil) {
 				logger.Warnf("[KiroAPI] retrying Claude non-stream after mid-response disconnect request_id=%s account_id=%s continuation=%d/%d: %v",
@@ -3116,6 +3297,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 				Ephemeral1hInputTokens: responseCacheUsage.CacheCreation1hInputTokens,
 			}
 		}
+		inflateClaudeUsage(&resp.Usage)
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		json.NewEncoder(w).Encode(resp)
 		return
@@ -3131,6 +3313,10 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 	if isAccountRefreshInProgressError(lastErr) {
 		w.Header().Set("Retry-After", fmt.Sprintf("%d", int(expiredAccountRefreshWait.Seconds())))
 		h.sendClaudeError(w, accountRefreshInProgressStatus, "account_refreshing", accountRefreshInProgressMessage)
+		return
+	}
+	if isAllAccountsModelCoolingError(lastErr) {
+		h.sendClaudeError(w, http.StatusServiceUnavailable, "api_error", lastErr.Error())
 		return
 	}
 	if isAllAccountsConcurrencyFullError(lastErr) {
@@ -3361,6 +3547,15 @@ func buildOpenAIUsageMap(inputTokens, outputTokens int, cacheUsage promptCacheUs
 	if cachedTokens > inputTokens {
 		cachedTokens = inputTokens
 	}
+	percent := config.GetTokenBillingInflationPercent()
+	if percent > 0 || inputTokens > maxBillingInputTokens {
+		cacheUsage.CacheReadInputTokens = cachedTokens
+		cacheUsage.CacheCreationInputTokens = maxInt(0, minInt(cacheUsage.CacheCreationInputTokens, inputTokens-cachedTokens))
+		billedUsage := inflatedBillingUsageWithPercent(inputTokens, outputTokens, cacheUsage, percent)
+		inputTokens = billedUsage.InputTokens + billedUsage.CacheCreationInputTokens + billedUsage.CacheReadInputTokens
+		outputTokens = billedUsage.OutputTokens
+		cachedTokens = billedUsage.CacheReadInputTokens
+	}
 	return map[string]interface{}{
 		"prompt_tokens":     inputTokens,
 		"completion_tokens": outputTokens,
@@ -3418,13 +3613,19 @@ func (h *Handler) handleOpenAIStreamWithCache(w http.ResponseWriter, payload *Ki
 
 	attemptLimit := h.maxAccountAttempts()
 	for attempt := 0; attempt < attemptLimit; attempt++ {
-		account, allFull := h.acquireAccountForModel(model, excluded, retrySameID, kiroPayloadContext(payload))
+		attemptModel := accountModelForAttempt(model, payload)
+		account, allFull := h.acquireAccountForModel(attemptModel, excluded, retrySameID, kiroPayloadContext(payload))
 		retrySameID = ""
 		if account == nil {
-			if h.startExpiredAccountRefreshes(model, excluded) {
+			if h.promoteOpus55EmptyToOpus5(payload, excluded) {
+				retrySameID = ""
+				attemptLimit++
+				continue
+			}
+			if h.startExpiredAccountRefreshes(attemptModel, excluded) {
 				lastErr = errAccountRefreshInProgress
-			} else if allFull {
-				lastErr = fmt.Errorf(allAccountsConcurrencyFullMessage)
+			} else if err := h.unavailableAccountError(attemptModel, allFull); err != nil {
+				lastErr = err
 			}
 			break
 		}
@@ -3995,6 +4196,15 @@ func (h *Handler) handleOpenAIStreamWithCache(w http.ResponseWriter, payload *Ki
 				return
 			}
 			lastErr = err
+			if isUpstreamContentFilteredError(err) {
+				h.recordFailureWithDetails("openai", model, account.ID, err)
+				if !streamCommitted {
+					h.sendOpenAIError(w, http.StatusForbidden, "permission_error", err.Error())
+				} else {
+					finishWithStreamError("permission_error", err)
+				}
+				return
+			}
 			if takeKiroOutputContinuationRetry(payload, err) {
 				retryUsage.markLastVisibleContinuation()
 				retryUsage.markLastContinuationAttemptOutput()
@@ -4196,6 +4406,14 @@ func (h *Handler) handleOpenAIStreamWithCache(w http.ResponseWriter, payload *Ki
 		h.sendOpenAIError(w, accountRefreshInProgressStatus, "account_refreshing", accountRefreshInProgressMessage)
 		return
 	}
+	if isAllAccountsModelCoolingError(lastErr) {
+		if streamCommitted {
+			finishWithStreamError("server_error", lastErr)
+		} else {
+			h.sendOpenAIError(w, http.StatusServiceUnavailable, "server_error", lastErr.Error())
+		}
+		return
+	}
 	if isAllAccountsConcurrencyFullError(lastErr) {
 		if streamCommitted {
 			finishWithStreamError("server_error", lastErr)
@@ -4237,13 +4455,19 @@ func (h *Handler) handleOpenAINonStreamWithCache(w http.ResponseWriter, payload 
 
 	attemptLimit := h.maxAccountAttempts()
 	for attempt := 0; attempt < attemptLimit; attempt++ {
-		account, allFull := h.acquireAccountForModel(model, excluded, retrySameID, kiroPayloadContext(payload))
+		attemptModel := accountModelForAttempt(model, payload)
+		account, allFull := h.acquireAccountForModel(attemptModel, excluded, retrySameID, kiroPayloadContext(payload))
 		retrySameID = ""
 		if account == nil {
-			if h.startExpiredAccountRefreshes(model, excluded) {
+			if h.promoteOpus55EmptyToOpus5(payload, excluded) {
+				retrySameID = ""
+				attemptLimit++
+				continue
+			}
+			if h.startExpiredAccountRefreshes(attemptModel, excluded) {
 				lastErr = errAccountRefreshInProgress
-			} else if allFull {
-				lastErr = fmt.Errorf(allAccountsConcurrencyFullMessage)
+			} else if err := h.unavailableAccountError(attemptModel, allFull); err != nil {
+				lastErr = err
 			}
 			break
 		}
@@ -4351,6 +4575,11 @@ func (h *Handler) handleOpenAINonStreamWithCache(w http.ResponseWriter, payload 
 				return
 			}
 			lastErr = err
+			if isUpstreamContentFilteredError(err) {
+				h.recordFailureWithDetails("openai", model, account.ID, err)
+				h.sendOpenAIError(w, http.StatusForbidden, "permission_error", err.Error())
+				return
+			}
 			if takeKiroOutputContinuationRetry(payload, err) {
 				retryUsage.markLastContinuationAttemptOutput()
 				retrySameID = account.ID
@@ -4489,6 +4718,10 @@ func (h *Handler) handleOpenAINonStreamWithCache(w http.ResponseWriter, payload 
 	if isAccountRefreshInProgressError(lastErr) {
 		w.Header().Set("Retry-After", fmt.Sprintf("%d", int(expiredAccountRefreshWait.Seconds())))
 		h.sendOpenAIError(w, accountRefreshInProgressStatus, "account_refreshing", accountRefreshInProgressMessage)
+		return
+	}
+	if isAllAccountsModelCoolingError(lastErr) {
+		h.sendOpenAIError(w, http.StatusServiceUnavailable, "server_error", lastErr.Error())
 		return
 	}
 	if isAllAccountsConcurrencyFullError(lastErr) {
@@ -4761,6 +4994,18 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetEndpointConfig(w, r)
 	case path == "/endpoint" && r.Method == "POST":
 		h.apiUpdateEndpointConfig(w, r)
+	case path == "/empty-output-cooldown" && r.Method == "GET":
+		h.apiGetEmptyOutputCooldown(w, r)
+	case path == "/empty-output-cooldown" && r.Method == "POST":
+		h.apiUpdateEmptyOutputCooldown(w, r)
+	case path == "/opus55-empty-fallback" && r.Method == "GET":
+		h.apiGetOpus55EmptyFallback(w, r)
+	case path == "/opus55-empty-fallback" && r.Method == "POST":
+		h.apiUpdateOpus55EmptyFallback(w, r)
+	case path == "/s2ap-bind" && r.Method == "GET":
+		h.apiGetS2APBind(w, r)
+	case path == "/s2ap-bind" && r.Method == "POST":
+		h.apiUpdateS2APBind(w, r)
 	case path == "/proxy" && r.Method == "GET":
 		h.apiGetProxy(w, r)
 	case path == "/proxy" && r.Method == "POST":
@@ -4806,6 +5051,14 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 	accounts := config.GetAccounts()
 	poolAccounts := h.pool.GetAllAccounts()
 	runtimeStates := h.pool.RuntimeStates()
+	s2apEnabled := config.S2APBindEnabled()
+	if s2apEnabled {
+		rebalanceS2APLeases()
+	}
+	s2apLeases := config.SnapshotS2APAccountLeases()
+	now := time.Now()
+	nowUnix := now.Unix()
+	emptyModels := h.emptyOutputModelViewsNow(now)
 
 	// 合并运行时统计
 	statsMap := make(map[string]config.Account)
@@ -4824,6 +5077,11 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 		runtimeReason := runtime.Reason
 		if !inPool {
 			runtimeReason = "not_in_runtime_pool"
+		}
+		lease, hasLease := s2apLeases[a.ID]
+		exitIP, leaseUntil := accountS2APLeaseView(lease, hasLease, nowUnix)
+		if exitIP == "" && leaseUntil > 0 {
+			exitIP = s2apExitByProxyID(lease.ProxyID)
 		}
 		result[i] = map[string]interface{}{
 			"id":                    a.ID,
@@ -4854,6 +5112,10 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"currentOverages":       a.CurrentOverages,
 			"overageCheckedAt":      a.OverageCheckedAt,
 			"proxyURL":              a.ProxyURL,
+			"s2apEnabled":           s2apEnabled,
+			"s2apExitIP":            exitIP,
+			"s2apLeaseUntil":        leaseUntil,
+			"emptyOutputModels":     emptyOutputModelsForAccount(emptyModels, a.ID),
 			"subscriptionType":      a.SubscriptionType,
 			"subscriptionTitle":     a.SubscriptionTitle,
 			"daysRemaining":         a.DaysRemaining,
@@ -6025,11 +6287,14 @@ func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 		"promptCacheMaxRatio":              config.GetPromptCacheMaxRatio(),
 		"promptCacheMaxEntries":            config.GetPromptCacheMaxEntries(),
 		"promptCacheTTLSeconds":            config.GetPromptCacheTTLSeconds(),
+		"tokenBillingInflationPercent":     config.GetTokenBillingInflationPercent(),
+		"tokenBillingInputLimit":           maxBillingInputTokens,
 		"rateLimit":                        config.GetRateLimitConfig(),
 		"scheduling":                       config.GetSchedulingConfig(),
 		"accountPriority":                  config.GetAccountPriorityConfig(),
 		"cacheMode":                        config.GetCacheMode(),
 		"functionCache":                    config.GetFunctionCacheConfig(),
+		"fixedRatioCache":                  config.GetFixedRatioCacheConfig(),
 		"reasoningCap":                     config.GetReasoningCapConfig(),
 		"reasoningCapEnvFallbackMode":      reasoningCapModeFromEnvFallback(),
 		"agentCompletionMarkerEnabled":     config.GetAgentCompletionMarkerEnabled(),
@@ -6089,11 +6354,13 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		PromptCacheMaxRatio              *float64                      `json:"promptCacheMaxRatio,omitempty"`
 		PromptCacheMaxEntries            *int                          `json:"promptCacheMaxEntries,omitempty"`
 		PromptCacheTTLSeconds            *int                          `json:"promptCacheTTLSeconds,omitempty"`
+		TokenBillingInflationPercent     *float64                      `json:"tokenBillingInflationPercent,omitempty"`
 		RateLimit                        *config.RateLimitConfig       `json:"rateLimit,omitempty"`
 		Scheduling                       *config.SchedulingConfig      `json:"scheduling,omitempty"`
 		AccountPriority                  *config.AccountPriorityConfig `json:"accountPriority,omitempty"`
 		CacheMode                        *string                       `json:"cacheMode,omitempty"`
 		FunctionCache                    *config.FunctionCacheConfig   `json:"functionCache,omitempty"`
+		FixedRatioCache                  *config.FixedRatioCacheConfig `json:"fixedRatioCache,omitempty"`
 		ReasoningCap                     *config.ReasoningCapConfig    `json:"reasoningCap,omitempty"`
 		AgentCompletionMarkerEnabled     *bool                         `json:"agentCompletionMarkerEnabled,omitempty"`
 	}
@@ -6107,6 +6374,13 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("promptCacheMaxRatio must be between %.2f and %.2f", config.MinPromptCacheRatio, config.MaxPromptCacheRatio)})
 		return
 	}
+	if req.TokenBillingInflationPercent != nil {
+		if err := config.ValidateTokenBillingInflationPercent(*req.TokenBillingInflationPercent); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
 	if req.PromptCacheMaxEntries != nil && (*req.PromptCacheMaxEntries < config.MinPromptCacheEntries || *req.PromptCacheMaxEntries > config.MaxPromptCacheEntries) {
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("promptCacheMaxEntries must be between %d and %d", config.MinPromptCacheEntries, config.MaxPromptCacheEntries)})
@@ -6117,9 +6391,9 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("promptCacheTTLSeconds must be either %d or %d", config.DefaultPromptCacheTTLSeconds, config.ExtendedPromptCacheTTLSeconds)})
 		return
 	}
-	if req.CacheMode != nil && *req.CacheMode != config.CacheModeNative && *req.CacheMode != config.CacheModeFunctionSimulation {
+	if req.CacheMode != nil && !config.IsKnownCacheMode(*req.CacheMode) {
 		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "cacheMode must be native or function_simulation"})
+		json.NewEncoder(w).Encode(map[string]string{"error": "cacheMode must be native, function_simulation, or fixed_ratio"})
 		return
 	}
 	if req.ReasoningCap != nil {
@@ -6138,6 +6412,13 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	if req.ApiKey != nil || req.RequireApiKey != nil || req.Password != "" {
 		if err := config.UpdateSettingsPatch(req.ApiKey, req.RequireApiKey, req.Password); err != nil {
 			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+	if req.TokenBillingInflationPercent != nil {
+		if err := config.UpdateTokenBillingInflationPercent(*req.TokenBillingInflationPercent); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
 		}
@@ -6197,8 +6478,8 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if req.CacheMode != nil || req.FunctionCache != nil {
-		if err := config.UpdateCachePolicy(req.CacheMode, req.FunctionCache); err != nil {
+	if req.CacheMode != nil || req.FunctionCache != nil || req.FixedRatioCache != nil {
+		if err := config.UpdateCachePolicy(req.CacheMode, req.FunctionCache, req.FixedRatioCache); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
@@ -6700,6 +6981,110 @@ func (h *Handler) apiUpdateEndpointConfig(w http.ResponseWriter, r *http.Request
 	}
 
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+func (h *Handler) apiGetEmptyOutputCooldown(w http.ResponseWriter, r *http.Request) {
+	cooldowns := []pool.ModelCooldown{}
+	if h.pool != nil {
+		cooldowns = h.pool.ListModelCooldowns(time.Now())
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"enabled":   config.EmptyOutputModelCooldownEnabled(),
+		"minutes":   config.EmptyOutputModelCooldownMinutes(),
+		"cooldowns": cooldowns,
+	})
+}
+
+func (h *Handler) apiUpdateEmptyOutputCooldown(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Enabled bool `json:"enabled"`
+		Minutes int  `json:"minutes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	if req.Minutes <= 0 {
+		req.Minutes = 30
+	}
+	if req.Minutes > 24*60 {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "minutes must be between 1 and 1440"})
+		return
+	}
+	if err := config.UpdateEmptyOutputCooldown(req.Enabled, req.Minutes); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	if !req.Enabled && h.pool != nil {
+		h.pool.ClearModelCooldowns()
+	}
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+func (h *Handler) apiGetOpus55EmptyFallback(w http.ResponseWriter, r *http.Request) {
+	json.NewEncoder(w).Encode(map[string]bool{
+		"enabled": config.Opus55EmptyMapToOpus5Enabled(),
+	})
+}
+
+func (h *Handler) apiUpdateOpus55EmptyFallback(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	if err := config.UpdateOpus55EmptyMapToOpus5(req.Enabled); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+func (h *Handler) apiGetS2APBind(w http.ResponseWriter, r *http.Request) {
+	settings := config.GetS2APBindSettings()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"enabled":   settings.Enabled,
+		"hours":     settings.Hours,
+		"leases":    settings.Leases,
+		"available": s2apAvailableCount(),
+	})
+}
+
+func (h *Handler) apiUpdateS2APBind(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Enabled bool `json:"enabled"`
+		Hours   int  `json:"hours"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	if req.Hours <= 0 {
+		req.Hours = 12
+	}
+	if req.Hours > 24*14 {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "hours must be between 1 and 336"})
+		return
+	}
+	settings, err := config.UpdateS2APBind(req.Enabled, req.Hours)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"bind":    settings,
+	})
 }
 
 // applyProxyConfig 将代理配置应用到所有出站 HTTP 客户端（Kiro API + auth 模块）

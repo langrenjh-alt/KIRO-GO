@@ -171,6 +171,7 @@ func addKiroContextUsage(usage map[string]interface{}, payload *KiroPayload, mod
 // ListAvailableModels values always take precedence; the fallback only covers
 // startup and temporary catalog-refresh failures.
 func fallbackModelTokenLimits(model string) modelTokenLimit {
+	model = canonicalModelLimitKey(model)
 	switch model {
 	case "auto":
 		return modelTokenLimit{MaxInputTokens: 1_000_000, MaxOutputTokens: 64_000}
@@ -184,7 +185,8 @@ func fallbackModelTokenLimits(model string) modelTokenLimit {
 		return modelTokenLimit{MaxInputTokens: 196_000, MaxOutputTokens: 64_000}
 	case "qwen3-coder-next":
 		return modelTokenLimit{MaxInputTokens: 256_000, MaxOutputTokens: 64_000}
-	case "claude-opus-4.7", "claude-opus-4.8", "claude-opus-5":
+	}
+	if opusHasExtendedOutputLimit(model) {
 		return modelTokenLimit{MaxInputTokens: 1_000_000, MaxOutputTokens: 128_000}
 	}
 	if isLargeContextModel(model) {

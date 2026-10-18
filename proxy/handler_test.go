@@ -824,23 +824,103 @@ func TestMergeUniqueModelsPreservesUnionAcrossAccounts(t *testing.T) {
 	}
 }
 
-func TestBuildAnthropicModelsResponseGeneratesThinkingVariants(t *testing.T) {
+func TestBuildAnthropicModelsResponseKeepsCatalogModel(t *testing.T) {
 	models := buildAnthropicModelsResponse([]ModelInfo{{
 		ModelId:    "claude-sonnet-4.5",
 		InputTypes: []string{"text", "image"},
-	}}, "-thinking")
+	}})
 
-	if len(models) != 2 {
-		t.Fatalf("expected base model and thinking variant, got %d", len(models))
+	if len(models) != 1 {
+		t.Fatalf("expected only the catalog model, got %d", len(models))
 	}
 	if models[0]["id"] != "claude-sonnet-4.5" {
 		t.Fatalf("unexpected base model id: %#v", models[0]["id"])
 	}
-	if models[1]["id"] != "claude-sonnet-4.5-thinking" {
-		t.Fatalf("unexpected thinking model id: %#v", models[1]["id"])
-	}
 	if supportsImage, ok := models[0]["supports_image"].(bool); !ok || !supportsImage {
 		t.Fatalf("expected image capability to be preserved, got %#v", models[0]["supports_image"])
+	}
+}
+
+func TestNormalizePublicModelsUsesHyphenAndDropsThinking(t *testing.T) {
+	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("config init: %v", err)
+	}
+	models := normalizePublicModels([]map[string]interface{}{
+		buildModelInfo("claude-opus-5.5", "anthropic", true),
+		buildModelInfo("claude-opus-5-5", "anthropic", false),
+		buildModelInfo("claude-opus-4.8", "anthropic", true),
+		buildModelInfo("claude-opus-4.8-thinking", "anthropic", true),
+		buildModelInfo("Claude-Sonnet-4.5", "anthropic", false),
+		buildModelInfo("claude-sonnet-4-5", "anthropic", true),
+		buildModelInfo("gpt-5.6-sol", "anthropic", false),
+		buildModelInfo("auto", "kiro-proxy", true),
+	})
+
+	got := make([]string, 0, len(models))
+	image := map[string]bool{}
+	for _, model := range models {
+		id, _ := model["id"].(string)
+		got = append(got, id)
+		image[id] = publicModelSupportsImage(model)
+		if strings.Contains(id, ".") || strings.HasSuffix(id, "-thinking") {
+			t.Fatalf("public id %q is not normalized", id)
+		}
+	}
+	want := []string{"claude-opus-5-5", "claude-opus-4-8", "claude-sonnet-4-5", "gpt-5-6-sol", "auto"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("public models = %v, want %v", got, want)
+	}
+	if !image["claude-opus-5-5"] || !image["claude-sonnet-4-5"] {
+		t.Fatalf("collapsed models lost image support: %#v", image)
+	}
+
+	recorder := httptest.NewRecorder()
+	(&Handler{}).handleModels(recorder, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("/v1/models status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		Data []map[string]interface{} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode /v1/models: %v", err)
+	}
+	seen := map[string]bool{}
+	for _, model := range response.Data {
+		id, _ := model["id"].(string)
+		seen[id] = true
+		if strings.Contains(id, ".") || strings.HasSuffix(id, "-thinking") {
+			t.Fatalf("/v1/models published %q", id)
+		}
+	}
+	for _, id := range []string{"claude-opus-4-8", "claude-sonnet-4-5", "auto", "gpt-4o", "gpt-4"} {
+		if !seen[id] {
+			t.Fatalf("/v1/models missing %q", id)
+		}
+	}
+	if seen["claude-opus-4.8"] || seen["claude-opus-4-8-thinking"] {
+		t.Fatalf("/v1/models still exposes an alternate spelling: %#v", seen)
+	}
+}
+
+func TestTryAlternateKiroModelIDPreservesOpus55(t *testing.T) {
+	payload := ClaudeToKiro(&ClaudeRequest{
+		Model:     "claude-opus-5.5",
+		MaxTokens: 32,
+		Messages: []ClaudeMessage{{
+			Role:    "user",
+			Content: "hello",
+		}},
+	}, false)
+
+	if !tryAlternateKiroModelID(payload) {
+		t.Fatal("expected alternate model id retry to be enabled")
+	}
+	if got := payload.ConversationState.CurrentMessage.UserInputMessage.ModelID; got != "claude-opus-5-5" {
+		t.Fatalf("alternate model id=%q, want claude-opus-5-5", got)
+	}
+	if tryAlternateKiroModelID(payload) {
+		t.Fatal("alternate model id retry must only happen once")
 	}
 }
 

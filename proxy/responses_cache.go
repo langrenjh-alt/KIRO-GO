@@ -65,4 +65,18 @@ func applyResponsesPromptCacheUsage(response *ResponsesObject, usage promptCache
 		cachedTokens = response.Usage.InputTokens
 	}
 	response.Usage.InputTokensDetails.CachedTokens = cachedTokens
+	// Cache policy works in the original token domain. Apply billing only once
+	// the final cached portion has been constrained to the input total.
+	percent := config.GetTokenBillingInflationPercent()
+	if percent == 0 && response.Usage.InputTokens <= maxBillingInputTokens {
+		return
+	}
+	usage.CacheReadInputTokens = cachedTokens
+	usage.CacheCreationInputTokens = maxInt(0, minInt(usage.CacheCreationInputTokens, response.Usage.InputTokens-cachedTokens))
+	billedUsage := inflatedBillingUsageWithPercent(response.Usage.InputTokens, response.Usage.OutputTokens, usage, percent)
+	response.Usage.InputTokens = billedUsage.InputTokens + billedUsage.CacheCreationInputTokens + billedUsage.CacheReadInputTokens
+	response.Usage.OutputTokens = billedUsage.OutputTokens
+	response.Usage.InputTokensDetails.CachedTokens = billedUsage.CacheReadInputTokens
+	response.Usage.OutputTokensDetails.ReasoningTokens = inflateBillingTokensWithPercent(response.Usage.OutputTokensDetails.ReasoningTokens, percent)
+	response.Usage.TotalTokens = response.Usage.InputTokens + response.Usage.OutputTokens
 }
