@@ -539,8 +539,9 @@
             <progress id="proxyPoolProgress" max="1" value="0" class="hidden" data-i18n-aria-label="proxyPool.inspectionProgress"></progress>
           </div>
           <div class="toolbar proxy-pool-toolbar">
-            <label class="proxy-pool-select-all"><input type="checkbox" id="proxyPoolSelectAll" /><span data-i18n="proxyPool.selectAll"></span></label>
-            <span id="proxyPoolSelectionCount" class="proxy-pool-hint"></span>
+            <label class="proxy-pool-select-all"><input type="checkbox" id="proxyPoolSelectAll" /><span data-i18n="proxyPool.selectPage"></span></label>
+            <span id="proxyPoolSelectionCount" class="proxy-pool-hint" role="status" aria-live="polite" aria-atomic="true"></span>
+            <button class="btn btn-outline btn-xs hidden" id="proxyPoolClearSelection" type="button" data-i18n="proxyPool.clearSelection"></button>
             <div id="proxyPoolBatchActions" class="proxy-pool-batch hidden">
               <button class="btn btn-secondary btn-xs" type="button" data-proxy-batch="edit" data-proxy-mutation data-i18n="proxyPool.edit"></button>
               <button class="btn btn-secondary btn-xs" type="button" data-proxy-batch="check" data-proxy-mutation data-i18n="proxyPool.check"></button>
@@ -561,6 +562,26 @@
           </div>
           <p id="proxyPoolError" class="proxy-pool-error hidden" role="alert"></p>
           <div id="proxyPoolList" aria-busy="false"></div>
+          <nav id="proxyPoolPagination" class="proxy-pool-pagination" data-i18n-aria-label="proxyPool.pagination">
+            <span id="proxyPoolPageRange" class="proxy-pool-page-range" role="status" aria-live="polite" aria-atomic="true"></span>
+            <div class="proxy-pool-page-size">
+              <label for="proxyPoolPageSize" data-i18n="proxyPool.pageSize"></label>
+              <select id="proxyPoolPageSize" aria-controls="proxyPoolList">
+                <option value="10">10</option><option value="20" selected>20</option><option value="50">50</option><option value="100">100</option>
+              </select>
+            </div>
+            <div class="proxy-pool-page-navigation">
+              <button class="btn btn-outline btn-sm" id="proxyPoolFirstPage" type="button" aria-controls="proxyPoolList" data-i18n="proxyPool.firstPage"></button>
+              <button class="btn btn-outline btn-sm" id="proxyPoolPreviousPage" type="button" aria-controls="proxyPoolList" data-i18n="proxyPool.previousPage"></button>
+              <span id="proxyPoolPageStatus" class="proxy-pool-page-status"></span>
+              <button class="btn btn-outline btn-sm" id="proxyPoolNextPage" type="button" aria-controls="proxyPoolList" data-i18n="proxyPool.nextPage"></button>
+              <button class="btn btn-outline btn-sm" id="proxyPoolLastPage" type="button" aria-controls="proxyPoolList" data-i18n="proxyPool.lastPage"></button>
+            </div>
+            <div class="proxy-pool-page-jump">
+              <label for="proxyPoolPageInput" data-i18n="proxyPool.jumpToPage"></label>
+              <input id="proxyPoolPageInput" type="number" min="1" max="1" step="1" value="1" inputmode="numeric" aria-controls="proxyPoolList" aria-describedby="proxyPoolPageStatus" data-i18n-title="proxyPool.pageInputHint" />
+            </div>
+          </nav>
           <p class="proxy-pool-footnote" data-i18n="proxyPool.trafficHint"></p>
         </div>
       </div>

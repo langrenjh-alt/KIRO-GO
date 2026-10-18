@@ -3871,6 +3871,19 @@ img.brand-icon {
 .proxy-pool-toolbar { gap: .5rem; padding-inline: 0; flex-wrap: wrap; }
 .proxy-pool-select-all { display: flex; gap: .5rem; align-items: center; min-height: 2.75rem; cursor: pointer; font-size: .75rem; }
 .proxy-pool-batch { display: flex; flex-wrap: wrap; gap: .375rem; }
+#proxyPoolSelectionCount { margin-top: 0; }
+.proxy-pool-pagination { display: flex; align-items: center; flex-wrap: wrap; gap: .75rem 1rem; margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--border); font-size: .75rem; }
+.proxy-pool-page-range { color: var(--muted-foreground); margin-right: auto; font-variant-numeric: tabular-nums; }
+.proxy-pool-page-size, .proxy-pool-page-jump { display: flex; align-items: center; gap: .5rem; }
+.proxy-pool-page-size label, .proxy-pool-page-jump label { white-space: nowrap; }
+.proxy-pool-page-size select, .proxy-pool-page-size .custom-select { width: 4.75rem; }
+.proxy-pool-page-size .custom-select-trigger { min-height: 2.75rem; }
+.proxy-pool-page-navigation { display: flex; align-items: center; flex-wrap: wrap; justify-content: center; gap: .5rem; }
+.proxy-pool-pagination .btn { min-height: 2.75rem; min-width: 2.75rem; }
+.proxy-pool-page-status { min-width: 5rem; text-align: center; font-variant-numeric: tabular-nums; }
+#proxyPoolPageInput { width: 4.5rem; min-height: 2.75rem; padding: .5rem; text-align: center; font-variant-numeric: tabular-nums; }
+.proxy-pool-pagination :disabled { cursor: not-allowed; opacity: .45; }
+.proxy-pool-pagination :focus-visible { outline: 2px solid var(--foreground); outline-offset: 3px; }
 .proxy-pool-toolbar input[type="search"] { width: min(18rem, 100%); }
 .proxy-pool-toolbar select { width: 8rem; }
 .proxy-pool-toolbar .custom-select { width: 8rem; flex: 0 0 auto; }
@@ -3927,6 +3940,10 @@ img.brand-icon {
   .proxy-pool-toolbar .custom-select { flex: 1; }
   .proxy-pool-inspection #proxyPoolUpdated { margin-left: 0; }
   .proxy-pool-card .card-header { align-items: flex-start; }
+  .proxy-pool-page-range { width: 100%; }
+  .proxy-pool-page-navigation { width: 100%; order: 3; }
+  .proxy-pool-page-jump { margin-left: auto; }
+  #proxyPoolPageInput { font-size: 1rem; }
   #proxyPoolImportModal input, #proxyPoolImportModal textarea, #proxyPoolEditModal input { font-size: 1rem; }
 }
 @media (prefers-reduced-motion: reduce) {

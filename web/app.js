@@ -28,6 +28,8 @@
   let proxyPoolBusy = false;
   let proxyPoolTimer = null;
   let proxyPoolEditingIds = [];
+  let proxyPoolPage = 1;
+  let proxyPoolPageSize = loadProxyPoolPageSize();
   const selectedProxies = new Set();
   let promptRules = [];
   let builderIdSession = '';
@@ -1477,6 +1479,45 @@
         .some(value => String(value || '').toLowerCase().includes(keyword));
     });
   }
+  function loadProxyPoolPageSize() {
+    try {
+      const value = Number(localStorage.getItem('kiro_proxy_pool_page_size'));
+      return [10, 20, 50, 100].includes(value) ? value : 20;
+    } catch (error) { return 20; }
+  }
+  function getProxyPoolPage() {
+    const filtered = getFilteredProxies();
+    const total = filtered.length;
+    const pageCount = Math.max(1, Math.ceil(total / proxyPoolPageSize));
+    proxyPoolPage = Math.max(1, Math.min(pageCount, Math.floor(Number(proxyPoolPage)) || 1));
+    const offset = (proxyPoolPage - 1) * proxyPoolPageSize;
+    return {
+      rows: filtered.slice(offset, offset + proxyPoolPageSize), total,
+      page: proxyPoolPage, pageSize: proxyPoolPageSize, pageCount,
+      start: total ? offset + 1 : 0, end: Math.min(offset + proxyPoolPageSize, total)
+    };
+  }
+  function renderProxyPoolPagination(page) {
+    const range = t('proxyPool.pageRange', page.start, page.end, page.total);
+    const status = t('proxyPool.pageStatus', page.page, page.pageCount);
+    if ($('proxyPoolPageRange').textContent !== range) $('proxyPoolPageRange').textContent = range;
+    if ($('proxyPoolPageStatus').textContent !== status) $('proxyPoolPageStatus').textContent = status;
+    $('proxyPoolFirstPage').disabled = $('proxyPoolPreviousPage').disabled = page.page <= 1;
+    $('proxyPoolNextPage').disabled = $('proxyPoolLastPage').disabled = page.page >= page.pageCount;
+    const input = $('proxyPoolPageInput');
+    input.max = String(page.pageCount);
+    input.disabled = page.pageCount <= 1;
+    // A background refresh must not overwrite a page number while it is being typed.
+    if (document.activeElement !== input || input.disabled) input.value = String(page.page);
+    $('proxyPoolPageSize').value = String(page.pageSize);
+    syncCustomSelect($('proxyPoolPageSize'));
+  }
+  function changeProxyPoolPage(value) {
+    const page = Number(value);
+    proxyPoolPage = Number.isFinite(page) ? Math.floor(page) : 1;
+    renderProxyPool();
+    $('proxyPoolPageInput').value = String(proxyPoolPage);
+  }
   function setProxyPoolError(id, message) {
     const element = $(id);
     element.textContent = message || '';
@@ -1505,12 +1546,14 @@
     renderProxyPool();
   }
   function renderProxyPoolSelection() {
-    const rows = getFilteredProxies();
+    const { rows } = getProxyPoolPage();
     const selectedVisible = rows.filter(proxy => selectedProxies.has(String(proxy.id))).length;
     $('proxyPoolSelectAll').checked = rows.length > 0 && rows.length === selectedVisible;
     $('proxyPoolSelectAll').indeterminate = selectedVisible > 0 && selectedVisible < rows.length;
     $('proxyPoolSelectAll').disabled = rows.length === 0;
-    $('proxyPoolSelectionCount').textContent = selectedProxies.size ? t('proxyPool.selected', selectedProxies.size) : '';
+    const selectionText = selectedProxies.size ? t('proxyPool.selectedAcrossPages', selectedProxies.size, selectedVisible) : '';
+    if ($('proxyPoolSelectionCount').textContent !== selectionText) $('proxyPoolSelectionCount').textContent = selectionText;
+    $('proxyPoolClearSelection').classList.toggle('hidden', selectedProxies.size === 0);
     $('proxyPoolBatchActions').classList.toggle('hidden', selectedProxies.size === 0);
     qsa('[data-proxy-select]', $('proxyPoolList')).forEach(element => {
       element.checked = selectedProxies.has(element.dataset.proxySelect);
@@ -1544,7 +1587,9 @@
     const listHadFocus = $('proxyPoolList').contains(focused);
     const focusedAction = focused && focused.dataset && focused.dataset.proxyAction;
     const focusedId = focused && focused.dataset && (focused.dataset.proxyId || focused.dataset.proxySelect);
-    const rows = getFilteredProxies();
+    const page = getProxyPoolPage();
+    const rows = page.rows;
+    renderProxyPoolPagination(page);
     const list = $('proxyPoolList');
     if (!rows.length) {
       list.innerHTML = '<div class="empty-state"><i class="fa-solid fa-network-wired" aria-hidden="true"></i><p>' + escapeHtml(t(!proxyPoolData ? 'proxyPool.loading' : entries.length ? 'proxyPool.noMatches' : 'proxyPool.empty')) + '</p></div>';
@@ -1751,10 +1796,26 @@
       bindDialogBackdropClose('proxyPool' + kind + 'Modal', close);
       $('proxyPool' + kind + 'Modal').addEventListener('keydown', event => { if (event.key === 'Escape') { event.preventDefault(); close(); } });
     });
-    $('proxyPoolSearch').addEventListener('input', renderProxyPool);
-    $('proxyPoolFilter').addEventListener('change', renderProxyPool);
+    const resetProxyPoolPage = () => { proxyPoolPage = 1; renderProxyPool(); };
+    $('proxyPoolSearch').addEventListener('input', resetProxyPoolPage);
+    $('proxyPoolFilter').addEventListener('change', resetProxyPoolPage);
+    $('proxyPoolPageSize').addEventListener('change', event => {
+      const value = Number(event.target.value);
+      proxyPoolPageSize = [10, 20, 50, 100].includes(value) ? value : 20;
+      try { localStorage.setItem('kiro_proxy_pool_page_size', String(proxyPoolPageSize)); } catch (error) { }
+      resetProxyPoolPage();
+    });
+    $('proxyPoolFirstPage').addEventListener('click', () => changeProxyPoolPage(1));
+    $('proxyPoolPreviousPage').addEventListener('click', () => changeProxyPoolPage(proxyPoolPage - 1));
+    $('proxyPoolNextPage').addEventListener('click', () => changeProxyPoolPage(proxyPoolPage + 1));
+    $('proxyPoolLastPage').addEventListener('click', () => changeProxyPoolPage(getProxyPoolPage().pageCount));
+    $('proxyPoolPageInput').addEventListener('change', event => changeProxyPoolPage(event.target.value));
+    $('proxyPoolPageInput').addEventListener('keydown', event => {
+      if (event.key === 'Enter') { event.preventDefault(); changeProxyPoolPage(event.target.value); }
+    });
+    $('proxyPoolClearSelection').addEventListener('click', () => { selectedProxies.clear(); renderProxyPoolSelection(); });
     $('proxyPoolSelectAll').addEventListener('change', event => {
-      getFilteredProxies().forEach(proxy => { if (event.target.checked) selectedProxies.add(String(proxy.id)); else selectedProxies.delete(String(proxy.id)); });
+      getProxyPoolPage().rows.forEach(proxy => { if (event.target.checked) selectedProxies.add(String(proxy.id)); else selectedProxies.delete(String(proxy.id)); });
       renderProxyPoolSelection();
     });
     $('proxyPoolList').addEventListener('change', event => {
