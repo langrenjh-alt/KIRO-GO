@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,6 +45,10 @@ type KiroPayloadPreflightError struct {
 	ModelInputLimitTokens        int
 	InputTokenBudget             int
 	DroppedHistoryEntries        int
+	ToolContextBytesSaved        int
+	CompactedToolDescriptions    int
+	CompactedSchemaDescriptions  int
+	RemovedSchemaAnnotations     int
 	Breakdown                    KiroPayloadBreakdown
 }
 
@@ -53,7 +58,7 @@ func (e *KiroPayloadPreflightError) Error() string {
 	}
 	b := e.Breakdown
 	return fmt.Sprintf(
-		"Kiro request exceeds local input limits after safe history trimming: original_total_bytes=%d original_estimated_input_tokens=%d total_bytes=%d raw_body_limit_bytes=%d estimated_input_tokens=%d model_input_limit_tokens=%d input_token_budget=%d history_bytes=%d current_bytes=%d system_bytes=%d tools_bytes=%d schema_bytes=%d images_bytes=%d fixed_bytes=%d history_entries=%d protected_history_entries=%d dropped_history_entries=%d tool_count=%d schema_count=%d image_count=%d",
+		"Kiro request exceeds local input limits after safe history trimming and tool documentation compaction: original_total_bytes=%d original_estimated_input_tokens=%d total_bytes=%d raw_body_limit_bytes=%d estimated_input_tokens=%d model_input_limit_tokens=%d input_token_budget=%d history_bytes=%d current_bytes=%d system_bytes=%d tools_bytes=%d schema_bytes=%d images_bytes=%d fixed_bytes=%d history_entries=%d protected_history_entries=%d dropped_history_entries=%d tool_count=%d schema_count=%d image_count=%d tool_context_bytes_saved=%d compacted_tool_descriptions=%d compacted_schema_descriptions=%d removed_schema_annotations=%d",
 		e.OriginalTotalBytes,
 		e.OriginalEstimatedInputTokens,
 		b.TotalBytes,
@@ -74,16 +79,24 @@ func (e *KiroPayloadPreflightError) Error() string {
 		b.ToolCount,
 		b.SchemaCount,
 		b.ImageCount,
+		e.ToolContextBytesSaved,
+		e.CompactedToolDescriptions,
+		e.CompactedSchemaDescriptions,
+		e.RemovedSchemaAnnotations,
 	)
 }
 
 type kiroPayloadPreflightResult struct {
-	Before                KiroPayloadBreakdown
-	After                 KiroPayloadBreakdown
-	RawBodyLimitBytes     int
-	ModelInputLimitTokens int
-	InputTokenBudget      int
-	DroppedHistoryEntries int
+	Before                      KiroPayloadBreakdown
+	After                       KiroPayloadBreakdown
+	RawBodyLimitBytes           int
+	ModelInputLimitTokens       int
+	InputTokenBudget            int
+	DroppedHistoryEntries       int
+	ToolContextBytesSaved       int
+	CompactedToolDescriptions   int
+	CompactedSchemaDescriptions int
+	RemovedSchemaAnnotations    int
 }
 
 func preflightKiroPayload(payload *KiroPayload) (kiroPayloadPreflightResult, error) {
@@ -143,6 +156,84 @@ func preflightKiroPayload(payload *KiroPayload) (kiroPayloadPreflightResult, err
 	result.Before = before
 	result.After = before
 
+	selectedPayload, selectedDrop, fits, err := fitKiroPayloadByHistory(payload, result.RawBodyLimitBytes, result.InputTokenBudget)
+	if err != nil {
+		return result, err
+	}
+	// History cannot solve an oversized fixed context (notably hundreds of
+	// MCP tools). Compact only tool documentation, never functional schemas,
+	// and try again from the original history to retain as much as possible.
+	var compaction kiroToolContextCompaction
+	if !fits {
+		for _, descriptionCap := range kiroToolDescriptionCompactionCaps {
+			candidate, candidateCompaction, compactErr := compactKiroToolContext(payload, descriptionCap)
+			if compactErr != nil {
+				return result, compactErr
+			}
+			if candidateCompaction.ToolContextBytesSaved == 0 {
+				continue
+			}
+			selectedPayload, selectedDrop, fits, err = fitKiroPayloadByHistory(candidate, result.RawBodyLimitBytes, result.InputTokenBudget)
+			if err != nil {
+				return result, err
+			}
+			compaction = candidateCompaction
+			if fits {
+				break
+			}
+		}
+	}
+	after, measureErr := measureKiroPayloadBreakdown(selectedPayload)
+	if measureErr != nil {
+		return result, measureErr
+	}
+	result.After = after
+	result.DroppedHistoryEntries = selectedDrop
+	result.ToolContextBytesSaved = compaction.ToolContextBytesSaved
+	result.CompactedToolDescriptions = compaction.CompactedToolDescriptions
+	result.CompactedSchemaDescriptions = compaction.CompactedSchemaDescriptions
+	result.RemovedSchemaAnnotations = compaction.RemovedSchemaAnnotations
+	setKiroPayloadAttemptSize(payload, after)
+	if fits {
+		payload.ConversationState.History = selectedPayload.ConversationState.History
+		payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext = selectedPayload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+		logger.Infof(
+			"[KiroPreflight] trimmed request_id=%s original_bytes=%d final_bytes=%d original_tokens=%d final_tokens=%d raw_limit_bytes=%d model_limit_tokens=%d token_budget=%d dropped_history_entries=%d remaining_history_entries=%d tools=%d schemas=%d images=%d tool_context_bytes_saved=%d compacted_tool_descriptions=%d compacted_schema_descriptions=%d removed_schema_annotations=%d",
+			kiroPayloadRequestID(payload), originalTotalBytes, after.TotalBytes,
+			originalEstimatedTokens, after.EstimatedInputTokens,
+			result.RawBodyLimitBytes, result.ModelInputLimitTokens, result.InputTokenBudget,
+			result.DroppedHistoryEntries, after.HistoryEntries, after.ToolCount, after.SchemaCount, after.ImageCount,
+			compaction.ToolContextBytesSaved, compaction.CompactedToolDescriptions, compaction.CompactedSchemaDescriptions, compaction.RemovedSchemaAnnotations,
+		)
+		return result, nil
+	}
+	preflightErr := &KiroPayloadPreflightError{
+		OriginalTotalBytes:           originalTotalBytes,
+		OriginalEstimatedInputTokens: originalEstimatedTokens,
+		RawBodyLimitBytes:            result.RawBodyLimitBytes,
+		ModelInputLimitTokens:        result.ModelInputLimitTokens,
+		InputTokenBudget:             result.InputTokenBudget,
+		DroppedHistoryEntries:        selectedDrop,
+		ToolContextBytesSaved:        compaction.ToolContextBytesSaved,
+		CompactedToolDescriptions:    compaction.CompactedToolDescriptions,
+		CompactedSchemaDescriptions:  compaction.CompactedSchemaDescriptions,
+		RemovedSchemaAnnotations:     compaction.RemovedSchemaAnnotations,
+		Breakdown:                    after,
+	}
+	logger.Warnf("[KiroPreflight] rejected request_id=%s: %v", kiroPayloadRequestID(payload), preflightErr)
+	return result, preflightErr
+}
+
+// fitKiroPayloadByHistory returns either the least-trimmed fitting candidate or
+// the smallest structurally safe candidate. It never changes the input payload.
+func fitKiroPayloadByHistory(payload *KiroPayload, rawBodyLimit, tokenBudget int) (*KiroPayload, int, bool, error) {
+	unchanged, err := measureKiroPayloadTotals(payload)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	if kiroPayloadFitsPreflight(unchanged, rawBodyLimit, tokenBudget) {
+		return payload, 0, true, nil
+	}
 	originalHistory := payload.ConversationState.History
 	primingCount := kiroSystemPrimingPrefixLen(originalHistory)
 	conversation := originalHistory[primingCount:]
@@ -151,7 +242,6 @@ func preflightKiroPayload(payload *KiroPayload) (kiroPayloadPreflightResult, err
 	if activeToolTurn >= 0 {
 		maxDrop = activeToolTurn
 	}
-
 	validDrops := []int{0}
 	for drop := 1; drop <= maxDrop; drop++ {
 		if drop == len(conversation) ||
@@ -160,72 +250,35 @@ func preflightKiroPayload(payload *KiroPayload) (kiroPayloadPreflightResult, err
 			validDrops = append(validDrops, drop)
 		}
 	}
-
-	var selectedHistory []KiroHistoryMessage
-	selectedDrop := -1
-	low, high := 1, len(validDrops)-1
+	minimalDrop := validDrops[len(validDrops)-1]
+	minimalPayload := kiroPayloadWithHistory(payload, kiroTrimmedHistory(originalHistory, primingCount, minimalDrop))
+	minimalBreakdown, err := measureKiroPayloadTotals(minimalPayload)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	if !kiroPayloadFitsPreflight(minimalBreakdown, rawBodyLimit, tokenBudget) {
+		return minimalPayload, minimalDrop, false, nil
+	}
+	selectedPayload := minimalPayload
+	selectedDrop := minimalDrop
+	low, high := 1, len(validDrops)-2
 	for low <= high {
 		mid := low + (high-low)/2
 		drop := validDrops[mid]
-		candidateHistory := kiroTrimmedHistory(originalHistory, primingCount, drop)
-		candidate := kiroPayloadWithHistory(payload, candidateHistory)
-		candidateBreakdown, candidateErr := measureKiroPayloadTotals(candidate)
-		if candidateErr != nil {
-			return result, candidateErr
+		candidate := kiroPayloadWithHistory(payload, kiroTrimmedHistory(originalHistory, primingCount, drop))
+		breakdown, err := measureKiroPayloadTotals(candidate)
+		if err != nil {
+			return nil, 0, false, err
 		}
-		if kiroPayloadFitsPreflight(candidateBreakdown, result.RawBodyLimitBytes, result.InputTokenBudget) {
+		if kiroPayloadFitsPreflight(breakdown, rawBodyLimit, tokenBudget) {
+			selectedPayload = candidate
 			selectedDrop = drop
-			selectedHistory = candidateHistory
 			high = mid - 1
 		} else {
 			low = mid + 1
 		}
 	}
-
-	if selectedDrop >= 0 {
-		payload.ConversationState.History = selectedHistory
-		after, measureErr := measureKiroPayloadBreakdown(payload)
-		if measureErr != nil {
-			return result, measureErr
-		}
-		result.After = after
-		result.DroppedHistoryEntries = selectedDrop
-		setKiroPayloadAttemptSize(payload, after)
-		logger.Infof(
-			"[KiroPreflight] trimmed request_id=%s original_bytes=%d final_bytes=%d original_tokens=%d final_tokens=%d raw_limit_bytes=%d model_limit_tokens=%d token_budget=%d dropped_history_entries=%d remaining_history_entries=%d tools=%d schemas=%d images=%d",
-			kiroPayloadRequestID(payload), before.TotalBytes, after.TotalBytes,
-			before.EstimatedInputTokens, after.EstimatedInputTokens,
-			result.RawBodyLimitBytes, result.ModelInputLimitTokens, result.InputTokenBudget,
-			result.DroppedHistoryEntries, after.HistoryEntries, after.ToolCount, after.SchemaCount, after.ImageCount,
-		)
-		return result, nil
-	}
-
-	minimalDrop := 0
-	minimalHistory := originalHistory
-	if len(validDrops) > 1 {
-		minimalDrop = validDrops[len(validDrops)-1]
-		minimalHistory = kiroTrimmedHistory(originalHistory, primingCount, minimalDrop)
-	}
-	minimalPayload := kiroPayloadWithHistory(payload, minimalHistory)
-	minimalBreakdown, measureErr := measureKiroPayloadBreakdown(minimalPayload)
-	if measureErr != nil {
-		return result, measureErr
-	}
-	result.After = minimalBreakdown
-	result.DroppedHistoryEntries = minimalDrop
-	setKiroPayloadAttemptSize(payload, minimalBreakdown)
-	preflightErr := &KiroPayloadPreflightError{
-		OriginalTotalBytes:           originalTotalBytes,
-		OriginalEstimatedInputTokens: originalEstimatedTokens,
-		RawBodyLimitBytes:            result.RawBodyLimitBytes,
-		ModelInputLimitTokens:        result.ModelInputLimitTokens,
-		InputTokenBudget:             result.InputTokenBudget,
-		DroppedHistoryEntries:        minimalDrop,
-		Breakdown:                    minimalBreakdown,
-	}
-	logger.Warnf("[KiroPreflight] rejected request_id=%s: %v", kiroPayloadRequestID(payload), preflightErr)
-	return result, preflightErr
+	return selectedPayload, selectedDrop, true, nil
 }
 
 func kiroPayloadFitsPreflight(b KiroPayloadBreakdown, rawBodyLimit, tokenBudget int) bool {
@@ -333,7 +386,7 @@ func kiroPayloadWithHistory(payload *KiroPayload, history []KiroHistoryMessage) 
 }
 
 func estimateKiroPayloadWire(payload *KiroPayload) ([]byte, int, error) {
-	wire, err := json.Marshal(payload)
+	wire, err := marshalUpstreamJSON(payload)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -433,14 +486,16 @@ func measureKiroPayloadBreakdown(payload *KiroPayload) (KiroPayloadBreakdown, er
 
 func cloneKiroPayloadForMeasurement(wire []byte) (*KiroPayload, error) {
 	var clone KiroPayload
-	if err := json.Unmarshal(wire, &clone); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(wire))
+	decoder.UseNumber()
+	if err := decoder.Decode(&clone); err != nil {
 		return nil, err
 	}
 	return &clone, nil
 }
 
 func marshaledKiroPayloadSize(payload *KiroPayload) (int, error) {
-	wire, err := json.Marshal(payload)
+	wire, err := marshalUpstreamJSON(payload)
 	if err != nil {
 		return 0, err
 	}

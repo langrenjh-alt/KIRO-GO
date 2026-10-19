@@ -130,8 +130,8 @@ func TestKiroPayloadPreflightRejectsOversizedSchemaWithoutUpstreamCall(t *testin
 	tool.ToolSpecification.Name = "oversized_schema"
 	tool.ToolSpecification.Description = "schema preflight"
 	tool.ToolSpecification.InputSchema.JSON = map[string]interface{}{
-		"type":        "object",
-		"description": strings.Repeat("s", 950_000),
+		"type": "string",
+		"enum": []interface{}{strings.Repeat("s", 950_000)},
 	}
 
 	var upstreamCalls atomic.Int32
@@ -163,7 +163,7 @@ func TestKiroPayloadPreflightRejectsOversizedSchemaWithoutUpstreamCall(t *testin
 		t.Fatalf("schema breakdown=%+v", preflightErr.Breakdown)
 	}
 	schema, ok := tool.ToolSpecification.InputSchema.JSON.(map[string]interface{})
-	if !ok || len(schema["description"].(string)) != 950_000 {
+	if !ok || len(schema["enum"].([]interface{})[0].(string)) != 950_000 {
 		t.Fatal("schema was silently changed")
 	}
 }
@@ -252,7 +252,7 @@ func TestHTTPProtocolsMapFixedPayloadPreflightFailureTo400BeforeStreaming(t *tes
 		t.Fatalf("config.Init: %v", err)
 	}
 	huge := strings.Repeat("z", 950_000)
-	schema := map[string]interface{}{"type": "object", "description": huge}
+	schema := map[string]interface{}{"type": "string", "enum": []interface{}{huge}}
 
 	tests := []struct {
 		name   string

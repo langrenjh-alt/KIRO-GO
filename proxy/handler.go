@@ -194,14 +194,11 @@ func validateClaudeThinkingConfig(thinking *ClaudeThinkingConfig, maxTokens int)
 		return "thinking.type must be one of: enabled, adaptive, disabled"
 	}
 
-	display := strings.ToLower(strings.TrimSpace(thinking.Display))
-	if display != "" && display != "summarized" && display != "omitted" {
-		return "thinking.display must be one of: summarized, omitted"
-	}
-	if kind == "disabled" && display != "" {
-		return "thinking.display is not supported when thinking.type is disabled"
-	}
-
+	// display is an optional response preference, not a thinking-generation
+	// control. New clients may send newer values (for example the Anthropic
+	// "updates" beta) or compatibility aliases. Do not reject an otherwise
+	// valid request here; resolve supported preferences below and ignore unknown
+	// strings without mutating the request or weakening type/budget validation.
 	return ""
 }
 
@@ -215,7 +212,7 @@ func resolveClaudeThinkingResponseOptions(thinking *ClaudeThinkingConfig, defaul
 	if opts.Format == "" {
 		opts.Format = "thinking"
 	}
-	if thinking == nil {
+	if thinking == nil || strings.EqualFold(strings.TrimSpace(thinking.Type), "disabled") {
 		return opts
 	}
 
@@ -223,7 +220,12 @@ func resolveClaudeThinkingResponseOptions(thinking *ClaudeThinkingConfig, defaul
 	switch display {
 	case "summarized":
 		opts.Format = "thinking"
-	case "omitted":
+	case "omitted", "updates":
+		// Anthropic's updates mode hides reasoning while showing separately
+		// classified progress updates. Kiro does not distinguish those blocks,
+		// so hide its reasoning conservatively, retaining ordinary text/tool
+		// output and the existing signature-only continuation behavior.
+		// https://platform.claude.com/docs/en/build-with-claude/thinking
 		opts.Format = "thinking"
 		opts.OmitDisplay = true
 	}

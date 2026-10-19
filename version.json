@@ -1,5 +1,5 @@
 {
-  "version": "1.1.5",
-  "changelog": "Automatically recover health-disabled proxies while preserving manual disables.\n故障停用代理持续巡检并自动恢复，保留手动禁用。",
+  "version": "1.1.6",
+  "changelog": "Accept updated thinking display preferences and compact large tool documentation within local input budgets.\n兼容 thinking.display 新值，修复大工具集输入预检；故障停用代理持续巡检并自动恢复，保留手动禁用。",
   "download": "https://github.com/langrenjh-alt/KIRO-GO"
 }

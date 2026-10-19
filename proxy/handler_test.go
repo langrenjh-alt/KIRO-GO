@@ -733,10 +733,10 @@ func TestValidateClaudeThinkingConfig(t *testing.T) {
 			expectError: false,
 		},
 		{
-			name:        "disabled rejects display",
+			name:        "disabled ignores decorative display for proxy compatibility",
 			thinking:    &ClaudeThinkingConfig{Type: "disabled", Display: "summarized"},
 			maxTokens:   4096,
-			expectError: true,
+			expectError: false,
 		},
 		{
 			name:        "missing type is rejected",
