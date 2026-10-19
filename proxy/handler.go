@@ -52,6 +52,7 @@ type Handler struct {
 	pool               *pool.AccountPool
 	webSearchMCPCaller webSearchMCPCaller
 	kiroCaller         kiroAPICaller
+	codeExecutor       CodeExecutor
 	// tokenRefresher is an internal seam for request-triggered bearer refresh;
 	// production uses refreshAccountTokenContext and tests can model IdP rotation
 	// without making a network call.
@@ -1483,6 +1484,10 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 }
 
 func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *KiroPayload, model, responseModel string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, prelude *claudeStreamPrelude) {
+	if payload != nil && payload.StructuredOutput {
+		h.handleClaudeStructuredStream(w, payload, model, responseModel, thinking, thinkingOpts, estimatedInputTokens, cacheProfile, apiKeyID, prelude)
+		return
+	}
 	_, deferBillingInflation := w.(*claudeCodeBufferedResponseWriter)
 	payload = cloneKiroPayload(payload)
 	configureSSEHeaders(w)
@@ -2907,7 +2912,19 @@ func (h *Handler) getRequestLogs() []RequestLog {
 
 // handleClaudeNonStream Claude 非流式响应
 func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model, responseModel string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+	h.handleClaudeBufferedResponse(w, payload, model, responseModel, thinking, thinkingOpts, estimatedInputTokens, cacheProfile, apiKeyID, nil, nil)
+}
+
+// handleClaudeBufferedResponse shares account selection, retries and accounting
+// between ordinary non-stream responses and schema-checked streams. The latter
+// must not publish an irreversible text delta before its JSON is validated.
+func (h *Handler) handleClaudeBufferedResponse(w http.ResponseWriter, payload *KiroPayload, model, responseModel string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, prelude *claudeStreamPrelude, respond func(*ClaudeResponse)) {
 	payload = cloneKiroPayload(payload)
+	if payload.StructuredOutput && thinking {
+		// Reasoning is a separate protocol block. Text-style thinking wrappers
+		// would corrupt an otherwise schema-valid JSON response after validation.
+		thinkingOpts.Format = "thinking"
+	}
 	excluded := make(map[string]bool)
 	retryCounts := make(map[string]int)
 	retrySameID := ""
@@ -2919,9 +2936,15 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 	cacheUsage := promptCacheUsage{}
 	cacheComputed := false
 	var retryUsage retryBillingUsage
+	if prelude != nil {
+		retryUsage.merge(prelude.RetryUsage)
+	}
 
 	attemptLimit := h.maxAccountAttempts()
 	for attempt := 0; attempt < attemptLimit; attempt++ {
+		if kiroPayloadContext(payload).Err() != nil {
+			return
+		}
 		attemptModel := accountModelForAttempt(model, payload)
 		account, allFull := h.acquireAccountForModel(attemptModel, excluded, retrySameID, kiroPayloadContext(payload))
 		retrySameID = ""
@@ -3027,7 +3050,21 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 
 		err := h.callKiroWithBearerRefresh(account, payload, callback)
-		err = resolveKiroOutputTruncation(payload, err, upstreamStopReason, content, completedKiroToolNames(toolUses))
+		if payload.StructuredOutput && (isKiroLengthStopReason(upstreamStopReason) || isUpstreamOutputTruncatedError(err)) {
+			// A truncated JSON document is not a continuation seed: replaying it
+			// can concatenate independent JSON values and hide max_tokens.
+			if upstreamStopReason == "" {
+				upstreamStopReason = "max_tokens"
+			}
+			if isUpstreamOutputTruncatedError(err) {
+				err = nil
+			}
+		} else {
+			err = resolveKiroOutputTruncation(payload, err, upstreamStopReason, content, completedKiroToolNames(toolUses))
+		}
+		if err == nil && kiroPayloadContext(payload).Err() != nil {
+			err = kiroPayloadContext(payload).Err()
+		}
 		clientVisibleAttemptText := claudeClientVisibleAttemptText(payload, content, len(toolUses))
 		var visibleContent string
 		var markerSeen bool
@@ -3165,14 +3202,20 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 
 		thinkingFormat := thinkingOpts.Format
 		finalContent, extractedReasoning := extractThinkingFromContent(content)
+		if claudeStructuredOutputRequiresValidation(payload, len(toolUses), upstreamStopReason, contextWindowExceeded, matchedStopSequence) {
+			finalContent, extractedReasoning = extractStructuredOutputContent(content)
+		}
 		finalContent, _ = filterAgentCompletionContent(payload, finalContent, len(toolUses))
 		finalContent = prependKiroOutputContinuation(payload, finalContent)
-		if payload.StructuredOutput {
+		finalContent, finalMatchedStopSequence := truncateAtStopSequence(finalContent, payload.StopSequences)
+		if matchedStopSequence == "" {
+			matchedStopSequence = finalMatchedStopSequence
+		}
+		if claudeStructuredOutputRequiresValidation(payload, len(toolUses), upstreamStopReason, contextWindowExceeded, matchedStopSequence) {
 			finalContent = normalizeStructuredOutputContent(finalContent)
 			if validationErr := validateStructuredOutputContent(
 				finalContent, payload.StructuredOutputType, payload.StructuredOutputSchema,
-			); validationErr != nil && structuredRetries == 0 {
-				structuredRetries++
+			); validationErr != nil {
 				// Settle the discarded attempt against the account that produced it,
 				// in this iteration. Deferring it to the successful attempt made the
 				// final turn report tokens it never generated, and lost the usage
@@ -3192,17 +3235,22 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 					discardedInput, discardedOutput, credits,
 					time.Since(reqStart).Milliseconds(),
 				))
+				if structuredRetries >= 1 {
+					err := fmt.Errorf("upstream structured output did not match the requested format after one validation retry: %w", validationErr)
+					h.recordFailureWithDetails("claude", model, account.ID, err)
+					h.sendClaudeError(w, http.StatusBadGateway, "upstream_structured_output_error", err.Error())
+					return
+				}
+				structuredRetries++
+				prepareClaudeStructuredOutputRetry(payload)
 				retrySameID = account.ID
+				attemptLimit++
 				logger.Warnf(
 					"[KiroAPI] structured output validation failed endpoint=claude model=%s account_id=%s; retrying once: %v",
 					model, account.ID, validationErr,
 				)
 				continue
 			}
-		}
-		finalContent, finalMatchedStopSequence := truncateAtStopSequence(finalContent, payload.StopSequences)
-		if matchedStopSequence == "" {
-			matchedStopSequence = finalMatchedStopSequence
 		}
 		rawThinkingContent := thinkingContent
 		if thinking && rawThinkingContent == "" && extractedReasoning != "" {
@@ -3241,17 +3289,26 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		// hidden Kiro prompt tokens cannot inflate downstream billing metadata.
 		cacheUsage = reanchorClaudeCacheUsage(cacheProfile, cacheUsage, inputTokens)
 		outputTokens = estimateClaudeOutputTokensWithRedacted(finalContent, rawThinkingContent, redactedThinking, toolUses)
+		executorInputTokens, executorOutputTokens, executorCredits := inputTokens, outputTokens, credits
+		if prelude != nil {
+			inputTokens = clampClaudeInputTokensToModelWindow(model, inputTokens+prelude.InputTokens)
+			outputTokens += prelude.OutputTokens
+			credits += prelude.Credits
+		}
 
 		// Each attempt settles in its own iteration, so this reports only what this
 		// attempt generated. Client-visible usage stays aligned with the response.
 		attemptOutputTokens := retryUsage.finalAttemptOutputTokens(outputTokens)
 		h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, attemptOutputTokens, credits, cacheUsage)
+		if prelude != nil {
+			prelude.RetryUsage.recordForAPIKey(apiKeyID)
+		}
 		h.pool.RecordSuccess(account.ID)
 		// h.pool.RecordLatency(account.ID, float64(time.Since(reqStart).Milliseconds()))
 		// ↑ dispatch-only latency EWMA (commit fbc99b1), absent on this cache-only
 		//   branch off main. No-op here; stripped so handler compiles against main's
 		//   pool. Re-added verbatim when dispatch lands.
-		h.pool.UpdateStats(account.ID, inputTokens+attemptOutputTokens, credits)
+		h.pool.UpdateStats(account.ID, executorInputTokens+retryUsage.finalAttemptOutputTokens(executorOutputTokens), executorCredits)
 		promptCacheTrackerForProfile(h.promptCache, cacheProfile).Update(account.ID, cacheProfile)
 		h.recordSuccessLog("claude", model, account.ID, inputTokens+attemptOutputTokens, credits, time.Since(reqStart).Milliseconds())
 
@@ -3282,6 +3339,9 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		responseCacheUsage := claudeTerminalCacheUsage(cacheProfile, payload, model, inputTokens, cacheUsage)
 		publicInputTokens, responseCacheUsage = retryUsage.apply(publicInputTokens, responseCacheUsage)
 		resp := KiroToClaudeResponseWithReasoning(finalContent, reasoningResult, includeEmptyThinkingBlock, toolUses, publicInputTokens, outputTokens, responseModel)
+		if prelude != nil {
+			resp.Content = append(append([]ClaudeContentBlock(nil), prelude.Blocks...), resp.Content...)
+		}
 		if thinking {
 			resp.Usage.OutputTokensDetails = claudeReasoningUsageDetails(ClaudeReasoningResult{
 				Text:      rawThinkingContent,
@@ -3290,6 +3350,9 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			}, includeEmptyThinkingBlock)
 		}
 		resp.StopReason = resolveClaudeStopReason(len(toolUses), contextWindowExceeded, upstreamStopReason)
+		if payload.StructuredOutput && (strings.EqualFold(strings.TrimSpace(upstreamStopReason), "refusal") || strings.EqualFold(strings.TrimSpace(upstreamStopReason), "pause_turn")) {
+			resp.StopReason = strings.ToLower(strings.TrimSpace(upstreamStopReason))
+		}
 		if matchedStopSequence != "" {
 			resp.StopReason = "stop_sequence"
 			resp.StopSequence = &matchedStopSequence
@@ -3304,7 +3367,14 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 				Ephemeral1hInputTokens: responseCacheUsage.CacheCreation1hInputTokens,
 			}
 		}
-		inflateClaudeUsage(&resp.Usage)
+		_, deferBillingInflation := w.(*claudeCodeBufferedResponseWriter)
+		if respond == nil || !deferBillingInflation {
+			inflateClaudeUsage(&resp.Usage)
+		}
+		if respond != nil {
+			respond(resp)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		json.NewEncoder(w).Encode(resp)
 		return

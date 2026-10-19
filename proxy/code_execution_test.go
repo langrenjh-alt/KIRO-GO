@@ -25,7 +25,7 @@ func TestCodeExecutionGeneratorRequestUsesClientToolOnly(t *testing.T) {
 		t.Fatalf("generator tool = %#v", generated.Tools)
 	}
 	choice, err := resolveToolChoice(generated.ToolChoice)
-	if err != nil || choice.Mode != "specific" || choice.Name != codeExecutionToolName {
+	if err != nil || choice.Mode != "auto" {
 		t.Fatalf("generator tool choice = %#v, err=%v", choice, err)
 	}
 }
@@ -47,6 +47,7 @@ func TestNativeCodeExecutionVersions(t *testing.T) {
 }
 
 func TestCodeExecutionResponseContracts(t *testing.T) {
+	t.Setenv("KIRO_CODE_EXECUTOR_URL", "")
 	for _, stream := range []bool{false, true} {
 		t.Run(fmt.Sprintf("stream=%v", stream), func(t *testing.T) {
 			h := newResponseContractHandler(t,
@@ -152,7 +153,7 @@ func assertCodeExecutionBlocks(t *testing.T, blocks []ClaudeContentBlock) {
 		t.Fatalf("result=%#v", result)
 	}
 	content, ok := result.Content.(map[string]interface{})
-	if !ok || content["type"] != "code_execution_tool_result_error" || content["error_code"] != "too_many_requests" {
+	if !ok || content["type"] != "code_execution_tool_result_error" || content["error_code"] != "unavailable" {
 		t.Fatalf("result content=%#v", result.Content)
 	}
 	if blocks[2].Type != "text" || blocks[2].Text != codeExecutionUnavailableText {

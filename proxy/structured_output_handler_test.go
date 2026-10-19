@@ -56,7 +56,7 @@ func TestClaudeStructuredOutputNormalizesStreamResponse(t *testing.T) {
 	}
 }
 
-func TestClaudeStructuredOutputStreamsJSONIncrementally(t *testing.T) {
+func TestClaudeStructuredOutputStreamsJSONAfterValidation(t *testing.T) {
 	var calls int
 	h := newEmptyVisibleOutputTestHandler(t, 1, func(_ *config.Account, _ *KiroPayload, callback *KiroStreamCallback) error {
 		calls++
@@ -97,7 +97,7 @@ func TestClaudeStructuredOutputStreamsJSONIncrementally(t *testing.T) {
 			textDeltas++
 		}
 	}
-	if text != `{"answer":42,"nested":{"ok":true}}` || textDeltas != 3 {
+	if text != `{"answer":42,"nested":{"ok":true}}` || textDeltas != 1 {
 		t.Fatalf("text=%q deltas=%d\n%s", text, textDeltas, rec.Body.String())
 	}
 }

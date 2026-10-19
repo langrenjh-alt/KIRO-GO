@@ -142,6 +142,37 @@ type ClaudeRequest struct {
 	responseModel                 string
 }
 
+// UnmarshalJSON accepts Anthropic's earlier output_format spelling as an
+// alias. A non-null output_config.format is authoritative when both are sent;
+// output_config.effort is preserved when only the legacy format is present.
+func (r *ClaudeRequest) UnmarshalJSON(data []byte) error {
+	type requestJSON ClaudeRequest
+	var decoded requestJSON
+	input := struct {
+		*requestJSON
+		OutputFormat json.RawMessage `json:"output_format"`
+	}{requestJSON: &decoded}
+	if err := json.Unmarshal(data, &input); err != nil {
+		return err
+	}
+	if len(input.OutputFormat) > 0 && (decoded.OutputConfig == nil || decoded.OutputConfig.Format == nil) {
+		var format *ClaudeOutputFormat
+		if err := json.Unmarshal(input.OutputFormat, &format); err != nil {
+			return err
+		}
+		if format == nil {
+			*r = ClaudeRequest(decoded)
+			return nil
+		}
+		if decoded.OutputConfig == nil {
+			decoded.OutputConfig = &ClaudeOutputConfig{}
+		}
+		decoded.OutputConfig.Format = format
+	}
+	*r = ClaudeRequest(decoded)
+	return nil
+}
+
 type ClaudeOutputConfig struct {
 	Effort string              `json:"effort,omitempty"`
 	Format *ClaudeOutputFormat `json:"format,omitempty"`

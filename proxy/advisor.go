@@ -536,6 +536,9 @@ func (h *Handler) callClaudeBuffered(
 		h.releaseAccount(account)
 
 		resultContent, extractedReasoning := extractThinkingFromContent(content.String())
+		if payload.StructuredOutput {
+			resultContent, extractedReasoning = extractStructuredOutputContent(content.String())
+		}
 		result.Content = resultContent
 		if thinking && result.Reasoning.Text == "" && extractedReasoning != "" {
 			result.Reasoning.Text = extractedReasoning

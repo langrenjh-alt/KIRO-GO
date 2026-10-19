@@ -159,6 +159,22 @@ func normalizeStructuredOutputContent(content string) string {
 	return trimmed
 }
 
+// JSON strings can legitimately contain the proxy's legacy thinking tags.
+// Never run the reasoning-tag parser through an already complete JSON value;
+// only wrapper text outside that value may contain protocol reasoning.
+func extractStructuredOutputContent(content string) (string, string) {
+	value := normalizeStructuredOutputContent(content)
+	if !json.Valid([]byte(value)) {
+		return extractThinkingFromContent(content)
+	}
+	if index := strings.Index(content, value); index >= 0 {
+		outside := content[:index] + content[index+len(value):]
+		_, reasoning := extractThinkingFromContent(outside)
+		return value, reasoning
+	}
+	return value, ""
+}
+
 // incrementalJSONStream drops prose and Markdown before a top-level object or
 // array, then forwards bytes until that JSON value closes. It deliberately does
 // not claim schema validation: once a delta is sent it cannot be retracted.
@@ -262,26 +278,34 @@ func validateStructuredOutputContent(content, formatType string, schemaBytes jso
 			return fmt.Errorf("expected a JSON object")
 		}
 	case "json_schema":
-		if len(bytes.TrimSpace(schemaBytes)) == 0 {
-			return fmt.Errorf("missing JSON Schema")
-		}
-		compiler := jsonschema.NewCompiler()
-		compiler.LoadURL = func(url string) (io.ReadCloser, error) {
-			return nil, fmt.Errorf("external JSON Schema reference is disabled: %s", url)
-		}
-		const schemaURL = "mem://kirogo/structured-output.json"
-		if err := compiler.AddResource(schemaURL, bytes.NewReader(schemaBytes)); err != nil {
-			return fmt.Errorf("load JSON Schema: %w", err)
-		}
-		compiled, err := compiler.Compile(schemaURL)
+		compiled, err := compileStructuredOutputSchema(schemaBytes)
 		if err != nil {
-			return fmt.Errorf("compile JSON Schema: %w", err)
+			return err
 		}
 		if err := compiled.Validate(value); err != nil {
 			return fmt.Errorf("JSON Schema mismatch: %w", err)
 		}
 	}
 	return nil
+}
+
+func compileStructuredOutputSchema(schemaBytes json.RawMessage) (*jsonschema.Schema, error) {
+	if len(bytes.TrimSpace(schemaBytes)) == 0 {
+		return nil, fmt.Errorf("missing JSON Schema")
+	}
+	compiler := jsonschema.NewCompiler()
+	compiler.LoadURL = func(url string) (io.ReadCloser, error) {
+		return nil, fmt.Errorf("external JSON Schema reference is disabled: %s", url)
+	}
+	const schemaURL = "mem://kirogo/structured-output.json"
+	if err := compiler.AddResource(schemaURL, bytes.NewReader(schemaBytes)); err != nil {
+		return nil, fmt.Errorf("load JSON Schema: %w", err)
+	}
+	compiled, err := compiler.Compile(schemaURL)
+	if err != nil {
+		return nil, fmt.Errorf("compile JSON Schema: %w", err)
+	}
+	return compiled, nil
 }
 
 func compactJSONObject(raw json.RawMessage) ([]byte, bool) {
@@ -318,6 +342,9 @@ func validateClaudeOutputFormat(format *ClaudeOutputFormat) string {
 	}
 	if _, ok := compactJSONObject(format.Schema); !ok {
 		return "output_config.format.schema must be a valid JSON object"
+	}
+	if _, err := compileStructuredOutputSchema(format.Schema); err != nil {
+		return "output_config.format.schema is not a supported valid JSON Schema: " + err.Error()
 	}
 	return ""
 }

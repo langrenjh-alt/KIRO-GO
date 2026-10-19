@@ -1,5 +1,5 @@
 {
-  "version": "1.1.6",
-  "changelog": "Accept updated thinking display preferences and compact large tool documentation within local input budgets.\n兼容 thinking.display 新值，修复大工具集输入预检；故障停用代理持续巡检并自动恢复，保留手动禁用。",
+  "version": "1.1.7",
+  "changelog": "Validate Claude structured outputs before streaming and execute server-side Python in isolated containers.\n兼容 output_format，强化结构化输出校验与重试；服务端代码执行接入隔离容器并返回真实结果。",
   "download": "https://github.com/langrenjh-alt/KIRO-GO"
 }
