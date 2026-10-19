@@ -1,5 +1,5 @@
-// Package codeexec runs Python only inside a restricted Docker container.
-// The HTTP worker and Docker CLI are trusted; submitted Python is not.
+// Package codeexec runs Python and Bash only inside a restricted Docker container.
+// The HTTP worker and Docker CLI are trusted; submitted code is not.
 package codeexec
 
 import (
@@ -15,7 +15,9 @@ import (
 
 const (
 	DefaultListenAddress    = "127.0.0.1:12346"
-	DefaultImage            = "python:3.12-alpine"
+	DefaultImage            = "python:3.12-slim"
+	ModePython              = "python"
+	ModeBash                = "bash"
 	MaxCodeBytes            = 64 << 10
 	MaxRequestBytes         = 96 << 10
 	MaxOutputBytes          = 16 << 10

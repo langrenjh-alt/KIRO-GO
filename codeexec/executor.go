@@ -92,7 +92,8 @@ func (e *Executor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	var request struct {
-		Code *string `json:"code"`
+		Code *string         `json:"code"`
+		Mode json.RawMessage `json:"mode"`
 	}
 	decodeErr := decoder.Decode(&request)
 	if decodeErr == nil {
@@ -117,7 +118,14 @@ func (e *Executor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		respond(http.StatusBadRequest, failure("invalid_request", "A code string is required."))
 		return
 	}
-	result, status := e.Execute(r.Context(), *request.Code)
+	var mode string
+	if len(request.Mode) > 0 {
+		if string(request.Mode) == "null" || json.Unmarshal(request.Mode, &mode) != nil {
+			respond(http.StatusBadRequest, failure("invalid_request", "Mode must be a string."))
+			return
+		}
+	}
+	result, status := e.ExecuteMode(r.Context(), *request.Code, mode)
 	respond(status, result)
 }
 
@@ -149,9 +157,21 @@ func (e *Executor) acquire() int {
 	}
 }
 
-// Execute returns return_code=-1 only when no trustworthy Python exit status
-// exists. A real nonzero Python exit is not mislabeled as a worker failure.
+// Execute preserves the original Python-only API. ExecuteMode explicitly selects
+// a fixed container interpreter; submitted code is never a host command argument.
 func (e *Executor) Execute(parent context.Context, code string) (result Response, status int) {
+	return e.ExecuteMode(parent, code, ModePython)
+}
+
+// ExecuteMode returns return_code=-1 only when no trustworthy interpreter exit
+// status exists. An actual nonzero script exit is not a worker failure.
+func (e *Executor) ExecuteMode(parent context.Context, code, mode string) (result Response, status int) {
+	if mode == "" {
+		mode = ModePython
+	}
+	if mode != ModePython && mode != ModeBash {
+		return failure("invalid_mode", "Mode must be python or bash."), http.StatusBadRequest
+	}
 	if len(code) > MaxCodeBytes {
 		return failure("code_too_large", "Code exceeds 64 KiB."), http.StatusRequestEntityTooLarge
 	}
@@ -173,7 +193,7 @@ func (e *Executor) Execute(parent context.Context, code string) (result Response
 		return failure("internal_error", "Container identity generation failed."), http.StatusInternalServerError
 	}
 	// rm uses its own context: cancellation of a caller or a timeout must not
-	// cancel the cleanup command that kills and removes its Python container.
+	// cancel the cleanup command that kills and removes its execution container.
 	defer func() {
 		if !e.cleanup(name) {
 			message := "Container cleanup failed."
@@ -194,7 +214,7 @@ func (e *Executor) Execute(parent context.Context, code string) (result Response
 	stop := context.AfterFunc(e.root, cancel)
 	defer stop()
 	stdout, stderr := newBoundedBuffer(MaxOutputBytes, cancel), newBoundedBuffer(MaxOutputBytes, cancel)
-	runErr := e.runner.Run(ctx, e.dockerArguments(name), strings.NewReader(code), stdout, stderr)
+	runErr := e.runner.Run(ctx, e.dockerArguments(name, mode), strings.NewReader(code), stdout, stderr)
 	result.Stdout, _ = stdout.snapshot()
 	result.Stderr, _ = stderr.snapshot()
 	result.ReturnCode = -1
@@ -244,8 +264,14 @@ func (e *Executor) Execute(parent context.Context, code string) (result Response
 	return result, http.StatusOK
 }
 
-func (e *Executor) dockerArguments(name string) []string {
-	return []string{"run", "--pull=never", "--name", name, "--label", "kiro.code-executor=true", "--network", "none", "--read-only", "--user", "65534:65534", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "64", "--memory", "128m", "--memory-swap", "128m", "--cpus", "0.5", "--ulimit", "nofile=64:64", "--tmpfs", "/tmp:rw,noexec,nosuid,size=16m", "--workdir", "/tmp", "--log-driver", "none", "-i", e.cfg.Image, "python3", "-I", "-S", "-u", "-"}
+func (e *Executor) dockerArguments(name, mode string) []string {
+	args := []string{"run", "--pull=never", "--name", name, "--label", "kiro.code-executor=true", "--network", "none", "--read-only", "--user", "65534:65534", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "64", "--memory", "128m", "--memory-swap", "128m", "--cpus", "0.5", "--ulimit", "nofile=64:64", "--tmpfs", "/tmp:rw,noexec,nosuid,size=16m", "--workdir", "/tmp", "--log-driver", "none", "-i", e.cfg.Image}
+	if mode == ModeBash {
+		// -p ignores BASH_ENV/ENV and exported shell functions. The process
+		// remains UID 65534 with no capabilities; this does not grant privilege.
+		return append(args, "bash", "--noprofile", "--norc", "-p", "-s", "--")
+	}
+	return append(args, "python3", "-I", "-S", "-u", "-")
 }
 
 type containerState struct {

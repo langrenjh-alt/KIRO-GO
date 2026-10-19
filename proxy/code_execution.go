@@ -14,13 +14,12 @@ const (
 	codeExecutionToolType       = "code_execution_20250522"
 	codeExecutionToolTypeLatest = "code_execution_20250825"
 	codeExecutionToolName       = "code_execution"
+	bashCodeExecutionToolName   = "bash_code_execution"
 )
 
 const codeExecutionUnavailableText = "The code execution service is currently unavailable, so the requested code was not run."
 
 func isNativeCodeExecutionTool(tool ClaudeTool) bool {
-	// The newer declaration accepts this standalone-Python compatibility path;
-	// it does not expose a persistent REPL or the Bash/file-editor tool family.
 	toolType := strings.TrimSpace(tool.Type)
 	return (toolType == codeExecutionToolType || toolType == codeExecutionToolTypeLatest) &&
 		strings.TrimSpace(tool.Name) == codeExecutionToolName
@@ -44,23 +43,39 @@ func codeExecutionGeneratorRequest(req *ClaudeRequest) *ClaudeRequest {
 	generated.Stream = false
 	generated.Thinking = nil
 	generated.StopSequences = nil
-	pythonTool := ClaudeTool{
+	name, inputField := codeExecutionToolName, "code"
+	description := "Execute standalone Python code in an isolated environment without network access. Each invocation starts a fresh interpreter; do not rely on state, files, or variables from earlier invocations. Use the actual returned stdout, stderr, and exit status to answer the user. Do not claim that code ran when the tool returned an error."
+	if tool, ok := findNativeCodeExecutionTool(req); ok && strings.TrimSpace(tool.Type) == codeExecutionToolTypeLatest {
+		name, inputField = bashCodeExecutionToolName, "command"
+		description = "Run a Bash command in an isolated Linux container without network access. Python 3 is available: execute Python using python3 and an inline script or a here-document in this same command. Each invocation starts a fresh container; files and state do not persist between invocations. There is no text-editor sub-tool, file-download service, or persistent REPL. Use the actual returned stdout, stderr, and exit status to answer; never claim code ran when execution returned an error."
+		if choice, err := resolveToolChoice(req.ToolChoice); err == nil && choice.Mode == "specific" && choice.Name == codeExecutionToolName {
+			// Only the internal generator uses the implementation sub-tool name.
+			// Keep the client's declaration and original choice unchanged.
+			mapped := map[string]interface{}{}
+			encoded, _ := json.Marshal(req.ToolChoice)
+			_ = json.Unmarshal(encoded, &mapped)
+			mapped["type"], mapped["name"] = "tool", name
+			delete(mapped, "function")
+			generated.ToolChoice = mapped
+		}
+	}
+	executionTool := ClaudeTool{
 		Type:        "custom",
-		Name:        codeExecutionToolName,
-		Description: "Execute standalone Python code in an isolated environment without network access. Each invocation starts a fresh interpreter; do not rely on state, files, or variables from earlier invocations. Use the actual returned stdout, stderr, and exit status to answer the user. Do not claim that code ran when the tool returned an error.",
+		Name:        name,
+		Description: description,
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
-				"code": map[string]interface{}{"type": "string"},
+				inputField: map[string]interface{}{"type": "string"},
 			},
-			"required":             []string{"code"},
+			"required":             []string{inputField},
 			"additionalProperties": false,
 		},
 	}
 	generated.Tools = make([]ClaudeTool, 0, len(req.Tools))
 	for _, tool := range req.Tools {
 		if isNativeCodeExecutionTool(tool) {
-			generated.Tools = append(generated.Tools, pythonTool)
+			generated.Tools = append(generated.Tools, executionTool)
 		} else {
 			generated.Tools = append(generated.Tools, tool)
 		}
@@ -74,25 +89,31 @@ func codeExecutionBlocks(toolUse KiroToolUse) []ClaudeContentBlock {
 }
 
 func codeExecutionResultBlocks(toolUse KiroToolUse, result CodeExecutionResult) []ClaudeContentBlock {
+	name := codeExecutionToolName
+	if toolUse.Name == bashCodeExecutionToolName {
+		name = bashCodeExecutionToolName
+	}
 	toolUseID := newClaudeServerToolUseID()
 	input := map[string]interface{}{}
 	for key, value := range toolUse.Input {
 		input[key] = value
 	}
 	var content interface{} = map[string]interface{}{
-		"type": "code_execution_result", "stdout": result.Stdout,
+		"type": name + "_result", "stdout": result.Stdout,
 		"stderr": result.Stderr, "return_code": result.ReturnCode,
 		"content": []interface{}{},
 	}
 	if result.ErrorCode != "" {
-		content = map[string]interface{}{
-			"type": "code_execution_tool_result_error", "error_code": publicCodeExecutionError(result.ErrorCode),
+		code := publicCodeExecutionError(result.ErrorCode)
+		if name == bashCodeExecutionToolName && (result.ErrorCode == "output_limit_exceeded" || result.ErrorCode == "output_file_too_large") {
+			code = "output_file_too_large"
 		}
+		content = map[string]interface{}{"type": name + "_tool_result_error", "error_code": code}
 	}
 	return []ClaudeContentBlock{
-		{Type: "server_tool_use", ID: toolUseID, Name: codeExecutionToolName, Input: input},
+		{Type: "server_tool_use", ID: toolUseID, Name: name, Input: input},
 		{
-			Type:      "code_execution_tool_result",
+			Type:      name + "_tool_result",
 			ToolUseID: toolUseID,
 			Content:   content,
 		},
@@ -121,6 +142,10 @@ func (h *Handler) handleCodeExecutionRequest(
 	}
 	started := time.Now()
 	generatorReq := codeExecutionGeneratorRequest(req)
+	nativeName, inputField, executionMode := codeExecutionToolName, "code", "python"
+	if tool, ok := findNativeCodeExecutionTool(req); ok && strings.TrimSpace(tool.Type) == codeExecutionToolTypeLatest {
+		nativeName, inputField, executionMode = bashCodeExecutionToolName, "command", "bash"
+	}
 	executor := h.codeExecutor
 	var executorConfigErr error
 	if executor == nil {
@@ -186,7 +211,7 @@ func (h *Handler) handleCodeExecutionRequest(
 		}
 		var nativeTools, clientTools []KiroToolUse
 		for _, toolUse := range result.ToolUses {
-			if toolUse.Name == codeExecutionToolName {
+			if toolUse.Name == nativeName {
 				nativeTools = append(nativeTools, toolUse)
 			} else {
 				clientTools = append(clientTools, toolUse)
@@ -255,9 +280,9 @@ func (h *Handler) handleCodeExecutionRequest(
 		executionFailed := false
 		for _, toolUse := range nativeTools {
 			toolID := normalizeClaudeToolUseID(toolUse.ToolUseID)
-			assistantBlocks = append(assistantBlocks, map[string]interface{}{"type": "tool_use", "id": toolID, "name": codeExecutionToolName, "input": toolUse.Input})
+			assistantBlocks = append(assistantBlocks, map[string]interface{}{"type": "tool_use", "id": toolID, "name": nativeName, "input": toolUse.Input})
 			execution := CodeExecutionResult{ReturnCode: -1}
-			code, isString := toolUse.Input["code"].(string)
+			code, isString := toolUse.Input[inputField].(string)
 			switch {
 			case !isString || len(code) == 0 || len(code) > maxCodeExecutionCodeBytes:
 				execution.ErrorCode = "invalid_tool_input"
@@ -266,7 +291,15 @@ func (h *Handler) handleCodeExecutionRequest(
 			default:
 				executions++
 				var executeErr error
-				execution, executeErr = executor.Execute(ctx, code)
+				if executionMode == "bash" {
+					if modern, ok := executor.(modeCodeExecutor); ok {
+						execution, executeErr = modern.ExecuteMode(ctx, executionMode, code)
+					} else {
+						execution.ErrorCode = "unavailable"
+					}
+				} else {
+					execution, executeErr = executor.Execute(ctx, code)
+				}
 				if ctx.Err() != nil {
 					return
 				}

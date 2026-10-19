@@ -29,6 +29,12 @@ type CodeExecutor interface {
 	Execute(context.Context, string) (CodeExecutionResult, error)
 }
 
+// modeCodeExecutor explicitly opts an executor into Bash support. Legacy
+// injected Python executors must never accidentally interpret shell input.
+type modeCodeExecutor interface {
+	ExecuteMode(context.Context, string, string) (CodeExecutionResult, error)
+}
+
 type CodeExecutionResult struct {
 	Stdout     string `json:"stdout"`
 	Stderr     string `json:"stderr"`
@@ -89,14 +95,26 @@ func configuredCodeExecutor() (CodeExecutor, error) {
 }
 
 func (executor *httpCodeExecutor) Execute(ctx context.Context, code string) (CodeExecutionResult, error) {
+	return executor.ExecuteMode(ctx, "python", code)
+}
+
+func (executor *httpCodeExecutor) ExecuteMode(ctx context.Context, mode, code string) (CodeExecutionResult, error) {
 	failure := CodeExecutionResult{ReturnCode: -1, ErrorCode: "unavailable"}
+	if mode != "python" && mode != "bash" {
+		failure.ErrorCode = "invalid_tool_input"
+		return failure, errors.New("unsupported code execution mode")
+	}
 	if len(code) == 0 || len(code) > maxCodeExecutionCodeBytes {
 		failure.ErrorCode = "invalid_tool_input"
 		return failure, errors.New("code must contain between 1 and 65536 bytes")
 	}
 	ctx, cancel := context.WithTimeout(ctx, codeExecutionTimeout)
 	defer cancel()
-	body, err := json.Marshal(map[string]string{"code": code})
+	wireRequest := map[string]string{"code": code}
+	if mode != "python" {
+		wireRequest["mode"] = mode
+	}
+	body, err := json.Marshal(wireRequest)
 	if err != nil {
 		return failure, errors.New("code executor request could not be encoded")
 	}
