@@ -649,6 +649,12 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 	// 获取使用量和订阅信息
 	usage, err := GetUsageLimits(account)
 	if err != nil {
+		// A proxy CONNECT/SOCKS error can contain 401/403 or authentication
+		// wording without any response from AWS. Keep the existing transport
+		// classification ahead of account-health string checks, as in chat.
+		if isKiroTransportError(err) {
+			return nil, fmt.Errorf("GetUsageLimits: %w", err)
+		}
 		// 检测封禁状态
 		errMsg := err.Error()
 		if isSuspensionErrorMessage(errMsg) {

@@ -5162,6 +5162,8 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			runtimeReason = "not_in_runtime_pool"
 		}
 		boundProxy := proxies[proxyBindings[a.ID]]
+		status := strings.ToUpper(strings.TrimSpace(a.BanStatus))
+		proxyEligible := a.Enabled && status != "BANNED" && status != "DISABLED" && status != "SUSPENDED"
 		result[i] = map[string]interface{}{
 			"id":                    a.ID,
 			"email":                 a.Email,
@@ -5195,7 +5197,7 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"proxyId":               boundProxy.ID,
 			"proxyName":             boundProxy.Name,
 			"proxyExitIP":           boundProxy.ExitIP,
-			"proxyBlocked":          proxySettings.Enabled && proxySettings.BlockWithoutProxy && boundProxy.ID == "",
+			"proxyBlocked":          proxyEligible && proxySettings.Enabled && proxySettings.BlockWithoutProxy && boundProxy.ID == "",
 			"emptyOutputModels":     emptyOutputModelsForAccount(emptyModels, a.ID),
 			"subscriptionType":      a.SubscriptionType,
 			"subscriptionTitle":     a.SubscriptionTitle,

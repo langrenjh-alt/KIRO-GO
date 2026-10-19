@@ -1407,7 +1407,12 @@
       accountsData.forEach(a => {
         const id = String(a.id);
         const latestAccount = proxyAccounts.get(id);
-        if (latestAccount) ['proxyPoolEnabled', 'proxyId', 'proxyName', 'proxyExitIP', 'proxyBlocked'].forEach(key => { a[key] = latestAccount[key]; });
+        if (latestAccount) {
+          ['enabled', 'banStatus', 'banReason', 'proxyPoolEnabled', 'proxyId', 'proxyName', 'proxyExitIP', 'proxyBlocked'].forEach(key => {
+            if (Object.prototype.hasOwnProperty.call(latestAccount, key)) a[key] = latestAccount[key];
+          });
+          proxyAccounts.set(id, a); // Render with merged eligibility, including partial status responses.
+        }
         if (counts.has(id)) a.inFlight = counts.get(id);
         if (!modelsByID.has(id)) return;
         const next = modelsByID.get(id);
@@ -1983,10 +1988,16 @@
   }
   function renderAccountProxy(a) {
     if (!a.proxyPoolEnabled) return '';
-    const label = a.proxyBlocked ? t('proxyPool.accountBlocked') : a.proxyId
-      ? (a.proxyName || t('proxyPool.bound')) + (a.proxyExitIP ? ' · ' + a.proxyExitIP : '')
-      : t('proxyPool.accountUnbound');
-    return '<div class="account-proxy' + (a.proxyBlocked ? ' account-proxy-blocked' : '') + '"><span>' + escapeHtml(t('proxyPool.accountProxy')) + '</span><strong>' + escapeHtml(label) + '</strong></div>';
+    const status = String(a.banStatus || '').trim().toUpperCase();
+    const banned = status === 'BANNED' || status === 'SUSPENDED';
+    const disabled = status === 'DISABLED' || a.enabled === false;
+    const authExpired = (banned || disabled) && a.banReason === 'Authentication failed - token invalid or expired';
+    const blocked = !banned && !disabled && a.proxyBlocked;
+    const label = authExpired ? t('proxyPool.accountAuthExpired') : banned ? t('proxyPool.accountBanned')
+      : disabled ? t('proxyPool.accountDisabled') : blocked ? t('proxyPool.accountBlocked') : a.proxyId
+        ? (a.proxyName || t('proxyPool.bound')) + (a.proxyExitIP ? ' · ' + a.proxyExitIP : '')
+        : t('proxyPool.accountUnbound');
+    return '<div class="account-proxy' + (blocked ? ' account-proxy-blocked' : '') + '"><span>' + escapeHtml(t('proxyPool.accountProxy')) + '</span><strong>' + escapeHtml(label) + '</strong></div>';
   }
   function renderAccounts() {
     const container = $('accountsList');
