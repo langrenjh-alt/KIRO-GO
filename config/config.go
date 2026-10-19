@@ -380,7 +380,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.1.10"
+const Version = "1.1.11"
 
 const (
 	autoQuarantineSuspicious429Reason = "auto-quarantine: suspicious 429 pattern"

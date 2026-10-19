@@ -155,5 +155,13 @@ func resolveClaudeStopReason(toolUseCount int, contextWindowExceeded bool, upstr
 	if toolUseCount > 0 {
 		return "tool_use"
 	}
+	// A paused or refused turn is still a successful Messages response, but
+	// clients must not treat it as a naturally completed turn. Preserve these
+	// explicit upstream terminal states for ordinary and structured responses.
+	// A pending client tool above still requires tool_use, not pause_turn.
+	switch strings.ToLower(strings.TrimSpace(upstreamStopReason)) {
+	case "refusal", "pause_turn":
+		return strings.ToLower(strings.TrimSpace(upstreamStopReason))
+	}
 	return "end_turn"
 }

@@ -145,18 +145,60 @@ func normalizeStructuredOutputContent(content string) string {
 		return trimmed
 	}
 
-	for index := 0; index < len(trimmed); index++ {
-		if trimmed[index] != '{' && trimmed[index] != '[' {
-			continue
-		}
-		decoder := json.NewDecoder(strings.NewReader(trimmed[index:]))
-		var value json.RawMessage
-		if err := decoder.Decode(&value); err != nil || !json.Valid(value) {
-			continue
-		}
-		return string(value)
+	index := strings.IndexAny(trimmed, "{[")
+	if index < 0 {
+		return trimmed
 	}
-	return trimmed
+	// A leading complete JSON value is not narration. Never silently replace it
+	// with a later object/array (for example, `true {"answer":7}`).
+	var preceding json.RawMessage
+	if structuredOutputPrimitiveFragment(trimmed[:index]) ||
+		json.NewDecoder(strings.NewReader(trimmed[:index])).Decode(&preceding) == nil {
+		return trimmed
+	}
+	decoder := json.NewDecoder(strings.NewReader(trimmed[index:]))
+	var value json.RawMessage
+	if err := decoder.Decode(&value); err != nil || !json.Valid(value) {
+		// Do not scan inside a malformed outer container for a schema-valid
+		// subobject. Its fields are not the model's complete answer.
+		return trimmed
+	}
+	tail := strings.TrimSpace(trimmed[index+int(decoder.InputOffset()):])
+	// One closing Markdown fence is a wrapper. A second code block, structural
+	// delimiter, or another JSON value is ambiguous output, not harmless prose.
+	if firstLine, rest, _ := strings.Cut(tail, "\n"); strings.TrimSpace(firstLine) == "```" {
+		tail = strings.TrimSpace(rest)
+	}
+	if strings.ContainsAny(tail, "{}[]") || strings.Contains(tail, "```") {
+		return trimmed
+	}
+	if structuredOutputPrimitiveFragment(tail) {
+		return trimmed
+	}
+	var extra json.RawMessage
+	if json.NewDecoder(strings.NewReader(tail)).Decode(&extra) == nil {
+		return trimmed
+	}
+	return string(value)
+}
+
+// A broken leading/trailing JSON primitive is not harmless narration. Keep it
+// attached so the validator can reject/correct the whole response rather than
+// publishing another value after dropping an incomplete string/number/literal.
+func structuredOutputPrimitiveFragment(text string) bool {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return false
+	}
+	if text[0] == '"' || text[0] == '-' || text[0] >= '0' && text[0] <= '9' {
+		return true
+	}
+	for _, literal := range []string{"true", "false", "null"} {
+		if strings.HasPrefix(literal, text) {
+			return true
+		}
+	}
+	return false
 }
 
 // JSON strings can legitimately contain the proxy's legacy thinking tags.
@@ -366,6 +408,9 @@ func validateOpenAIResponseFormat(format *OpenAIResponseFormat) string {
 		if _, ok := compactJSONObject(format.JSONSchema.Schema); !ok {
 			return "response_format.json_schema.schema must be a valid JSON object"
 		}
+		if _, err := compileStructuredOutputSchema(format.JSONSchema.Schema); err != nil {
+			return "response_format.json_schema.schema is not a supported valid JSON Schema: " + err.Error()
+		}
 		return ""
 	default:
 		return "response_format.type must be one of: text, json_object, json_schema"
@@ -386,6 +431,9 @@ func validateResponsesTextConfig(text *ResponsesTextConfig) string {
 		}
 		if _, ok := compactJSONObject(format.Schema); !ok {
 			return "text.format.schema must be a valid JSON object when type is json_schema"
+		}
+		if _, err := compileStructuredOutputSchema(format.Schema); err != nil {
+			return "text.format.schema is not a supported valid JSON Schema: " + err.Error()
 		}
 		return ""
 	default:
