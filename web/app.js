@@ -1599,11 +1599,15 @@
         const id = escapeAttr(proxy.id);
         const name = proxy.name || proxyEndpoint(proxy.url);
         const health = ['healthy', 'unhealthy'].includes(proxy.health) ? proxy.health : 'unknown';
+        // Only system network failures may recover automatically. Unknown legacy
+        // reasons stay manual; never render a server-provided reason as markup.
+        const disabledLabel = proxy.disabledBy === 'health' ? 'proxyPool.autoDisabled'
+          : proxy.disabledBy === 'invalid' ? 'proxyPool.invalidDisabled' : 'proxyPool.manualDisabled';
         const td = (label, body, cls) => '<td data-label="' + escapeAttr(t(label)) + '"' + (cls ? ' class="' + cls + '"' : '') + '>' + body + '</td>';
         const action = (value, label, cls) => '<button class="btn btn-xs ' + (cls || 'btn-outline') + '" type="button" data-proxy-action="' + value + '" data-proxy-id="' + id + '" data-proxy-mutation' + (proxyPoolBusy ? ' disabled' : '') + '>' + escapeHtml(t(label)) + '</button>';
         return '<tr' + (selectedProxies.has(String(proxy.id)) ? ' class="is-selected"' : '') + '><td class="proxy-pool-checkbox"><input type="checkbox" data-proxy-select="' + id + '"' + (selectedProxies.has(String(proxy.id)) ? ' checked' : '') + ' aria-label="' + escapeAttr(t('proxyPool.selectProxy', name)) + '" /></td>' +
           td('proxyPool.proxy', '<strong>' + escapeHtml(name) + '</strong><code>' + escapeHtml(proxyEndpoint(proxy.url)) + '</code>', 'proxy-pool-endpoint') +
-          td('proxyPool.status', '<span class="badge ' + (proxy.enabled ? 'badge-info' : 'badge-warning') + '">' + escapeHtml(t(proxy.enabled ? 'proxyPool.enabledFilter' : 'proxyPool.disabledFilter')) + '</span><span class="badge ' + (health === 'healthy' ? 'badge-success' : health === 'unhealthy' ? 'badge-error' : 'badge-warning') + '">' + escapeHtml(t('proxyPool.' + health)) + '</span>') +
+          td('proxyPool.status', '<span class="badge ' + (proxy.enabled ? 'badge-info' : 'badge-warning') + '">' + escapeHtml(t(proxy.enabled ? 'proxyPool.enabledFilter' : disabledLabel)) + '</span><span class="badge ' + (health === 'healthy' ? 'badge-success' : health === 'unhealthy' ? 'badge-error' : 'badge-warning') + '">' + escapeHtml(t('proxyPool.' + health)) + '</span>') +
           td('proxyPool.exitIP', escapeHtml(proxy.exitIP || '—'), 'proxy-pool-number') +
           td('proxyPool.location', escapeHtml(Array.from(new Set([proxy.country, proxy.region, proxy.city].filter(Boolean))).join(' · ') || '—'), 'proxy-pool-location') +
           td('proxyPool.accountCount', Math.max(0, Number(proxy.accountCount) || 0), 'proxy-pool-number') +

@@ -1,5 +1,5 @@
 {
-  "version": "1.1.4",
-  "changelog": "Proxy pool pagination, page size preferences and cross-page selection.\n代理池分页、每页数量记忆与跨页选择。",
+  "version": "1.1.5",
+  "changelog": "Automatically recover health-disabled proxies while preserving manual disables.\n故障停用代理持续巡检并自动恢复，保留手动禁用。",
   "download": "https://github.com/langrenjh-alt/KIRO-GO"
 }

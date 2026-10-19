@@ -143,7 +143,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 			if resp.Body == nil {
 				finish()
 			} else if metrics != nil {
-				resp.Body = &responseBody{ReadCloser: resp.Body, ctx: req.Context(), metrics: metrics, finish: finish, proxyID: proxyID, proxyURL: proxyURL}
+				resp.Body = &responseBody{ReadCloser: resp.Body, ctx: req.Context(), metrics: metrics, finish: finish, proxyID: proxyID, proxyURL: proxyURL, proxyVersion: entry.StateVersion}
 			}
 			return resp, nil
 		}
@@ -154,7 +154,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		if proxyID == "" || !IsProxyNetworkError(req.Context(), err) {
 			return nil, err
 		}
-		if disableErr := config.DisableProxy(proxyID, proxyURL, "outbound proxy network failure: "+err.Error()); disableErr != nil {
+		if disableErr := config.DisableProxyIfCurrent(proxyID, proxyURL, entry.StateVersion, "outbound proxy network failure: "+err.Error()); disableErr != nil {
 			return nil, fmt.Errorf("disable failed proxy: %v (outbound: %w)", disableErr, err)
 		}
 		if attempt == 3 || (req.Body != nil && req.Body != http.NoBody && req.GetBody == nil) {
@@ -224,12 +224,13 @@ func (b *requestBody) Read(p []byte) (int, error) {
 
 type responseBody struct {
 	io.ReadCloser
-	ctx      context.Context
-	metrics  *proxyMetrics
-	finish   func()
-	proxyID  string
-	proxyURL string
-	failOnce sync.Once
+	ctx          context.Context
+	metrics      *proxyMetrics
+	finish       func()
+	proxyID      string
+	proxyURL     string
+	proxyVersion uint64
+	failOnce     sync.Once
 }
 
 func (b *responseBody) Read(p []byte) (int, error) {
@@ -239,7 +240,7 @@ func (b *responseBody) Read(p []byte) (int, error) {
 		b.finish()
 		if err != io.EOF && IsProxyNetworkError(b.ctx, err) {
 			b.failOnce.Do(func() {
-				_ = config.DisableProxy(b.proxyID, b.proxyURL, "proxy stream network failure: "+err.Error())
+				_ = config.DisableProxyIfCurrent(b.proxyID, b.proxyURL, b.proxyVersion, "proxy stream network failure: "+err.Error())
 			})
 		}
 	}

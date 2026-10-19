@@ -24,24 +24,30 @@ const (
 	ProxyHealthUnknown   = "unknown"
 	ProxyHealthHealthy   = "healthy"
 	ProxyHealthUnhealthy = "unhealthy"
+
+	ProxyDisabledManual  = "manual"
+	ProxyDisabledHealth  = "health"
+	ProxyDisabledInvalid = "invalid"
 )
 
 // ProxyEntry contains durable proxy state. Live concurrency and bandwidth are
 // transport counters, not configuration, and are joined by the admin API.
 type ProxyEntry struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	URL         string `json:"url"`
-	Enabled     bool   `json:"enabled"`
-	Health      string `json:"health"`
-	ExitIP      string `json:"exitIP,omitempty"`
-	Country     string `json:"country,omitempty"`
-	Region      string `json:"region,omitempty"`
-	City        string `json:"city,omitempty"`
-	LastChecked int64  `json:"lastChecked,omitempty"`
-	LatencyMS   int64  `json:"latencyMS,omitempty"`
-	LastError   string `json:"lastError,omitempty"`
-	TotalBytes  int64  `json:"totalBytes"`
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	URL          string `json:"url"`
+	Enabled      bool   `json:"enabled"`
+	DisabledBy   string `json:"disabledBy,omitempty"`
+	StateVersion uint64 `json:"stateVersion,omitempty"`
+	Health       string `json:"health"`
+	ExitIP       string `json:"exitIP,omitempty"`
+	Country      string `json:"country,omitempty"`
+	Region       string `json:"region,omitempty"`
+	City         string `json:"city,omitempty"`
+	LastChecked  int64  `json:"lastChecked,omitempty"`
+	LatencyMS    int64  `json:"latencyMS,omitempty"`
+	LastError    string `json:"lastError,omitempty"`
+	TotalBytes   int64  `json:"totalBytes"`
 }
 
 type ProxyPoolSettings struct {
@@ -65,14 +71,18 @@ type ProxyPatch struct {
 }
 
 type ProxyCheckResult struct {
-	Healthy   bool   `json:"healthy"`
-	ExitIP    string `json:"exitIP,omitempty"`
-	Country   string `json:"country,omitempty"`
-	Region    string `json:"region,omitempty"`
-	City      string `json:"city,omitempty"`
-	LatencyMS int64  `json:"latencyMS"`
-	LastError string `json:"lastError,omitempty"`
-	CheckedAt int64  `json:"checkedAt"`
+	// ExpectedStateVersion fences probes started before an administrator edit or
+	// an automatic disable/recovery. Metadata-only observations do not invalidate
+	// in-flight streams; timestamps still order their check observations.
+	ExpectedStateVersion *uint64 `json:"-"`
+	Healthy              bool    `json:"healthy"`
+	ExitIP               string  `json:"exitIP,omitempty"`
+	Country              string  `json:"country,omitempty"`
+	Region               string  `json:"region,omitempty"`
+	City                 string  `json:"city,omitempty"`
+	LatencyMS            int64   `json:"latencyMS"`
+	LastError            string  `json:"lastError,omitempty"`
+	CheckedAt            int64   `json:"checkedAt"`
 }
 
 func defaultProxyPoolSettings() ProxyPoolSettings {
@@ -122,6 +132,7 @@ func normalizeLoadedProxyPoolLocked(data []byte) bool {
 	ids := make(map[string]struct{}, len(cfg.Proxies))
 	for i := range cfg.Proxies {
 		proxy := &cfg.Proxies[i]
+		previous := *proxy
 		if _, duplicate := ids[proxy.ID]; proxy.ID == "" || duplicate {
 			proxy.ID = newUniqueConfigID(ids)
 			dirty = true
@@ -129,10 +140,11 @@ func normalizeLoadedProxyPoolLocked(data []byte) bool {
 		ids[proxy.ID] = struct{}{}
 		normalized, err := NormalizeProxyURL(proxy.URL)
 		if err != nil {
-			if proxy.Enabled || proxy.Health != ProxyHealthUnhealthy {
+			if proxy.Enabled || proxy.Health != ProxyHealthUnhealthy || proxy.DisabledBy != ProxyDisabledInvalid || proxy.LastError != "invalid proxy URL" {
 				dirty = true
 			}
 			proxy.Enabled = false
+			proxy.DisabledBy = ProxyDisabledInvalid
 			proxy.Health = ProxyHealthUnhealthy
 			proxy.LastError = "invalid proxy URL"
 		} else if normalized != proxy.URL {
@@ -145,6 +157,27 @@ func normalizeLoadedProxyPoolLocked(data []byte) bool {
 		}
 		if proxy.Health == ProxyHealthUnhealthy && proxy.Enabled {
 			proxy.Enabled = false
+			proxy.DisabledBy = ProxyDisabledHealth
+			dirty = true
+		}
+		// Older versions never recorded why a proxy was disabled. Preserve those
+		// administrator decisions unless an explicit one-time migration marks a
+		// known automatic fault as health-disabled. A saved healthy observation is
+		// not a new connectivity check and must not enable a proxy during startup.
+		if proxy.Enabled {
+			if proxy.DisabledBy != "" {
+				proxy.DisabledBy = ""
+				dirty = true
+			}
+		} else if proxy.DisabledBy != ProxyDisabledManual && proxy.DisabledBy != ProxyDisabledHealth && proxy.DisabledBy != ProxyDisabledInvalid {
+			proxy.DisabledBy = ProxyDisabledManual
+			dirty = true
+		}
+		if proxy.StateVersion == 0 {
+			proxy.StateVersion = 1
+			dirty = true
+		} else if previous.Enabled != proxy.Enabled || previous.DisabledBy != proxy.DisabledBy || previous.URL != proxy.URL || previous.Health != proxy.Health {
+			proxy.StateVersion++
 			dirty = true
 		}
 		if proxy.TotalBytes < 0 {
@@ -281,7 +314,11 @@ func ImportProxies(entries []ProxyEntry) (added, skipped int, err error) {
 			u, _ := url.Parse(entry.URL)
 			name = u.Host
 		}
-		cfg.Proxies = append(cfg.Proxies, ProxyEntry{ID: newUUID(), Name: name, URL: entry.URL, Enabled: entry.Enabled, Health: ProxyHealthUnknown})
+		imported := ProxyEntry{ID: newUUID(), Name: name, URL: entry.URL, Enabled: entry.Enabled, Health: ProxyHealthUnknown, StateVersion: 1}
+		if !imported.Enabled {
+			imported.DisabledBy = ProxyDisabledManual
+		}
+		cfg.Proxies = append(cfg.Proxies, imported)
 		added++
 	}
 	if added == 0 {
@@ -373,17 +410,35 @@ func UpdateProxyPatches(patches map[string]ProxyPatch) error {
 				entry.LastChecked = time.Now().Unix()
 				entry.LatencyMS = 0
 				entry.LastError = ""
+				if entry.DisabledBy == ProxyDisabledInvalid {
+					entry.DisabledBy = ProxyDisabledManual
+				}
 			}
 		}
 		if patch.Enabled != nil {
+			if *patch.Enabled {
+				if _, err := NormalizeProxyURL(entry.URL); err != nil {
+					return err
+				}
+			}
 			if entry.Enabled != *patch.Enabled {
 				entry.LastChecked = time.Now().Unix()
 			}
 			entry.Enabled = *patch.Enabled
+			if entry.Enabled {
+				entry.DisabledBy = ""
+			} else {
+				entry.DisabledBy = ProxyDisabledManual
+			}
 			if entry.Enabled && entry.Health == ProxyHealthUnhealthy {
 				entry.Health = ProxyHealthUnknown
 				entry.LastError = ""
 			}
+		}
+		// An idempotent explicit action is still a newer administrator decision.
+		// Advance once per transaction even if the URL/on-off value is unchanged.
+		if patch.URL != nil || patch.Enabled != nil {
+			entry.StateVersion++
 		}
 	}
 	seen := make(map[string]bool, len(candidate))
@@ -440,7 +495,7 @@ func RecordProxyCheck(id, expectedURL string, result ProxyCheckResult) error {
 		if entry.ID != id {
 			continue
 		}
-		if entry.URL != expectedURL || (result.CheckedAt > 0 && result.CheckedAt < entry.LastChecked) {
+		if entry.URL != expectedURL || (result.ExpectedStateVersion != nil && *result.ExpectedStateVersion != entry.StateVersion) || (result.CheckedAt > 0 && result.CheckedAt < entry.LastChecked) {
 			return nil
 		}
 		previous := snapshotProxyPoolLocked()
@@ -453,13 +508,23 @@ func RecordProxyCheck(id, expectedURL string, result ProxyCheckResult) error {
 			entry.Health = ProxyHealthHealthy
 			entry.LastError = SanitizeProxyError(result.LastError, entry.URL)
 			entry.ExitIP, entry.Country, entry.Region, entry.City = result.ExitIP, result.Country, result.Region, result.City
+			if entry.DisabledBy == ProxyDisabledHealth {
+				entry.Enabled = true
+				entry.DisabledBy = ""
+			}
 		} else {
 			entry.Health = ProxyHealthUnhealthy
+			if entry.Enabled || entry.DisabledBy == ProxyDisabledHealth {
+				entry.DisabledBy = ProxyDisabledHealth
+			}
 			entry.Enabled = false
 			entry.LastError = SanitizeProxyError(result.LastError, entry.URL)
 			if entry.LastError == "" {
 				entry.LastError = "proxy connectivity check failed"
 			}
+		}
+		if previousEntry := previous.proxies[i]; entry.Enabled != previousEntry.Enabled || entry.DisabledBy != previousEntry.DisabledBy {
+			entry.StateVersion++
 		}
 		reconcileProxyBindingsLocked()
 		if err := saveLocked(); err != nil {
@@ -474,6 +539,19 @@ func RecordProxyCheck(id, expectedURL string, result ProxyCheckResult) error {
 func DisableProxy(id, expectedURL, reason string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
+	return disableProxyLocked(id, expectedURL, nil, reason)
+}
+
+// DisableProxyIfCurrent rejects a network failure from a request that used an
+// older proxy state. In particular, a late response cannot undo a manual enable
+// or a newer automatic recovery even when both happened in the same second.
+func DisableProxyIfCurrent(id, expectedURL string, version uint64, reason string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	return disableProxyLocked(id, expectedURL, &version, reason)
+}
+
+func disableProxyLocked(id, expectedURL string, version *uint64, reason string) error {
 	if cfg == nil {
 		return errors.New("config not initialized")
 	}
@@ -482,14 +560,20 @@ func DisableProxy(id, expectedURL, reason string) error {
 		if entry.ID != id {
 			continue
 		}
-		if entry.URL != expectedURL {
+		if entry.URL != expectedURL || (version != nil && *version != entry.StateVersion) {
 			return nil
 		}
 		previous := snapshotProxyPoolLocked()
+		if entry.Enabled || entry.DisabledBy == ProxyDisabledHealth {
+			entry.DisabledBy = ProxyDisabledHealth
+		}
 		entry.Enabled = false
 		entry.Health = ProxyHealthUnhealthy
 		entry.LastError = SanitizeProxyError(reason, entry.URL)
 		entry.LastChecked = time.Now().Unix()
+		if previousEntry := previous.proxies[i]; entry.Enabled != previousEntry.Enabled || entry.DisabledBy != previousEntry.DisabledBy {
+			entry.StateVersion++
+		}
 		reconcileProxyBindingsLocked()
 		if err := saveLocked(); err != nil {
 			restoreProxyPoolLocked(previous)

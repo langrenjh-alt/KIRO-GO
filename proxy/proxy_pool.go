@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -96,10 +97,19 @@ func (h *Handler) startProxyInspection(ids []string, includeDisabled bool) bool 
 		if len(selected) > 0 && !selected[entry.ID] {
 			continue
 		}
-		if !includeDisabled && !entry.Enabled {
+		// Automatic health failures remain eligible for recovery probes. A
+		// manually disabled or invalid entry stays out of automatic scheduling.
+		if !includeDisabled && !entry.Enabled && entry.DisabledBy != config.ProxyDisabledHealth {
 			continue
 		}
 		entries = append(entries, entry)
+	}
+	if !includeDisabled {
+		// Recover quarantined nodes first so a long healthy pool does not
+		// unnecessarily keep accounts blocked behind ordinary refresh work.
+		sort.SliceStable(entries, func(i, j int) bool {
+			return !entries[i].Enabled && entries[j].Enabled
+		})
 	}
 	c.state = proxyInspectionState{Running: len(entries) > 0, Total: len(entries)}
 	if len(entries) == 0 {
@@ -127,7 +137,12 @@ func (h *Handler) startProxyInspection(ids []string, includeDisabled bool) bool 
 			go func() {
 				defer wg.Done()
 				for entry := range jobs {
+					version := entry.StateVersion
 					result := checker(c.ctx, entry)
+					// The scheduler owns the pre-probe state token. A checker must
+					// not overwrite an admin edit or a newer runtime failure, even
+					// when both occur in the same wall-clock second.
+					result.ExpectedStateVersion = &version
 					// Shutdown/caller cancellation is not evidence of a dead proxy.
 					if c.ctx.Err() == nil {
 						if err := config.RecordProxyCheck(entry.ID, entry.URL, result); err != nil {

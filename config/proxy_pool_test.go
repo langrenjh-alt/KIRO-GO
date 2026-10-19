@@ -243,7 +243,7 @@ func TestProxyPoolAccountLifecycleReleasesAndAssigns(t *testing.T) {
 	}
 }
 
-func TestProxyPoolCheckFailureRebindAndManualRecovery(t *testing.T) {
+func TestProxyPoolCheckFailureRebindAndAutomaticRecovery(t *testing.T) {
 	initProxyPoolTest(t)
 	proxies := addProxyPoolTest(t, 2)
 	if err := AddAccount(Account{ID: "a", Enabled: true}); err != nil {
@@ -259,10 +259,16 @@ func TestProxyPoolCheckFailureRebindAndManualRecovery(t *testing.T) {
 	if err := RecordProxyCheck(proxies[0].ID, proxies[0].URL, ProxyCheckResult{Healthy: true, ExitIP: "192.0.2.3", Country: "US", City: "New York"}); err != nil {
 		t.Fatal(err)
 	}
-	if GetProxies()[0].Enabled {
-		t.Fatal("healthy manual check unexpectedly re-enabled disabled proxy")
+	if got := GetProxies()[0]; !got.Enabled || got.DisabledBy != "" || got.Health != ProxyHealthHealthy {
+		t.Fatalf("healthy check did not automatically recover fault-disabled proxy: %+v", got)
 	}
 	if err := DisableProxy(proxies[1].ID, proxies[1].URL, "connection failed"); err != nil {
+		t.Fatal(err)
+	}
+	if GetProxyBindings()["a"] != proxies[0].ID {
+		t.Fatal("recovered proxy did not receive the displaced account")
+	}
+	if err := DisableProxy(proxies[0].ID, proxies[0].URL, "connection failed again"); err != nil {
 		t.Fatal(err)
 	}
 	if len(GetProxyBindings()) != 0 {
@@ -459,5 +465,272 @@ func TestProxyPoolConcurrentBindingsAndCountersPersist(t *testing.T) {
 	}
 	if persisted.AccountProxyBindings["a"] != proxies[0].ID {
 		t.Fatal("bindings not persisted")
+	}
+}
+
+func TestProxyPoolAutomaticRecoveryRebindsAfterRestart(t *testing.T) {
+	path := initProxyPoolTest(t)
+	entry := addProxyPoolTest(t, 1)[0]
+	if err := AddAccount(Account{ID: "account", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	enableProxyPoolTest(t, true)
+	version := entry.StateVersion
+	if err := RecordProxyCheck(entry.ID, entry.URL, ProxyCheckResult{ExpectedStateVersion: &version, LastError: "network unavailable"}); err != nil {
+		t.Fatal(err)
+	}
+	failed := GetProxies()[0]
+	if failed.Enabled || failed.DisabledBy != ProxyDisabledHealth || failed.StateVersion <= version || len(GetProxyBindings()) != 0 {
+		t.Fatalf("failure state not recorded: %+v %v", failed, GetProxyBindings())
+	}
+	if err := Init(path); err != nil {
+		t.Fatal(err)
+	}
+	if got := GetProxies()[0]; got != failed {
+		t.Fatalf("fault provenance changed after restart: %+v, want %+v", got, failed)
+	}
+	version = failed.StateVersion
+	if err := RecordProxyCheck(entry.ID, entry.URL, ProxyCheckResult{Healthy: true, ExpectedStateVersion: &version, ExitIP: "192.0.2.4", Country: "US", City: "New York"}); err != nil {
+		t.Fatal(err)
+	}
+	recovered := GetProxies()[0]
+	if !recovered.Enabled || recovered.Health != ProxyHealthHealthy || recovered.DisabledBy != "" || recovered.StateVersion <= version || recovered.ExitIP != "192.0.2.4" || GetProxyBindings()["account"] != entry.ID {
+		t.Fatalf("automatic recovery did not restore assignment: %+v %v", recovered, GetProxyBindings())
+	}
+	if err := Init(path); err != nil {
+		t.Fatal(err)
+	}
+	if got := GetProxies()[0]; got != recovered || GetProxyBindings()["account"] != entry.ID {
+		t.Fatalf("recovery not persisted: %+v %v", got, GetProxyBindings())
+	}
+}
+
+func TestProxyPoolManualDisableSurvivesFailedAndHealthyChecks(t *testing.T) {
+	path := initProxyPoolTest(t)
+	entry := addProxyPoolTest(t, 1)[0]
+	no, yes := false, true
+	if err := UpdateProxies([]string{entry.ID}, ProxyPatch{Enabled: &no}); err != nil {
+		t.Fatal(err)
+	}
+	for _, healthy := range []bool{false, true} {
+		before := GetProxies()[0]
+		version := before.StateVersion
+		if err := RecordProxyCheck(entry.ID, entry.URL, ProxyCheckResult{Healthy: healthy, ExpectedStateVersion: &version, LastError: "test observation"}); err != nil {
+			t.Fatal(err)
+		}
+		if got := GetProxies()[0]; got.Enabled || got.DisabledBy != ProxyDisabledManual || got.StateVersion != version {
+			t.Fatalf("check healthy=%v overrode manual disable: %+v", healthy, got)
+		}
+	}
+	if err := DisableProxy(entry.ID, entry.URL, "late runtime error"); err != nil {
+		t.Fatal(err)
+	}
+	if got := GetProxies()[0]; got.DisabledBy != ProxyDisabledManual {
+		t.Fatalf("runtime failure erased manual intent: %+v", got)
+	}
+	if err := Init(path); err != nil {
+		t.Fatal(err)
+	}
+	if got := GetProxies()[0]; got.Enabled || got.DisabledBy != ProxyDisabledManual {
+		t.Fatalf("manual state lost on restart: %+v", got)
+	}
+	if err := UpdateProxies([]string{entry.ID}, ProxyPatch{Enabled: &yes}); err != nil {
+		t.Fatal(err)
+	}
+	if got := GetProxies()[0]; !got.Enabled || got.DisabledBy != "" || got.Health != ProxyHealthUnknown || got.LastError != "" {
+		t.Fatalf("explicit re-enable did not clear failure state: %+v", got)
+	}
+}
+
+func TestProxyPoolIdempotentManualDisableOverridesAutomaticFault(t *testing.T) {
+	initProxyPoolTest(t)
+	entry := addProxyPoolTest(t, 1)[0]
+	if err := DisableProxy(entry.ID, entry.URL, "automatic fault"); err != nil {
+		t.Fatal(err)
+	}
+	failed := GetProxies()[0]
+	no := false
+	if err := UpdateProxies([]string{entry.ID}, ProxyPatch{Enabled: &no}); err != nil {
+		t.Fatal(err)
+	}
+	manual := GetProxies()[0]
+	if manual.Enabled || manual.DisabledBy != ProxyDisabledManual || manual.StateVersion <= failed.StateVersion {
+		t.Fatalf("idempotent disable did not record manual intent: %+v", manual)
+	}
+	version := manual.StateVersion
+	if err := RecordProxyCheck(entry.ID, entry.URL, ProxyCheckResult{Healthy: true, ExpectedStateVersion: &version}); err != nil {
+		t.Fatal(err)
+	}
+	if got := GetProxies()[0]; got.Enabled || got.DisabledBy != ProxyDisabledManual || got.Health != ProxyHealthHealthy {
+		t.Fatalf("healthy check overrode manual override: %+v", got)
+	}
+}
+
+func TestProxyPoolLoadConservativelyMigratesDisabledProvenance(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	raw := `{"proxies":[
+		{"id":"legacy-healthy","url":"http://proxy:1001","enabled":false,"health":"healthy"},
+		{"id":"legacy-failed","url":"http://proxy:1002","enabled":false,"health":"unhealthy"},
+		{"id":"known-fault","url":"http://proxy:1003","enabled":false,"health":"healthy","disabledBy":"health","stateVersion":7},
+		{"id":"manual","url":"http://proxy:1004","enabled":false,"health":"healthy","disabledBy":"manual","stateVersion":8},
+		{"id":"invalid","url":"ftp://proxy:1005","enabled":true,"health":"healthy"},
+		{"id":"enabled","url":"http://proxy:1006","enabled":true,"health":"healthy","disabledBy":"health"}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := Init(path); err != nil {
+		t.Fatal(err)
+	}
+	entries := GetProxies()
+	for _, index := range []int{0, 1, 3} {
+		if got := entries[index]; got.Enabled || got.DisabledBy != ProxyDisabledManual || got.StateVersion == 0 {
+			t.Errorf("unknown/manual disable incorrectly migrated: %+v", got)
+		}
+	}
+	if got := entries[2]; got.Enabled || got.DisabledBy != ProxyDisabledHealth || got.StateVersion != 7 {
+		t.Fatalf("saved healthy observation enabled known fault before real check: %+v", got)
+	}
+	if got := entries[4]; got.Enabled || got.DisabledBy != ProxyDisabledInvalid || got.Health != ProxyHealthUnhealthy {
+		t.Fatalf("invalid URL not marked invalid: %+v", got)
+	}
+	if got := entries[5]; !got.Enabled || got.DisabledBy != "" {
+		t.Fatalf("enabled proxy retained obsolete disabled provenance: %+v", got)
+	}
+	yes := true
+	if err := UpdateProxies([]string{entries[4].ID}, ProxyPatch{Enabled: &yes}); !errors.Is(err, ErrInvalidProxy) {
+		t.Fatalf("manual enable accepted an invalid proxy URL: %v", err)
+	}
+	for _, index := range []int{0, 1, 2, 3, 4} {
+		entry := GetProxies()[index]
+		version := entry.StateVersion
+		if err := RecordProxyCheck(entry.ID, entry.URL, ProxyCheckResult{Healthy: true, ExpectedStateVersion: &version}); err != nil {
+			t.Fatal(err)
+		}
+		if got := GetProxies()[index]; got.Enabled != (index == 2) {
+			t.Errorf("fresh check recovered wrong disable source at %d: %+v", index, got)
+		}
+	}
+	if err := Init(path); err != nil {
+		t.Fatal(err)
+	}
+	if got := GetProxies()[0]; got.DisabledBy != ProxyDisabledManual || got.Enabled {
+		t.Fatalf("legacy migration did not persist: %+v", got)
+	}
+}
+
+func TestProxyPoolStateVersionRejectsSameSecondStaleResults(t *testing.T) {
+	initProxyPoolTest(t)
+	entry := addProxyPoolTest(t, 1)[0]
+	no, yes := false, true
+	if err := UpdateProxies([]string{entry.ID}, ProxyPatch{Enabled: &no}); err != nil {
+		t.Fatal(err)
+	}
+	manual := GetProxies()[0]
+	oldVersion := entry.StateVersion
+	if err := RecordProxyCheck(entry.ID, entry.URL, ProxyCheckResult{Healthy: true, CheckedAt: manual.LastChecked, ExpectedStateVersion: &oldVersion}); err != nil {
+		t.Fatal(err)
+	}
+	if got := GetProxies()[0]; got != manual {
+		t.Fatalf("same-second old probe overwrote manual disable: %+v", got)
+	}
+	if err := UpdateProxies([]string{entry.ID}, ProxyPatch{Enabled: &no}); err != nil {
+		t.Fatal(err)
+	}
+	if got := GetProxies()[0]; got.StateVersion != manual.StateVersion+1 {
+		t.Fatalf("idempotent enabled patch did not advance version: %+v", got)
+	}
+	if err := UpdateProxies([]string{entry.ID}, ProxyPatch{Enabled: &yes}); err != nil {
+		t.Fatal(err)
+	}
+	enabled := GetProxies()[0]
+	if err := DisableProxyIfCurrent(entry.ID, entry.URL, manual.StateVersion, "stale request error"); err != nil {
+		t.Fatal(err)
+	}
+	if got := GetProxies()[0]; got != enabled {
+		t.Fatalf("same-second old request overrode manual enable: %+v", got)
+	}
+	if err := DisableProxyIfCurrent(entry.ID, entry.URL, enabled.StateVersion, "current fault"); err != nil {
+		t.Fatal(err)
+	}
+	failed := GetProxies()[0]
+	version := failed.StateVersion
+	if err := RecordProxyCheck(entry.ID, entry.URL, ProxyCheckResult{Healthy: true, CheckedAt: failed.LastChecked, ExpectedStateVersion: &version}); err != nil {
+		t.Fatal(err)
+	}
+	recovered := GetProxies()[0]
+	if !recovered.Enabled || recovered.DisabledBy != "" {
+		t.Fatalf("current healthy check did not recover proxy: %+v", recovered)
+	}
+	if err := DisableProxyIfCurrent(entry.ID, entry.URL, failed.StateVersion, "stale request after recovery"); err != nil {
+		t.Fatal(err)
+	}
+	if got := GetProxies()[0]; got != recovered {
+		t.Fatalf("stale request undid newer recovery: %+v", got)
+	}
+	if err := UpdateProxies([]string{entry.ID}, ProxyPatch{URL: &entry.URL}); err != nil {
+		t.Fatal(err)
+	}
+	edited := GetProxies()[0]
+	if edited.StateVersion != recovered.StateVersion+1 {
+		t.Fatalf("idempotent URL edit did not advance version: %+v", edited)
+	}
+	version = recovered.StateVersion
+	if err := RecordProxyCheck(entry.ID, entry.URL, ProxyCheckResult{ExpectedStateVersion: &version, CheckedAt: edited.LastChecked}); err != nil {
+		t.Fatal(err)
+	}
+	if got := GetProxies()[0]; got != edited {
+		t.Fatalf("old check overrode same-URL edit: %+v", got)
+	}
+}
+
+func TestProxyPoolRecoverySaveFailureRestoresStateAndBindings(t *testing.T) {
+	initProxyPoolTest(t)
+	entry := addProxyPoolTest(t, 1)[0]
+	if err := AddAccount(Account{ID: "a", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	enableProxyPoolTest(t, true)
+	if err := DisableProxy(entry.ID, entry.URL, "test fault"); err != nil {
+		t.Fatal(err)
+	}
+	before, bindings := GetProxies()[0], GetProxyBindings()
+	cfgLock.Lock()
+	previousPath := cfgPath
+	cfgPath = t.TempDir()
+	cfgLock.Unlock()
+	t.Cleanup(func() { cfgLock.Lock(); cfgPath = previousPath; cfgLock.Unlock() })
+	version := before.StateVersion
+	if err := RecordProxyCheck(entry.ID, entry.URL, ProxyCheckResult{Healthy: true, ExpectedStateVersion: &version}); err == nil {
+		t.Fatal("recovery unexpectedly persisted to directory")
+	}
+	if got := GetProxies()[0]; got != before || !reflect.DeepEqual(GetProxyBindings(), bindings) {
+		t.Fatalf("failed recovery leaked enabled state/version/bindings: %+v %v", got, GetProxyBindings())
+	}
+}
+
+func TestProxyPoolHealthyObservationDoesNotInvalidateLiveRequest(t *testing.T) {
+	initProxyPoolTest(t)
+	entry := addProxyPoolTest(t, 1)[0]
+	version := entry.StateVersion
+	if err := RecordProxyCheck(entry.ID, entry.URL, ProxyCheckResult{Healthy: true, ExpectedStateVersion: &version, ExitIP: "192.0.2.9"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := GetProxies()[0]; got.StateVersion != entry.StateVersion || !got.Enabled || got.Health != ProxyHealthHealthy {
+		t.Fatalf("metadata-only healthy probe invalidated a live request: %+v", got)
+	}
+	if err := DisableProxyIfCurrent(entry.ID, entry.URL, entry.StateVersion, "live request connection failed"); err != nil {
+		t.Fatal(err)
+	}
+	if got := GetProxies()[0]; got.Enabled || got.DisabledBy != ProxyDisabledHealth || got.StateVersion <= entry.StateVersion {
+		t.Fatalf("genuine live request failure ignored after healthy probe: %+v", got)
+	}
+	failed := GetProxies()[0]
+	version = failed.StateVersion
+	if err := RecordProxyCheck(entry.ID, entry.URL, ProxyCheckResult{Healthy: false, ExpectedStateVersion: &version}); err != nil {
+		t.Fatal(err)
+	}
+	if got := GetProxies()[0]; got.StateVersion != version || got.DisabledBy != ProxyDisabledHealth {
+		t.Fatalf("metadata-only failed recheck changed control revision: %+v", got)
 	}
 }
