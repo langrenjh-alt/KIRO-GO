@@ -53,9 +53,9 @@ func responsesPromptCacheUsageForInput(state *openAIPromptCacheState, inputToken
 	return reanchorClaudeCacheUsage(state.profile, state.usage, inputTokens)
 }
 
-func applyResponsesPromptCacheUsage(response *ResponsesObject, usage promptCacheUsage) {
+func applyResponsesPromptCacheUsage(response *ResponsesObject, usage promptCacheUsage) ClaudeUsage {
 	if response == nil {
-		return
+		return ClaudeUsage{}
 	}
 	cachedTokens := usage.CacheReadInputTokens
 	if cachedTokens < 0 {
@@ -68,15 +68,14 @@ func applyResponsesPromptCacheUsage(response *ResponsesObject, usage promptCache
 	// Cache policy works in the original token domain. Apply billing only once
 	// the final cached portion has been constrained to the input total.
 	percent := config.GetTokenBillingInflationPercent()
-	if percent == 0 && response.Usage.InputTokens <= maxBillingInputTokens {
-		return
-	}
 	usage.CacheReadInputTokens = cachedTokens
 	usage.CacheCreationInputTokens = maxInt(0, minInt(usage.CacheCreationInputTokens, response.Usage.InputTokens-cachedTokens))
-	billedUsage := inflatedBillingUsageWithPercent(response.Usage.InputTokens, response.Usage.OutputTokens, usage, percent)
+	billedUsage := ClaudeUsage{InputTokens: billedClaudeInputTokens(response.Usage.InputTokens, usage), OutputTokens: response.Usage.OutputTokens, CacheCreationInputTokens: usage.CacheCreationInputTokens, CacheReadInputTokens: cachedTokens, CacheCreation: &ClaudeCacheCreationUsage{Ephemeral5mInputTokens: usage.CacheCreation5mInputTokens, Ephemeral1hInputTokens: usage.CacheCreation1hInputTokens}}
+	inflateClaudeUsageWithPercent(&billedUsage, percent)
 	response.Usage.InputTokens = billedUsage.InputTokens + billedUsage.CacheCreationInputTokens + billedUsage.CacheReadInputTokens
 	response.Usage.OutputTokens = billedUsage.OutputTokens
 	response.Usage.InputTokensDetails.CachedTokens = billedUsage.CacheReadInputTokens
 	response.Usage.OutputTokensDetails.ReasoningTokens = inflateBillingTokensWithPercent(response.Usage.OutputTokensDetails.ReasoningTokens, percent)
 	response.Usage.TotalTokens = response.Usage.InputTokens + response.Usage.OutputTokens
+	return billedUsage
 }

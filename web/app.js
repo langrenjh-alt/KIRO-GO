@@ -1408,7 +1408,7 @@
         const id = String(a.id);
         const latestAccount = proxyAccounts.get(id);
         if (latestAccount) {
-          ['enabled', 'banStatus', 'banReason', 'proxyPoolEnabled', 'proxyId', 'proxyName', 'proxyExitIP', 'proxyBlocked'].forEach(key => {
+          ['enabled', 'banStatus', 'banReason', 'proxyPoolEnabled', 'proxyId', 'proxyName', 'proxyExitIP', 'proxyBlocked', 'quotaEstimate'].forEach(key => {
             if (Object.prototype.hasOwnProperty.call(latestAccount, key)) a[key] = latestAccount[key];
           });
           proxyAccounts.set(id, a); // Render with merged eligibility, including partial status responses.
@@ -1431,6 +1431,18 @@
         if (account) {
           const markup = renderAccountProxy(account);
           if (element.innerHTML !== markup) element.innerHTML = markup;
+        }
+      });
+      qsa('.account-quota-slot', $('accountsList')).forEach(element => {
+        const account = proxyAccounts.get(element.dataset.accountId);
+        if (!account) return;
+        const markup = renderAccountQuota(account);
+        if (element.innerHTML !== markup) {
+          const details = element.querySelector('details');
+          const expanded = details && details.open;
+          element.innerHTML = markup;
+          const nextDetails = element.querySelector('details');
+          if (nextDetails && expanded) nextDetails.open = true;
         }
       });
       if (modelTargets.length) {
@@ -1986,6 +1998,68 @@
     const list = Array.isArray(models) ? models : [];
     return list.map(item => (item && item.model ? item.model : '') + '@' + (item && item.until ? item.until : 0)).join('|');
   }
+  function quotaNonNegativeNumber(value) {
+    return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER ? value : null;
+  }
+  function formatQuotaUSD(value) {
+    if (quotaNonNegativeNumber(value) === null) return null;
+    if (value === 0) return '$0.00';
+    if (value > 0 && value < 0.0001) return '<$0.0001';
+    return '$' + value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: value < 1 ? 4 : 2 });
+  }
+  function quotaDate(value) {
+    let date;
+    if (quotaNonNegativeNumber(value) !== null && value > 0 && value <= 8640000000000) date = new Date(value * 1000);
+    else if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value)) date = new Date(value);
+    return date && !Number.isNaN(date.getTime()) && date.getUTCFullYear() > 1970 ? date : null;
+  }
+  function formatQuotaDate(value) {
+    const date = quotaDate(value);
+    return date ? date.toLocaleString(currentLang === 'zh' ? 'zh-CN' : 'en-US') : '—';
+  }
+  function renderAccountQuota(a) {
+    const q = a.quotaEstimate && typeof a.quotaEstimate === 'object' && !Array.isArray(a.quotaEstimate) ? a.quotaEstimate : {};
+    const statusKeys = {
+      collecting: 'accounts.quotaCollecting', no_credit_snapshot: 'accounts.quotaWaiting',
+      insufficient_credit_delta: 'accounts.quotaCreditDelta', available: 'accounts.quotaWaiting',
+      stale: 'accounts.quotaStale', unknown_price: 'accounts.quotaPricing', storage_error: 'accounts.quotaStorageError',
+      awaiting_usage: 'accounts.quotaWaiting', awaiting_credit_snapshot: 'accounts.quotaCreditSnapshot',
+      awaiting_credit_delta: 'accounts.quotaCreditDelta', credit_epoch_changed: 'accounts.quotaCycleReset',
+      incomplete_cost_interval: 'accounts.quotaIncompleteInterval', unattributed_credit_usage: 'accounts.quotaUnattributed',
+      load_error: 'accounts.quotaStorageError', reset: 'accounts.quotaCycleReset', ready: 'accounts.quotaWaiting'
+    };
+    const status = typeof q.estimateStatus === 'string' ? q.estimateStatus : '';
+    const currencyKnown = q.currency === 'USD';
+    const unpriced = quotaNonNegativeNumber(q.unpricedRequests) > 0;
+    const statusKey = status === 'incomplete_cost_interval' && unpriced ? 'accounts.quotaPricing'
+      : Object.prototype.hasOwnProperty.call(statusKeys, status) ? statusKeys[status] : 'accounts.quotaWaiting';
+    const estimate = currencyKnown && ['available', 'ready', 'stale'].includes(status) ? formatQuotaUSD(q.estimatedTotalUSD) : null;
+    const spentValue = quotaNonNegativeNumber(q.spentUSD);
+    const tracked = status !== 'awaiting_usage' && quotaDate(q.trackingSince) !== null;
+    const spent = currencyKnown && status !== 'awaiting_usage' && spentValue !== null && (tracked || spentValue > 0)
+      && !(spentValue === 0 && unpriced) ? formatQuotaUSD(spentValue) : null;
+    const partial = q.spentComplete !== true || unpriced || status === 'load_error';
+    const unavailable = !currencyKnown && q.currency ? 'accounts.quotaPricing' : statusKey;
+    const statusTag = key => '<small class="account-quota-status">' + escapeHtml(t(key)) + '</small>';
+    const estimateHTML = estimate === null ? escapeHtml(t(unavailable))
+      : escapeHtml(estimate) + (status === 'stale' ? statusTag('accounts.quotaStale') : '');
+    const spentHTML = spent === null ? escapeHtml(t(['storage_error', 'load_error'].includes(status) ? 'accounts.quotaStorageError'
+      : status === 'unknown_price' || unpriced || (!currencyKnown && q.currency) ? 'accounts.quotaPricing' : 'accounts.quotaWaiting'))
+      : escapeHtml(spent) + (partial ? statusTag('accounts.quotaPartial') : '');
+    const count = value => Number.isSafeInteger(value) && value >= 0 ? value.toLocaleString('en-US') : '—';
+    const credit = value => quotaNonNegativeNumber(value) === null ? '—' : value.toLocaleString('en-US', { maximumFractionDigits: 4 });
+    const priceAsOf = typeof q.priceAsOf === 'string' && q.priceAsOf ? q.priceAsOf.slice(0, 80) : '—';
+    const explanation = t('accounts.quotaExplanation');
+    return '<div class="account-quota"><dl class="account-quota-values">' +
+      '<div class="account-quota-item"><dt title="' + escapeAttr(explanation) + '">' + escapeHtml(t('accounts.quotaEstimated')) + '</dt><dd>' + estimateHTML + '</dd></div>' +
+      '<div class="account-quota-item"><dt title="' + escapeAttr(explanation) + '">' + escapeHtml(t('accounts.quotaSpent')) + '</dt><dd>' + spentHTML + '</dd></div>' +
+      '</dl>' + (typeof q.persistenceError === 'string' && q.persistenceError ? '<p class="account-quota-status">' + escapeHtml(t('accounts.quotaPersistence')) + '</p>' : '') +
+      '<details class="account-quota-info"><summary>' + escapeHtml(t('accounts.quotaDetails')) + '</summary><div>' +
+      '<p>' + escapeHtml(explanation) + '</p><p>' + escapeHtml(t('accounts.quotaSamples', count(q.sampleCount), formatQuotaDate(q.lastSampleAt))) + '</p>' +
+      '<p>' + escapeHtml(t('accounts.quotaTracking', tracked ? formatQuotaDate(q.trackingSince) : '—', count(q.unpricedRequests))) + '</p>' +
+      '<p>' + escapeHtml(t('accounts.quotaCredits', credit(q.creditUsed), credit(q.creditLimit))) + '</p>' +
+      '<p>' + escapeHtml(t('accounts.quotaPriceDate', priceAsOf)) + '</p></div></details></div>';
+  }
   function renderAccountProxy(a) {
     if (!a.proxyPoolEnabled) return '';
     const status = String(a.banStatus || '').trim().toUpperCase();
@@ -2067,6 +2141,7 @@
           '<div class="usage-bar"><div class="usage-fill ' + trialClass + '" data-usage-pct="' + escapeAttr(trialPct) + '"></div></div>' +
           '<div class="usage-text"><span>' + (a.trialUsageCurrent != null ? a.trialUsageCurrent.toFixed(1) : 0) + ' / ' + (a.trialUsageLimit != null ? a.trialUsageLimit.toFixed(0) : 0) + '</span><span>' + trialPct.toFixed(1) + '%</span></div>' +
           '</div>' : '') +
+        '<div class="account-quota-slot" data-account-id="' + idAttr + '">' + renderAccountQuota(a) + '</div>' +
         '<div class="account-proxy-slot" data-account-id="' + idAttr + '">' + renderAccountProxy(a) + '</div>' +
         '<div class="account-stats">' +
         '<div class="account-stat"><div class="account-stat-value">' + (a.requestCount || 0) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.requests')) + '</div></div>' +

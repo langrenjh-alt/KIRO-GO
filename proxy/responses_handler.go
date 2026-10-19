@@ -426,7 +426,8 @@ func (h *Handler) handleResponsesNonStream(
 		publicCacheUsage := contextUsageBlendedCacheUsage(payload, model, inputTokens, cacheUsage)
 		publicInputTokens, publicCacheUsage = retryUsage.apply(publicInputTokens, publicCacheUsage)
 		respObj := buildResponsesObjectWithReasoning(respID, responseModel, finalContent, reasoningContent, toolUses, publicInputTokens, outputTokens, req)
-		applyResponsesPromptCacheUsage(respObj, publicCacheUsage)
+		dollarUsage := applyResponsesPromptCacheUsage(respObj, publicCacheUsage)
+		stageAccountQuotaReceipt(kiroPayloadContext(payload), responseModel, quotaUsageFromClaude(dollarUsage), quotaFinalSources(publicInputTokens, outputTokens, publicCacheUsage, retryUsage, quotaOwner{AccountID: account.ID, Model: model, Input: int64(inputTokens), Output: int64(attemptOutputTokens)}))
 		respObj.Usage.KiroContextUsage = kiroContextUsage(payload, model)
 		applyResponsesTerminalStatus(respObj, upstreamStopReason, contextWindowExceeded)
 		respObj.StoredInput = storedInput
@@ -440,7 +441,9 @@ func (h *Handler) handleResponsesNonStream(
 		}
 
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		_ = json.NewEncoder(w).Encode(respObj)
+		if err := json.NewEncoder(w).Encode(respObj); err == nil {
+			completeAccountQuotaReceipt(kiroPayloadContext(payload))
+		}
 		return
 	}
 
@@ -596,6 +599,7 @@ func (h *Handler) handleResponsesStream(
 		}
 		data, err := json.Marshal(payload)
 		if err != nil {
+			invalidateQuotaReceiptWriter(w)
 			return
 		}
 		if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventName, string(data)); err != nil {
@@ -1385,7 +1389,8 @@ func (h *Handler) handleResponsesStream(
 		publicInputTokens, publicCacheUsage = retryUsage.apply(publicInputTokens, publicCacheUsage)
 		publicOutputTokens := retryUsage.applyOutput(outputTokens)
 		respObj := buildResponsesObjectWithReasoning(respID, responseModel, finalContent, reasoning, toolUses, publicInputTokens, publicOutputTokens, req)
-		applyResponsesPromptCacheUsage(respObj, publicCacheUsage)
+		dollarUsage := applyResponsesPromptCacheUsage(respObj, publicCacheUsage)
+		stageAccountQuotaReceipt(kiroPayloadContext(payload), responseModel, quotaUsageFromClaude(dollarUsage), quotaFinalSources(publicInputTokens, publicOutputTokens, publicCacheUsage, retryUsage, quotaOwner{AccountID: account.ID, Model: model, Input: int64(inputTokens), Output: int64(outputTokens)}))
 		respObj.Usage.KiroContextUsage = kiroContextUsage(payload, model)
 		respObj.Output = streamOutput
 		incomplete := applyResponsesTerminalStatus(respObj, upstreamStopReason, contextWindowExceeded)
@@ -1408,6 +1413,7 @@ func (h *Handler) handleResponsesStream(
 			"type":     terminalEvent,
 			"response": respObj,
 		})
+		completeAccountQuotaReceipt(kiroPayloadContext(payload))
 		return
 	}
 

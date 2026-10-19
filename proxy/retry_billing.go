@@ -6,9 +6,13 @@ import (
 )
 
 type discardedAttemptUsage struct {
-	InputTokens  int
-	OutputTokens int
-	Credits      float64
+	AccountID      string
+	Model          string
+	InputTokens    int
+	OutputTokens   int
+	Credits        float64
+	visibleOutput  bool
+	replayedOutput bool
 }
 
 func newDiscardedAttemptUsage(inputTokens, outputTokens int, credits float64) discardedAttemptUsage {
@@ -68,6 +72,7 @@ func (u *retryBillingUsage) markLastVisibleContinuation() {
 		return
 	}
 	last := u.attempts[len(u.attempts)-1]
+	u.attempts[len(u.attempts)-1].visibleOutput = true
 	u.cachedInputTokens -= last.OutputTokens
 	if u.cachedInputTokens < 0 {
 		u.cachedInputTokens = 0
@@ -80,6 +85,7 @@ func (u *retryBillingUsage) markLastContinuationAttemptOutput() {
 		return
 	}
 	u.continuationAttemptOutputTokens += u.attempts[len(u.attempts)-1].OutputTokens
+	u.attempts[len(u.attempts)-1].replayedOutput = true
 }
 
 func (u retryBillingUsage) finalAttemptOutputTokens(outputTokens int) int {
@@ -119,6 +125,22 @@ func (u retryBillingUsage) apply(inputTokens int, cacheUsage promptCacheUsage) (
 	inputTokens += u.cachedInputTokens
 	cacheUsage.CacheReadInputTokens += u.cachedInputTokens
 	return inputTokens, cacheUsage
+}
+
+func (u retryBillingUsage) quotaSources() []quotaSource {
+	result := make([]quotaSource, 0, len(u.attempts))
+	for _, attempt := range u.attempts {
+		s := quotaSource{AccountID: attempt.AccountID, Model: attempt.Model}
+		s.Usage.CacheReadTokens = int64(attempt.InputTokens) + int64(attempt.OutputTokens)
+		if attempt.visibleOutput {
+			s.Usage.CacheReadTokens -= int64(attempt.OutputTokens)
+		}
+		if attempt.visibleOutput || attempt.replayedOutput {
+			s.Usage.OutputTokens = int64(attempt.OutputTokens)
+		}
+		result = append(result, s)
+	}
+	return result
 }
 
 // recordForAPIKey is used by buffered internal calls, which do not know the

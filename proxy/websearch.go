@@ -319,7 +319,12 @@ func (h *Handler) handleWebSearchRequestWithCallerAndCache(
 		cacheUsage = cacheTracker.Compute(execution.Account.ID, cacheProfile)
 		cacheUsage = reanchorClaudeCacheUsage(cacheProfile, cacheUsage, estimatedInputTokens)
 	}
-	outputTokens, err := writeWebSearchResponseWithCache(w, req, execution.Result, estimatedInputTokens, cacheUsage)
+	delivery := quotaWebSearchDelivery{Context: ctx}
+	if execution.Account != nil {
+		delivery.AccountID = execution.Account.ID
+	}
+	noteAccountQuotaAttempt(ctx, execution.LastAccountID, req.Model)
+	outputTokens, err := writeWebSearchResponseWithCache(w, req, execution.Result, estimatedInputTokens, cacheUsage, delivery)
 	if err != nil {
 		if execution.Account != nil {
 			h.pool.RecordSuccess(execution.Account.ID)
@@ -1206,6 +1211,7 @@ func writeWebSearchResponseWithCache(
 	result *webSearchResultSet,
 	estimatedInputTokens int,
 	cacheUsage promptCacheUsage,
+	deliveries ...quotaWebSearchDelivery,
 ) (int, error) {
 	if w == nil {
 		return 0, fmt.Errorf("web search response writer is nil")
@@ -1228,6 +1234,8 @@ func writeWebSearchResponseWithCache(
 	}
 
 	if !req.Stream {
+		usage := buildWebSearchUsage(inputTokens, outputTokens, cacheUsage)
+		stageWebSearchQuotaReceipt(deliveries, responseModel, inputTokens, outputTokens, cacheUsage, usage)
 		body := map[string]interface{}{
 			"id":            newWebSearchMessageID(),
 			"type":          "message",
@@ -1237,7 +1245,7 @@ func writeWebSearchResponseWithCache(
 			"stop_reason":   "end_turn",
 			"stop_sequence": nil,
 			"stop_details":  nil,
-			"usage":         buildWebSearchUsage(inputTokens, outputTokens, cacheUsage),
+			"usage":         usage,
 			"context_management": map[string]interface{}{
 				"applied_edits": []interface{}{},
 			},
@@ -1251,6 +1259,9 @@ func writeWebSearchResponseWithCache(
 		if _, err := w.Write(encoded); err != nil {
 			return 0, err
 		}
+		if len(deliveries) > 0 {
+			completeAccountQuotaReceipt(deliveries[0].Context)
+		}
 		return outputTokens, nil
 	}
 
@@ -1262,12 +1273,16 @@ func writeWebSearchResponseWithCache(
 	if err != nil {
 		return 0, err
 	}
+	stageWebSearchQuotaReceipt(deliveries, responseModel, inputTokens, outputTokens, cacheUsage, quotaClaudeSSETerminalUsage(streamBody))
 
 	configureSSEHeaders(w)
 	if _, err := w.Write(streamBody); err != nil {
 		return 0, err
 	}
 	flusher.Flush()
+	if len(deliveries) > 0 {
+		completeAccountQuotaReceipt(deliveries[0].Context)
+	}
 	return outputTokens, nil
 }
 

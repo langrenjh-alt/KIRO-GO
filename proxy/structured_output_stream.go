@@ -111,5 +111,8 @@ func (h *Handler) handleClaudeStructuredStream(w http.ResponseWriter, payload *K
 			"usage": response.Usage, "context_management": response.ContextManagement,
 		})
 		send("message_stop", map[string]interface{}{"type": "message_stop"})
+		if kiroPayloadContext(payload).Err() == nil {
+			completeAccountQuotaReceipt(kiroPayloadContext(payload))
+		}
 	})
 }

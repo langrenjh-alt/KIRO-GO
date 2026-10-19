@@ -111,7 +111,9 @@ func (h *Handler) handleResponsesWebSearch(
 	}
 
 	respObj, outputTokens := buildResponsesWebSearchObject(respID, responseModel, req, execution.Result, estimatedInputTokens)
-	applyResponsesPromptCacheUsage(respObj, cacheUsage)
+	dollarUsage := applyResponsesPromptCacheUsage(respObj, cacheUsage)
+	noteAccountQuotaAttempt(ctx, execution.LastAccountID, responseModel)
+	stageAccountQuotaReceipt(ctx, responseModel, quotaUsageFromClaude(dollarUsage), []quotaSource{{AccountID: cacheAccountID, Model: model, Usage: quotaRawUsage(estimatedInputTokens, outputTokens, cacheUsage)}})
 	respObj.StoredInput = storedInput
 	respObj.Instructions = req.Instructions
 	respObj.OwnerKeyID = apiKeyID
@@ -129,6 +131,7 @@ func (h *Handler) handleResponsesWebSearch(
 			h.recordFailureWithDetails("responses", model, accountID, err)
 			return
 		}
+		completeAccountQuotaReceipt(ctx)
 		if execution.DegradedError != nil {
 			h.recordFailureWithDetails("responses", model, accountID, execution.DegradedError)
 			return
@@ -145,6 +148,7 @@ func (h *Handler) handleResponsesWebSearch(
 		h.recordFailureWithDetails("responses", model, accountID, err)
 		return
 	}
+	completeAccountQuotaReceipt(ctx)
 	if execution.DegradedError != nil {
 		h.recordFailureWithDetails("responses", model, accountID, execution.DegradedError)
 		return

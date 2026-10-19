@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -38,6 +39,8 @@ type boundedResponseWriter struct {
 	writeGeneration  uint64
 	inFlightWrite    uint64
 	lastFlushedWrite uint64
+	writeErr         error
+	quotaReceipt     *accountQuotaReceipt
 }
 
 type responseWritePolicy struct {
@@ -198,12 +201,21 @@ func (w *boundedResponseWriter) Write(p []byte) (int, error) {
 	w.ioMu.Lock()
 	w.setWriteDeadline()
 	n, err := w.ResponseWriter.Write(p)
+	if err == nil && n != len(p) {
+		err = io.ErrShortWrite
+	}
 	w.mu.Lock()
+	if err != nil && w.writeErr == nil {
+		w.writeErr = err
+	}
 	if n > 0 {
 		w.dirty = true
 		w.writeGeneration++
 	}
 	w.mu.Unlock()
+	if n > 0 && n <= len(p) {
+		w.quotaReceipt.observeWrite(p[:n], w.Header().Get("Content-Type"))
+	}
 	w.ioMu.Unlock()
 	if err != nil && w.cancel != nil {
 		w.cancel()
@@ -282,9 +294,11 @@ func (w *boundedResponseWriter) flushUnderlying() {
 	w.ioMu.Lock()
 	w.setWriteDeadline()
 	err := http.NewResponseController(w.ResponseWriter).Flush()
-	w.ioMu.Unlock()
 	flushedAt := time.Now()
 	w.mu.Lock()
+	if err != nil && w.writeErr == nil {
+		w.writeErr = err
+	}
 	visible := w.inFlightVisible
 	flushedWrite := w.inFlightWrite
 	w.flushInFlight = false
@@ -298,6 +312,10 @@ func (w *boundedResponseWriter) flushUnderlying() {
 		w.lastFlushedWrite = flushedWrite
 	}
 	w.mu.Unlock()
+	// Publish the flush result before finish's ioMu barrier can return. The
+	// receipt must never observe success while a timer's failed flush is only
+	// waiting to acquire mu and publish its error.
+	w.ioMu.Unlock()
 	if err != nil {
 		if w.cancel != nil {
 			w.cancel()
@@ -307,6 +325,12 @@ func (w *boundedResponseWriter) flushUnderlying() {
 	if visible && w.timing != nil {
 		w.timing.markVisibleFlushed(flushedAt)
 	}
+}
+
+func (w *boundedResponseWriter) writeError() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.writeErr
 }
 
 func (w *boundedResponseWriter) finish() {

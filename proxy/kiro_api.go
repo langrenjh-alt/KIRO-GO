@@ -175,7 +175,19 @@ func shouldProbeFallbackRegions(account *config.Account) bool {
 
 // GetUsageLimits 获取账户使用量和订阅信息
 func GetUsageLimits(account *config.Account) (*UsageLimitsResponse, error) {
-	if err := ensureRestProfileArn(account); err != nil {
+	return GetUsageLimitsContext(context.Background(), account)
+}
+
+// GetUsageLimitsContext keeps background quota sampling cancellable, including
+// profile resolution. It uses the same account-bound egress as generation.
+func GetUsageLimitsContext(ctx context.Context, account *config.Account) (*UsageLimitsResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if account == nil {
+		return nil, fmt.Errorf("account is nil")
+	}
+	if err := ensureRestProfileArnContext(ctx, account); err != nil {
 		return nil, fmt.Errorf("resolve profileArn: %w", err)
 	}
 
@@ -183,7 +195,7 @@ func GetUsageLimits(account *config.Account) (*UsageLimitsResponse, error) {
 	url = regionalizeURL(url, account)
 	url = withProfileArnQuery(url, account)
 
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -456,10 +468,14 @@ func isProfileArnResolutionSoftError(err error) bool {
 }
 
 func ensureRestProfileArn(account *config.Account) error {
+	return ensureRestProfileArnContext(context.Background(), account)
+}
+
+func ensureRestProfileArnContext(ctx context.Context, account *config.Account) error {
 	if account == nil || strings.TrimSpace(account.ProfileArn) != "" {
 		return nil
 	}
-	profileArn, err := ResolveProfileArn(account)
+	profileArn, err := ResolveProfileArnContext(ctx, account)
 	if err != nil {
 		if isProfileArnResolutionSoftError(err) {
 			logger.Debugf("[ProfileArn] Continuing REST request without profile ARN for %s: %v", accountEmailForLog(account), err)
@@ -807,30 +823,36 @@ type UsageLimitsResponse struct {
 }
 
 type UsageBreakdown struct {
-	ResourceType  string         `json:"resourceType"`
-	CurrentUsage  float64        `json:"currentUsage"`
-	UsageLimit    float64        `json:"usageLimit"`
-	Currency      string         `json:"currency"`
-	Unit          string         `json:"unit"`
-	OverageRate   float64        `json:"overageRate"`
-	FreeTrialInfo *FreeTrialInfo `json:"freeTrialInfo"`
-	Bonuses       []BonusInfo    `json:"bonuses"`
+	CurrentUsageWithPrecision *float64       `json:"currentUsageWithPrecision"`
+	UsageLimitWithPrecision   *float64       `json:"usageLimitWithPrecision"`
+	ResourceType              string         `json:"resourceType"`
+	CurrentUsage              float64        `json:"currentUsage"`
+	UsageLimit                float64        `json:"usageLimit"`
+	Currency                  string         `json:"currency"`
+	Unit                      string         `json:"unit"`
+	OverageRate               float64        `json:"overageRate"`
+	FreeTrialInfo             *FreeTrialInfo `json:"freeTrialInfo"`
+	Bonuses                   []BonusInfo    `json:"bonuses"`
 }
 
 type FreeTrialInfo struct {
-	CurrentUsage    float64     `json:"currentUsage"`
-	UsageLimit      float64     `json:"usageLimit"`
-	FreeTrialStatus string      `json:"freeTrialStatus"`
-	FreeTrialExpiry json.Number `json:"freeTrialExpiry"`
+	CurrentUsageWithPrecision *float64    `json:"currentUsageWithPrecision"`
+	UsageLimitWithPrecision   *float64    `json:"usageLimitWithPrecision"`
+	CurrentUsage              float64     `json:"currentUsage"`
+	UsageLimit                float64     `json:"usageLimit"`
+	FreeTrialStatus           string      `json:"freeTrialStatus"`
+	FreeTrialExpiry           json.Number `json:"freeTrialExpiry"`
 }
 
 type BonusInfo struct {
-	BonusCode    string      `json:"bonusCode"`
-	DisplayName  string      `json:"displayName"`
-	CurrentUsage float64     `json:"currentUsage"`
-	UsageLimit   float64     `json:"usageLimit"`
-	ExpiresAt    json.Number `json:"expiresAt"`
-	Status       string      `json:"status"`
+	CurrentUsageWithPrecision *float64    `json:"currentUsageWithPrecision"`
+	UsageLimitWithPrecision   *float64    `json:"usageLimitWithPrecision"`
+	BonusCode                 string      `json:"bonusCode"`
+	DisplayName               string      `json:"displayName"`
+	CurrentUsage              float64     `json:"currentUsage"`
+	UsageLimit                float64     `json:"usageLimit"`
+	ExpiresAt                 json.Number `json:"expiresAt"`
+	Status                    string      `json:"status"`
 }
 
 type SubscriptionInfo struct {

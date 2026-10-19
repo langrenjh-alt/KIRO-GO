@@ -94,6 +94,7 @@ func (h *Handler) handleClaudeCodeBufferedStream(
 	body := buffered.body.Bytes()
 	if status == http.StatusOK {
 		body = patchClaudeCodeUsageTotals(body)
+		patchAccountQuotaClaudeCodeReceipt(kiroPayloadContext(payload), body)
 	}
 	if !buffered.committed {
 		w.WriteHeader(status)

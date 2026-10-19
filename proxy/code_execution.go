@@ -158,8 +158,10 @@ func (h *Handler) handleCodeExecutionRequest(
 	var credits float64
 	var container *ClaudeContainer
 	type pendingRound struct {
-		result  *bufferedClaudeCall
-		settled bool
+		result     *bufferedClaudeCall
+		settled    bool
+		blockStart int
+		discarded  bool
 	}
 	var successfulRounds []*pendingRound
 	defer func() {
@@ -198,7 +200,7 @@ func (h *Handler) handleCodeExecutionRequest(
 		}
 		credits += result.Credits
 		retryUsage.merge(result.RetryUsage)
-		pending := &pendingRound{result: result}
+		pending := &pendingRound{result: result, blockStart: len(blocks)}
 		successfulRounds = append(successfulRounds, pending)
 		if ctx.Err() != nil {
 			return
@@ -237,6 +239,7 @@ func (h *Handler) handleCodeExecutionRequest(
 					// Python execution. Settle it once without re-recording the pool.
 					attempt := h.settleCodeExecutionRound(req.Model, apiKeyID, result, time.Since(started).Milliseconds())
 					pending.settled = true
+					pending.discarded = true
 					credits -= result.Credits
 					retryUsage.add(attempt)
 					if structuredRetries >= 1 {
@@ -369,9 +372,29 @@ func (h *Handler) handleCodeExecutionRequest(
 		accountID = result.Account.ID
 	}
 	h.recordSuccessLog("claude", req.Model, accountID, inputTokens+outputTokens, credits, time.Since(started).Milliseconds())
+	var quotaOwners []quotaOwner
+	for i, round := range successfulRounds {
+		if round.discarded {
+			continue
+		}
+		end := len(blocks)
+		if i+1 < len(successfulRounds) {
+			end = successfulRounds[i+1].blockStart
+		}
+		visibleOutput := 0
+		if end > round.blockStart {
+			visibleOutput = estimateCodeExecutionOutputTokens(blocks[round.blockStart:end])
+		}
+		owner := quotaOwner{Model: round.result.Model, Input: int64(round.result.InputTokens), Output: int64(visibleOutput)}
+		if round.result.Account != nil {
+			owner.AccountID = round.result.Account.ID
+		}
+		quotaOwners = append(quotaOwners, owner)
+	}
+	stageAccountQuotaReceipt(ctx, responseModel, quotaRawUsage(publicInputTokens, outputTokens, responseCacheUsage), quotaFinalSources(publicInputTokens, outputTokens, responseCacheUsage, retryUsage, quotaOwners...))
 
 	if req.Stream {
-		if err := writeCodeExecutionSSEWithStop(w, responseModel, blocks, container, stopReason, publicInputTokens, outputTokens, responseCacheUsage, contextUsage); err != nil {
+		if err := writeCodeExecutionSSEWithStop(w, responseModel, blocks, container, stopReason, publicInputTokens, outputTokens, responseCacheUsage, contextUsage, ctx); err != nil {
 			h.recordFailureWithDetails("claude", req.Model, accountID, err)
 		}
 		return
@@ -404,9 +427,12 @@ func (h *Handler) handleCodeExecutionRequest(
 		ContextManagement: ClaudeContextManagement{AppliedEdits: []interface{}{}},
 	}
 	inflateClaudeUsage(&response.Usage)
+	updateAccountQuotaClaudeUsage(ctx, response.Usage)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	if err := json.NewEncoder(w).Encode(response); err != nil {
 		h.recordFailureWithDetails("claude", req.Model, accountID, err)
+	} else {
+		completeAccountQuotaReceipt(ctx)
 	}
 }
 
@@ -418,6 +444,7 @@ func (h *Handler) settleCodeExecutionRound(model, apiKeyID string, result *buffe
 	if result.Account != nil {
 		accountID = result.Account.ID
 	}
+	usage.AccountID, usage.Model = accountID, result.Model
 	h.recordSuccessLog("claude", model, accountID, usage.totalTokens(), usage.Credits, elapsedMs)
 	return usage
 }
@@ -446,8 +473,9 @@ func writeCodeExecutionSSE(
 	inputTokens, outputTokens int,
 	cacheUsage promptCacheUsage,
 	contextUsage *KiroContextUsage,
+	receiptContexts ...context.Context,
 ) error {
-	return writeCodeExecutionSSEWithStop(w, model, blocks, container, "end_turn", inputTokens, outputTokens, cacheUsage, contextUsage)
+	return writeCodeExecutionSSEWithStop(w, model, blocks, container, "end_turn", inputTokens, outputTokens, cacheUsage, contextUsage, receiptContexts...)
 }
 
 func writeCodeExecutionSSEWithStop(
@@ -459,15 +487,24 @@ func writeCodeExecutionSSEWithStop(
 	inputTokens, outputTokens int,
 	cacheUsage promptCacheUsage,
 	contextUsage *KiroContextUsage,
+	receiptContexts ...context.Context,
 ) error {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		return errors.New("streaming not supported")
 	}
 	configureSSEHeaders(w)
+	var writeErr error
 	send := func(event string, data interface{}) {
-		encoded, _ := json.Marshal(data)
-		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, encoded)
+		if writeErr != nil {
+			return
+		}
+		encoded, err := json.Marshal(data)
+		if err != nil {
+			writeErr = err
+			return
+		}
+		_, writeErr = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, encoded)
 		flusher.Flush()
 	}
 
@@ -514,6 +551,9 @@ func writeCodeExecutionSSEWithStop(
 		send("content_block_stop", map[string]interface{}{"type": "content_block_stop", "index": index})
 	}
 	usage := buildClaudeTerminalUsageMap(inputTokens, outputTokens, cacheUsage)
+	if len(receiptContexts) > 0 {
+		updateAccountQuotaClaudeMap(receiptContexts[0], usage, cacheUsage)
+	}
 	if contextUsage != nil {
 		usage["kiro_context_usage"] = contextUsage
 	}
@@ -527,5 +567,8 @@ func writeCodeExecutionSSEWithStop(
 		"context_management": map[string]interface{}{"applied_edits": []interface{}{}},
 	})
 	send("message_stop", map[string]interface{}{"type": "message_stop"})
-	return nil
+	if writeErr == nil && len(receiptContexts) > 0 {
+		completeAccountQuotaReceipt(receiptContexts[0])
+	}
+	return writeErr
 }

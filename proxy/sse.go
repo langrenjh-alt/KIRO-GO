@@ -17,6 +17,7 @@ type claudeStreamPrelude struct {
 	OutputTokens int
 	Credits      float64
 	RetryUsage   retryBillingUsage
+	QuotaOwners  []quotaOwner
 }
 
 // configureSSEHeaders prevents HTTP intermediaries from buffering or

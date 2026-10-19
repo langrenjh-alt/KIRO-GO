@@ -27,6 +27,7 @@ type kiroAPICaller func(*config.Account, *KiroPayload, *KiroStreamCallback) erro
 
 type bufferedClaudeCall struct {
 	Account               *config.Account
+	Model                 string
 	Content               string
 	Reasoning             ClaudeReasoningResult
 	ToolUses              []KiroToolUse
@@ -177,6 +178,7 @@ func (h *Handler) handleAdvisorRequest(
 				OutputTokens: advisorResult.OutputTokens,
 				Credits:      advisorResult.Credits,
 				RetryUsage:   advisorResult.RetryUsage,
+				QuotaOwners:  []quotaOwner{{AccountID: advisorResult.Account.ID, Model: advisorResult.Model, Input: int64(advisorResult.InputTokens), Output: int64(advisorResult.OutputTokens)}},
 			},
 		)
 		return
@@ -266,6 +268,9 @@ func (h *Handler) handleAdvisorRequest(
 	}
 	resp.Usage.OutputTokensDetails = claudeReasoningUsageDetails(reasoning, includeEmptyThinkingBlock)
 	inflateClaudeUsage(&resp.Usage)
+	stageAccountQuotaReceipt(ctx, responseModel, quotaUsageFromClaude(resp.Usage), quotaFinalSources(publicInputTokens, totalOutputTokens, responseCacheUsage, retryUsage,
+		quotaOwner{AccountID: advisorResult.Account.ID, Model: advisorResult.Model, Input: int64(advisorResult.InputTokens), Output: int64(advisorResult.OutputTokens)},
+		quotaOwner{AccountID: executorResult.Account.ID, Model: executorResult.Model, Input: int64(executorResult.InputTokens), Output: int64(executorResult.RetryUsage.finalAttemptOutputTokens(totalOutputTokens - advisorResult.OutputTokens))}))
 
 	totalCredits := advisorResult.Credits + executorResult.Credits
 	h.recordSuccessForApiKeyWithCache(apiKeyID, totalInputTokens, accountedOutputTokens, totalCredits, cacheUsage)
@@ -279,6 +284,8 @@ func (h *Handler) handleAdvisorRequest(
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		h.recordFailureWithDetails("claude", req.Model, accountID, err)
+	} else {
+		completeAccountQuotaReceipt(ctx)
 	}
 }
 
@@ -377,7 +384,7 @@ func (h *Handler) callClaudeBuffered(
 			continue
 		}
 
-		result := &bufferedClaudeCall{Account: account}
+		result := &bufferedClaudeCall{Account: account, Model: attemptModel}
 		var content strings.Builder
 		var reasoning strings.Builder
 		var suppressedReasoningObserved bool

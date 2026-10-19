@@ -48,6 +48,7 @@ const requestLogsMaxSize = 500
 
 // Handler HTTP 处理器
 type Handler struct {
+	accountQuota       *accountQuotaController
 	proxyPool          *proxyPoolController
 	pool               *pool.AccountPool
 	webSearchMCPCaller webSearchMCPCaller
@@ -325,6 +326,7 @@ func NewHandler() *Handler {
 		h.backgroundStatsSaver()
 	}()
 	h.startProxyPoolWorker()
+	h.startAccountQuota()
 	// 清理过期的 stored responses（>30 天）
 	go purgeExpiredResponses(responsesDefaultTTL)
 	return h
@@ -348,6 +350,7 @@ func (h *Handler) Close() {
 		}
 	})
 	h.backgroundWG.Wait()
+	h.closeAccountQuota()
 	CloseKiroIdleConnections()
 	if h.promptCache != nil {
 		h.promptCache.Stop()
@@ -528,15 +531,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if isGenerationAPIPath(path) {
 		ctx, cancel := context.WithCancel(r.Context())
 		ctx, timing := withRequestTiming(ctx, h.latency)
+		var receipt *accountQuotaReceipt
+		if !strings.HasSuffix(path, "/count_tokens") {
+			ctx, receipt = withAccountQuotaReceipt(ctx)
+		}
 		r = r.WithContext(ctx)
 		policy := h.responseWritePolicy
 		if policy.writeTimeout <= 0 {
 			policy = responseWritePolicyFromEnv()
 		}
 		wrapped, bounded := wrapBoundedResponseWriterWithPolicy(w, cancel, timing, policy)
+		bounded.quotaReceipt = receipt
 		w = wrapped
 		defer func() {
 			bounded.finish()
+			receipt.settle(h, bounded.writeError())
 			cancel()
 		}()
 	}
@@ -1678,6 +1687,8 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 			if preludeEmitted || prelude == nil || len(prelude.Blocks) == 0 {
 				return
 			}
+			restoreQuotaOwners := withQuotaVisibleOwners(kiroPayloadContext(payload), prelude.QuotaOwners)
+			defer restoreQuotaOwners()
 			ensureMessageStart()
 			closeActiveBlock()
 			for _, block := range prelude.Blocks {
@@ -2622,6 +2633,7 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 		publicInputTokens, terminalCacheUsage = retryUsage.apply(publicInputTokens, terminalCacheUsage)
 		publicOutputTokens := retryUsage.applyOutput(outputTokens)
 		finalUsage := buildClaudeTerminalUsageMap(publicInputTokens, publicOutputTokens, terminalCacheUsage, deferBillingInflation)
+		stageAccountQuotaReceipt(kiroPayloadContext(payload), responseModel, quotaUsageFromClaudeMap(finalUsage, terminalCacheUsage), quotaFinalSources(publicInputTokens, publicOutputTokens, terminalCacheUsage, retryUsage, quotaClaudeOwners(account.ID, model, executorInputTokens, executorOutputTokens, prelude)...))
 		addKiroContextUsage(finalUsage, payload, model)
 		addClaudeReasoningUsageDetails(finalUsage, ClaudeReasoningResult{
 			Text:      thinkingOutput,
@@ -2644,6 +2656,7 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 		h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
 			"type": "message_stop",
 		})
+		completeAccountQuotaReceipt(kiroPayloadContext(payload))
 		return
 	}
 
@@ -2675,7 +2688,11 @@ func (h *Handler) handleClaudeStreamWithPrelude(w http.ResponseWriter, payload *
 }
 
 func (h *Handler) sendSSE(w http.ResponseWriter, flusher http.Flusher, event string, data interface{}) {
-	jsonData, _ := json.Marshal(data)
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		invalidateQuotaReceiptWriter(w)
+		return
+	}
 	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, string(jsonData))
 	flusher.Flush()
 }
@@ -2765,6 +2782,7 @@ func estimateOpenAIDiscardedOutput(content, reasoning string, toolCalls []ToolCa
 // carried into a later successful response as cache-read input.
 func (h *Handler) settleDiscardedAttempt(endpoint, model, accountID, apiKeyID string, inputTokens, outputTokens int, credits float64, elapsedMs int64) discardedAttemptUsage {
 	attempt := newDiscardedAttemptUsage(inputTokens, outputTokens, credits)
+	attempt.AccountID, attempt.Model = accountID, model
 	h.recordSuccessForApiKey(apiKeyID, attempt.InputTokens, attempt.OutputTokens, attempt.Credits)
 	if h.pool != nil {
 		h.pool.UpdateStats(accountID, attempt.totalTokens(), attempt.Credits)
@@ -3371,12 +3389,15 @@ func (h *Handler) handleClaudeBufferedResponse(w http.ResponseWriter, payload *K
 		if respond == nil || !deferBillingInflation {
 			inflateClaudeUsage(&resp.Usage)
 		}
+		stageAccountQuotaReceipt(kiroPayloadContext(payload), responseModel, quotaUsageFromClaude(resp.Usage), quotaFinalSources(publicInputTokens, outputTokens, responseCacheUsage, retryUsage, quotaClaudeOwners(account.ID, model, executorInputTokens, executorOutputTokens, prelude)...))
 		if respond != nil {
 			respond(resp)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		json.NewEncoder(w).Encode(resp)
+		if err := json.NewEncoder(w).Encode(resp); err == nil {
+			completeAccountQuotaReceipt(kiroPayloadContext(payload))
+		}
 		return
 	}
 
@@ -3617,6 +3638,11 @@ func (s *openAIPromptCacheState) complete(accountID string, inputTokens int) pro
 }
 
 func buildOpenAIUsageMap(inputTokens, outputTokens int, cacheUsage promptCacheUsage) map[string]interface{} {
+	result, _ := buildOpenAIUsageMapWithQuota(inputTokens, outputTokens, cacheUsage)
+	return result
+}
+
+func buildOpenAIUsageMapWithQuota(inputTokens, outputTokens int, cacheUsage promptCacheUsage) (map[string]interface{}, ClaudeUsage) {
 	cachedTokens := cacheUsage.CacheReadInputTokens
 	if cachedTokens < 0 {
 		cachedTokens = 0
@@ -3625,14 +3651,13 @@ func buildOpenAIUsageMap(inputTokens, outputTokens int, cacheUsage promptCacheUs
 		cachedTokens = inputTokens
 	}
 	percent := config.GetTokenBillingInflationPercent()
-	if percent > 0 || inputTokens > maxBillingInputTokens {
-		cacheUsage.CacheReadInputTokens = cachedTokens
-		cacheUsage.CacheCreationInputTokens = maxInt(0, minInt(cacheUsage.CacheCreationInputTokens, inputTokens-cachedTokens))
-		billedUsage := inflatedBillingUsageWithPercent(inputTokens, outputTokens, cacheUsage, percent)
-		inputTokens = billedUsage.InputTokens + billedUsage.CacheCreationInputTokens + billedUsage.CacheReadInputTokens
-		outputTokens = billedUsage.OutputTokens
-		cachedTokens = billedUsage.CacheReadInputTokens
-	}
+	cacheUsage.CacheReadInputTokens = cachedTokens
+	cacheUsage.CacheCreationInputTokens = maxInt(0, minInt(cacheUsage.CacheCreationInputTokens, inputTokens-cachedTokens))
+	billedUsage := ClaudeUsage{InputTokens: billedClaudeInputTokens(inputTokens, cacheUsage), OutputTokens: outputTokens, CacheCreationInputTokens: cacheUsage.CacheCreationInputTokens, CacheReadInputTokens: cachedTokens, CacheCreation: &ClaudeCacheCreationUsage{Ephemeral5mInputTokens: cacheUsage.CacheCreation5mInputTokens, Ephemeral1hInputTokens: cacheUsage.CacheCreation1hInputTokens}}
+	inflateClaudeUsageWithPercent(&billedUsage, percent)
+	inputTokens = billedUsage.InputTokens + billedUsage.CacheCreationInputTokens + billedUsage.CacheReadInputTokens
+	outputTokens = billedUsage.OutputTokens
+	cachedTokens = billedUsage.CacheReadInputTokens
 	return map[string]interface{}{
 		"prompt_tokens":     inputTokens,
 		"completion_tokens": outputTokens,
@@ -3640,7 +3665,7 @@ func buildOpenAIUsageMap(inputTokens, outputTokens int, cacheUsage promptCacheUs
 		"prompt_tokens_details": map[string]int{
 			"cached_tokens": cachedTokens,
 		},
-	}
+	}, billedUsage
 }
 
 // handleOpenAIStream preserves the direct-call contract used by focused tests.
@@ -3757,7 +3782,11 @@ func (h *Handler) handleOpenAIStreamWithCache(w http.ResponseWriter, payload *Ki
 			if usage != nil {
 				chunk["usage"] = usage
 			}
-			data, _ := json.Marshal(chunk)
+			data, err := json.Marshal(chunk)
+			if err != nil {
+				invalidateQuotaReceiptWriter(w)
+				return
+			}
 			fmt.Fprintf(w, "data: %s\n\n", string(data))
 			flusher.Flush()
 			streamCommitted = true
@@ -4448,17 +4477,19 @@ func (h *Handler) handleOpenAIStreamWithCache(w http.ResponseWriter, payload *Ki
 			"delta":         map[string]string{"content": ""},
 			"finish_reason": finishReason,
 		}}, nil)
+		publicInputTokens := contextUsageBlendedInputTokens(payload, model, inputTokens)
+		publicCacheUsage := contextUsageBlendedCacheUsage(payload, model, inputTokens, cacheUsage)
+		publicInputTokens, publicCacheUsage = retryUsage.apply(publicInputTokens, publicCacheUsage)
+		publicOutputTokens := retryUsage.applyOutput(outputTokens)
+		terminalUsage, dollarUsage := buildOpenAIUsageMapWithQuota(publicInputTokens, publicOutputTokens, publicCacheUsage)
+		stageAccountQuotaReceipt(kiroPayloadContext(payload), responseModel, quotaUsageFromClaude(dollarUsage), quotaFinalSources(publicInputTokens, publicOutputTokens, publicCacheUsage, retryUsage, quotaOwner{AccountID: account.ID, Model: model, Input: int64(inputTokens), Output: int64(outputTokens)}))
 		if includeUsage {
-			publicInputTokens := contextUsageBlendedInputTokens(payload, model, inputTokens)
-			publicCacheUsage := contextUsageBlendedCacheUsage(payload, model, inputTokens, cacheUsage)
-			publicInputTokens, publicCacheUsage = retryUsage.apply(publicInputTokens, publicCacheUsage)
-			publicOutputTokens := retryUsage.applyOutput(outputTokens)
-			terminalUsage := buildOpenAIUsageMap(publicInputTokens, publicOutputTokens, publicCacheUsage)
 			addKiroContextUsage(terminalUsage, payload, model)
 			writeChunk([]map[string]interface{}{}, terminalUsage)
 		}
 		fmt.Fprintf(w, "data: [DONE]\n\n")
 		flusher.Flush()
+		completeAccountQuotaReceipt(kiroPayloadContext(payload))
 		return
 	}
 
@@ -4768,7 +4799,8 @@ func (h *Handler) handleOpenAINonStreamWithCache(w http.ResponseWriter, payload 
 		publicCacheUsage := contextUsageBlendedCacheUsage(payload, model, inputTokens, cacheUsage)
 		publicInputTokens, publicCacheUsage = retryUsage.apply(publicInputTokens, publicCacheUsage)
 		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, publicInputTokens, outputTokens, responseModel, thinkingFormat)
-		usage := buildOpenAIUsageMap(publicInputTokens, outputTokens, publicCacheUsage)
+		usage, dollarUsage := buildOpenAIUsageMapWithQuota(publicInputTokens, outputTokens, publicCacheUsage)
+		stageAccountQuotaReceipt(kiroPayloadContext(payload), responseModel, quotaUsageFromClaude(dollarUsage), quotaFinalSources(publicInputTokens, outputTokens, publicCacheUsage, retryUsage, quotaOwner{AccountID: account.ID, Model: model, Input: int64(inputTokens), Output: int64(attemptOutputTokens)}))
 		addKiroContextUsage(usage, payload, model)
 		resp["usage"] = usage
 		if matchedStopSequence != "" {
@@ -4781,7 +4813,9 @@ func (h *Handler) handleOpenAINonStreamWithCache(w http.ResponseWriter, payload 
 			}
 		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		json.NewEncoder(w).Encode(resp)
+		if err := json.NewEncoder(w).Encode(resp); err == nil {
+			completeAccountQuotaReceipt(kiroPayloadContext(payload))
+		}
 		return
 	}
 
@@ -4848,6 +4882,9 @@ func isKiroBearerTokenInvalidError(err error) bool {
 }
 
 func (h *Handler) callKiroWithBearerRefresh(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
+	if account != nil {
+		noteAccountQuotaAttempt(kiroPayloadContext(payload), account.ID, accountModelForAttempt("", payload))
+	}
 	call := h.kiroCaller
 	if call == nil {
 		call = CallKiroAPI
@@ -5166,6 +5203,7 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 		proxyEligible := a.Enabled && status != "BANNED" && status != "DISABLED" && status != "SUSPENDED"
 		result[i] = map[string]interface{}{
 			"id":                    a.ID,
+			"quotaEstimate":         h.accountQuotaSnapshot(a.ID),
 			"email":                 a.Email,
 			"userId":                a.UserId,
 			"nickname":              a.Nickname,
@@ -6896,6 +6934,7 @@ func (h *Handler) apiGetAccountFull(w http.ResponseWriter, r *http.Request, id s
 	// 返回完整账号信息（包含敏感字段）
 	result := map[string]interface{}{
 		"id":                account.ID,
+		"quotaEstimate":     h.accountQuotaSnapshot(account.ID),
 		"email":             account.Email,
 		"userId":            account.UserId,
 		"nickname":          account.Nickname,
